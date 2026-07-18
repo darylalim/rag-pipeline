@@ -1,22 +1,39 @@
 name: CI
 
-on: push
+# `pull_request` is required, not decorative: a PR from a fork produces no push
+# event in this repo, so with `push` alone none of the required status checks
+# would ever report and the PR could never merge. `push` is scoped to main so a
+# PR branch gets one run (via pull_request) rather than two.
+on:
+  push:
+    branches: [main]
+  pull_request:
 
 # Neither job writes anything back to the repo; least privilege limits what a
 # compromised dependency build backend could reach during `uv sync`.
 permissions:
   contents: read
 
-# Cancel superseded runs on the same ref so only the latest push is tested.
+# Cancel superseded runs on the same ref so only the latest push/PR is tested.
+# head_ref is set for pull_request events, ref for push.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
+# The rendered `name:` of each job below is its status check name, and the
+# "main: require CI" ruleset requires these three by exact string:
+#
+#     ruff + ty · pytest (py3.11) · pytest (py3.13)
+#
+# Renaming a job (or changing the matrix values) without updating the ruleset
+# silently stops the gate matching — it still reads as configured while
+# enforcing nothing. Update both together:
+#     gh api repos/darylalim/rag-pipeline/rulesets
 jobs:
   # Lint and type checks are interpreter-independent, so they run once on a
   # single version rather than across the test matrix.
   lint:
-    name: ruff + ty
+    name: ruff + ty  # ← required status check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -54,7 +71,7 @@ jobs:
         run: uv run ty check
 
   test:
-    name: pytest (py${{ matrix.python-version }})
+    name: pytest (py${{ matrix.python-version }})  # ← required status check
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
