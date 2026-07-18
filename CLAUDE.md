@@ -14,6 +14,7 @@ uv run pytest tests/test_config.py::test_defaults   # single test
 uv run pytest -k idempotent -v                      # by keyword
 uv run ruff check --fix . && uv run ruff format .   # lint, then format (order matters)
 uv run ty check                      # type check
+uv sync --locked && uv run ruff check . && uv run ruff format --check . && uv run ty check && uv run pytest   # every check CI runs
 ```
 
 When working with Python, invoke the relevant `/astral:<skill>` — `/astral:uv`,
@@ -32,8 +33,14 @@ UV_PROJECT_ENVIRONMENT=.venv311 uv run -p 3.11 pytest
 Plain `uv run -p 3.11` would recreate `.venv` itself at 3.11, and the next
 ordinary `uv run` would rebuild it at 3.13 — two full torch reinstalls.
 
+More generally: probe uv/tool behaviour in a throwaway project elsewhere, never
+here. This venv is 135 packages and multi-GB, and several uv commands rebuild it
+without asking.
+
 Add dependencies with `uv add` / `uv add --dev` rather than hand-editing
 `pyproject.toml`, so constraints and `uv.lock` stay derived rather than invented.
+`uv add` silently no-ops if the current constraint already allows the resolved
+version — pass an explicit floor (`uv add --dev "ruff>=0.15.22"`) to tighten one.
 
 The lint select list is broad and the tree is clean against it. **Fix findings
 rather than adding `# noqa` / `# ty: ignore`.** Prefer `uv run ruff`/`uv run ty`
