@@ -91,12 +91,13 @@ picked up automatically if set — see `.env.example`.
 uv run pytest
 ```
 
-The suite runs fast and fully offline — it injects a deterministic fake
-embedding model (no `torch`, no model download) and a fake chat model in place
-of Claude, so no API key is needed. It covers configuration, the loader/splitter,
-ingest idempotency, the source helpers, the setup guards, an ingest→retrieve
-round-trip, and the generation path end-to-end (answer text plus source
-citations, and that retrieved context is injected into the prompt).
+The suite runs fully offline — it injects a deterministic fake embedding model
+(no model download, no network) and a fake chat model in place of Claude, so no
+API key is needed. Most of its ~7s wall time is the transitive `torch` import;
+the tests themselves run in well under a second. It covers configuration, the
+loader/splitter, ingest idempotency, the source helpers, the setup guards, an
+ingest→retrieve round-trip, and the generation path end-to-end (answer text plus
+source citations, and that retrieved context is injected into the prompt).
 
 A GitHub Actions workflow (`.github/workflows/ci.yml`) runs this suite on every
 push, on Python 3.11 and 3.13.

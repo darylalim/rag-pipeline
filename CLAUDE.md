@@ -9,7 +9,7 @@ uv sync                              # install deps (creates .venv)
 uv run rag ingest                    # rebuild the Chroma index from data/
 uv run rag query "your question"     # ask from the terminal
 uv run streamlit run app.py          # chat UI over the same pipeline
-uv run pytest                        # full suite (~0.5s, fully offline)
+uv run pytest                        # full suite (~7s wall: ~4s torch import, ~0.5s tests; offline)
 uv run pytest tests/test_config.py::test_defaults   # single test
 uv run pytest -k idempotent -v                      # by keyword
 ```
@@ -32,8 +32,12 @@ query  (rag_pipeline/pipeline.py)  embed question → search → stuff prompt �
 
 `Settings` (`config.py`) is a frozen dataclass built via `Settings.from_env()`.
 Both frontends — `rag_pipeline/cli.py` and `app.py` — construct it the same way,
-which is what keeps them agreeing on index location, models, and chunking. All
-tunables belong here, not scattered as literals.
+which is what keeps them agreeing on index location, models, and chunking.
+
+All tunables live here — never inline a literal at a call site. Adding one is a
+**three-file change**: the field plus its `_env_*` line in `config.py`, a
+commented default in `.env.example`, and a row in the README config table.
+Leaving either of the latter two stale is a bug.
 
 ### Why the store factories live in `ingest.py`
 
@@ -50,11 +54,13 @@ chromadb caches one client per persist directory *within a process*. Any code
 that re-opens a store after it was rebuilt on disk will otherwise reuse the stale
 client and silently read the old index. `reset_store_cache()` wraps this
 (`SharedSystemClient.clear_system_cache()`) so callers never touch chromadb
-internals directly. Two places depend on it:
+internals directly. Callers (`grep reset_store_cache`):
 
 - `app.py` calls it before rebuilding the cached pipeline.
 - `tests/conftest.py` clears it autouse at every test boundary, so an in-process
   re-ingest behaves like a fresh CLI run.
+- `tests/test_ingest.py::test_ingest_is_idempotent` calls it directly between
+  ingests to emulate a fresh CLI process.
 
 The Streamlit cache key is `index_version()` — the mtime of `chroma.sqlite3`,
 which chromadb bumps on every write. That's how the running app picks up a
@@ -67,44 +73,16 @@ It must never `rmtree` the persist directory — that dir may hold unrelated dat
 (`test_ingest_preserves_unrelated_files_in_persist_dir` guards this). Re-ingest
 is idempotent: same input → same chunk count, no duplicate append.
 
-### Error contract
-
-`FileNotFoundError | RuntimeError | ValueError` is the union both frontends catch
-and render as a friendly message (`cli.py`, `app.py`) — roughly: missing/empty
-index, missing API key, malformed numeric env var. Keep new failure modes inside
-this union rather than introducing a fourth type.
-
-`pipeline.answer()` translates `anthropic.APIError` into `RuntimeError` on
-purpose, so frontends handle failed generation without importing the Anthropic
-SDK. Preserve that translation.
-
-Setup guards fail loudly and early, in this order: persist dir exists → API key
-present (only when building a real client) → collection non-empty. The empty-
-collection check matters because Chroma's `get_or_create` silently yields an
-empty collection on a `COLLECTION_NAME` mismatch, which would answer every
-question with "I don't know."
-
 ### Dependency injection is the test seam
 
 `ingest()`, `open_store()`, and `RAGPipeline.__init__` all accept optional
 `embeddings` / `llm`. **Production always passes `None`**; the parameters exist
 so tests can inject `DeterministicFakeEmbedding` and `FakeListChatModel`. This is
-why the suite needs no torch, no model download, and no API key. Any new code
-path touching an embedding model or the LLM should thread these through rather
-than constructing them unconditionally.
-
-## Conventions
-
-- `build_chat_model()` sets no `temperature`/`top_p` — grounding comes from
-  retrieved context, and some models (Opus 4.8) reject sampling params outright.
-  Don't add them.
-- Env-var helpers in `config.py` treat set-but-empty (`CHAT_MODEL=`) as unset and
-  fall back to the default. Match that behavior for new settings.
-- `load_documents()` skips unreadable and whitespace-only files with a warning
-  instead of aborting the ingest. Preserve that resilience.
-- Document `source` metadata (path relative to `data_dir`, POSIX-style) is what
-  citations key off. Any new loader must set it.
-- Module and function docstrings explain *why*, not what. Match that register.
+why the suite needs no model download, no network, and no API key. (torch is
+still imported transitively via `langchain_huggingface`; it just never runs a
+model — that import is the ~4s in `uv run pytest`.) Any new code path touching an
+embedding model or the LLM should thread these through rather than constructing
+them unconditionally.
 
 ## Gotchas
 
@@ -114,5 +92,24 @@ than constructing them unconditionally.
 - `cli.py` imports `ingest`/`pipeline` lazily inside the command functions. This
   is load-bearing: importing them pulls in sentence-transformers/torch, measured
   at ~4.3s versus ~0.08s for `rag --help` today. Keep those imports local.
-- `chroma_db/` and `.env` are gitignored; the index is a build artifact,
-  regenerated by `rag ingest`.
+
+## Conventions
+
+- New failure modes must fit `FileNotFoundError | RuntimeError | ValueError` —
+  the union both frontends catch (`cli.py:65`, `app.py:48`; see the comment at
+  `app.py:49-50` for the precise per-type mapping). Don't add a fourth type.
+- Preserve `answer()`'s `anthropic.APIError` → `RuntimeError` translation, so
+  frontends never import the Anthropic SDK.
+- Keep the empty-collection guard in `RAGPipeline.__init__`: Chroma's
+  `get_or_create` silently returns an *empty* collection on a `COLLECTION_NAME`
+  mismatch, so without it every question is answered "I don't know."
+- `build_chat_model()` sets no `temperature`/`top_p` — grounding comes from
+  retrieved context, and some models (Opus 4.8) reject sampling params outright.
+  Don't add them.
+- Env-var helpers in `config.py` treat set-but-empty (`CHAT_MODEL=`) as unset and
+  fall back to the default. Match that behavior for new settings.
+- `load_documents()` warns on stderr for unreadable files and *silently* skips
+  whitespace-only ones, rather than aborting the ingest. Preserve that resilience.
+- Document `source` metadata (path relative to `data_dir`, POSIX-style) is what
+  citations key off. Any new loader must set it.
+- Module and function docstrings explain *why*, not what. Match that register.
