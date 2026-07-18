@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import pytest
 from langchain_core.documents import Document
+from langchain_core.language_models import FakeListChatModel
+from langchain_core.messages import AIMessage
+from langchain_core.runnables import RunnableLambda
 
 from rag_pipeline import ingest as ingest_mod
 from rag_pipeline.pipeline import RAGPipeline, format_docs, unique_sources
@@ -61,3 +64,42 @@ def test_retrieve_round_trip(settings, fake_embeddings, monkeypatch):
 
     assert results, "expected at least one retrieved chunk"
     assert results[0].metadata["source"] == target.metadata["source"]
+
+
+def test_answer_returns_model_output_and_sources(settings, fake_embeddings, monkeypatch):
+    # Injecting an llm skips building ChatAnthropic, so no real key is needed.
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    ingest_mod.ingest(settings, embeddings=fake_embeddings)
+
+    canned = "Chunks overlap to preserve context across boundaries. (rag_concepts.md)"
+    fake_llm = FakeListChatModel(responses=[canned])
+    pipeline = RAGPipeline(settings, embeddings=fake_embeddings, llm=fake_llm)
+
+    result = pipeline.answer("Why do chunks overlap?")
+
+    assert result.text == canned
+    assert result.sources, "expected grounding sources"
+    assert all("source" in doc.metadata for doc in result.sources)
+
+
+def test_answer_injects_retrieved_context_into_prompt(settings, fake_embeddings, monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    ingest_mod.ingest(settings, embeddings=fake_embeddings)
+
+    captured: dict = {}
+
+    def spy(prompt_value):
+        # The chain feeds the rendered prompt into the model; capture it here.
+        captured["messages"] = prompt_value.to_messages()
+        return AIMessage(content="ok")
+
+    pipeline = RAGPipeline(
+        settings, embeddings=fake_embeddings, llm=RunnableLambda(spy)
+    )
+    result = pipeline.answer("Why do chunks overlap?")
+
+    human = captured["messages"][-1].content
+    assert "Question: Why do chunks overlap?" in human
+    # Retrieved chunks are stuffed into the prompt as labeled context.
+    assert "[Source:" in human
+    assert result.sources[0].metadata["source"] in human

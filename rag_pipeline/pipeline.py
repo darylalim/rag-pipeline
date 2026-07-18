@@ -14,8 +14,10 @@ from langchain_anthropic import ChatAnthropic
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
+from langchain_core.language_models import BaseChatModel
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import Runnable
 
 from rag_pipeline.config import Settings
 from rag_pipeline.ingest import build_embeddings
@@ -67,16 +69,35 @@ def unique_sources(docs: list[Document]) -> list[str]:
     return seen
 
 
+def build_chat_model(settings: Settings) -> BaseChatModel:
+    """Construct the Claude chat model used for generation.
+
+    No temperature/top_p: grounding comes from the retrieved context, and
+    omitting sampling params keeps this safe across models — Opus 4.8, for
+    instance, rejects them outright. Reads ANTHROPIC_API_KEY from the
+    environment.
+    """
+    return ChatAnthropic(model=settings.chat_model, max_tokens=settings.max_tokens)
+
+
 class RAGPipeline:
     """Loads the persisted index and answers questions against it."""
 
-    def __init__(self, settings: Settings, embeddings: Embeddings | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        embeddings: Embeddings | None = None,
+        llm: Runnable | None = None,
+    ) -> None:
         if not settings.persist_dir.exists():
             raise FileNotFoundError(
                 f"No index found at {settings.persist_dir}. "
                 "Run `rag ingest` (or `uv run rag ingest`) first."
             )
-        if not os.getenv("ANTHROPIC_API_KEY"):
+        # Fast-fail on a missing key *before* loading the embedding model — but
+        # only when we're going to build the real Claude client (an injected
+        # `llm`, as in tests, needs no key).
+        if llm is None and not os.getenv("ANTHROPIC_API_KEY"):
             raise RuntimeError(
                 "ANTHROPIC_API_KEY is not set. Generation uses Claude; set the "
                 "key in your environment or a .env file (see .env.example). "
@@ -87,7 +108,8 @@ class RAGPipeline:
 
         # Reload the existing store; the same embedding model that indexed the
         # documents must embed the queries, so we reuse the shared factory.
-        # `embeddings` is injectable for tests; production leaves it as None.
+        # `embeddings` and `llm` are injectable for tests; production leaves
+        # both as None and gets local embeddings + ChatAnthropic.
         vectorstore = Chroma(
             collection_name=settings.collection_name,
             embedding_function=embeddings or build_embeddings(settings),
@@ -97,16 +119,9 @@ class RAGPipeline:
             search_kwargs={"k": settings.retrieval_k}
         )
 
-        # No temperature/top_p: grounding comes from the retrieved context, and
-        # omitting sampling params keeps this safe across models — Opus 4.8, for
-        # instance, rejects them outright.
-        llm = ChatAnthropic(
-            model=settings.chat_model,
-            max_tokens=settings.max_tokens,
-        )
         # StrOutputParser extracts plain text whether the model returns a string
         # or structured content blocks.
-        self._chain = _PROMPT | llm | StrOutputParser()
+        self._chain = _PROMPT | (llm or build_chat_model(settings)) | StrOutputParser()
 
     def retrieve(self, question: str) -> list[Document]:
         """Return the chunks most relevant to the question."""

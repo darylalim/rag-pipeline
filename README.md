@@ -89,10 +89,12 @@ picked up automatically if set — see `.env.example`.
 uv run pytest
 ```
 
-The suite runs fast and fully offline — it uses a deterministic fake embedding
-model (no `torch`, no model download) and never calls Claude, so no API key is
-needed. It covers configuration, the loader/splitter, ingest idempotency, the
-source helpers, the setup guards, and an ingest→retrieve round-trip.
+The suite runs fast and fully offline — it injects a deterministic fake
+embedding model (no `torch`, no model download) and a fake chat model in place
+of Claude, so no API key is needed. It covers configuration, the loader/splitter,
+ingest idempotency, the source helpers, the setup guards, an ingest→retrieve
+round-trip, and the generation path end-to-end (answer text plus source
+citations, and that retrieved context is injected into the prompt).
 
 ## Project structure
 
