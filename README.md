@@ -72,7 +72,7 @@ required; the rest have sensible defaults:
 | Variable          | Default                                    | Purpose                                  |
 | ----------------- | ------------------------------------------ | ---------------------------------------- |
 | `ANTHROPIC_API_KEY` | —                                        | Claude key (query step only)             |
-| `CHAT_MODEL`      | `claude-opus-4-8`                          | Generation model (e.g. `claude-haiku-4-5` for a cheaper demo) |
+| `CHAT_MODEL`      | `claude-haiku-4-5`                         | Generation model (e.g. `claude-opus-4-8` for higher-quality answers) |
 | `EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2`   | Local embedding model                    |
 | `RETRIEVAL_K`     | `4`                                        | Chunks retrieved per question            |
 | `CHUNK_SIZE`      | `1000`                                     | Characters per chunk                     |

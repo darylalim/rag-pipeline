@@ -95,7 +95,9 @@ class RAGPipeline:
             search_kwargs={"k": settings.retrieval_k}
         )
 
-        # Note: no temperature/top_p — Claude Opus 4.8 rejects sampling params.
+        # No temperature/top_p: grounding comes from the retrieved context, and
+        # omitting sampling params keeps this safe across models — Opus 4.8, for
+        # instance, rejects them outright.
         llm = ChatAnthropic(
             model=settings.chat_model,
             max_tokens=settings.max_tokens,

@@ -48,9 +48,9 @@ class Settings:
     # all-MiniLM-L6-v2 -> 384-dim vectors; small, fast, and solid for retrieval.
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
 
-    # Generation model. Opus 4.8 is the current Claude default; override via
-    # CHAT_MODEL (e.g. claude-haiku-4-5) for a cheaper/faster demo.
-    chat_model: str = "claude-opus-4-8"
+    # Generation model. Haiku 4.5 is a fast, low-cost default for demos;
+    # override via CHAT_MODEL (e.g. claude-opus-4-8) for higher-quality answers.
+    chat_model: str = "claude-haiku-4-5"
     max_tokens: int = 1024
 
     # Splitter: 1000-char chunks with 200-char (20%) overlap keeps enough
