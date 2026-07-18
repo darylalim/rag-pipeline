@@ -31,7 +31,6 @@ def sample_data_dir(tmp_path):
     """A data directory that exercises the loader: a nested subdirectory, a
     whitespace-only file, and an unsupported extension (both must be skipped)."""
     root = tmp_path / "data"
-    (root / "sub").mkdir(parents=True)
     files = {
         "a.md": "Alpha topic about apples and orchards.\n",
         "sub/b.txt": "Beta topic about bicycles and boats.\n",
@@ -39,7 +38,10 @@ def sample_data_dir(tmp_path):
         "notes.rst": "unsupported extension -> skipped",  # bad suffix -> skipped
     }
     for name, content in files.items():
-        (root / name).write_text(content, encoding="utf-8")
+        # Create parents per entry, so adding a new nested path above just works.
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
     return root
 
 

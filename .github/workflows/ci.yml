@@ -22,8 +22,11 @@ jobs:
           enable-cache: true
           python-version: "3.13"
 
+      # --locked installs from uv.lock *and* asserts the lock is up to date with
+      # pyproject.toml. --frozen would skip that check, so a dependency added by
+      # hand without re-locking would silently never install and CI would pass.
       - name: Install dependencies
-        run: uv sync --frozen
+        run: uv sync --locked
 
       - name: Lint
         run: uv run ruff check .
@@ -51,10 +54,11 @@ jobs:
           enable-cache: true
           python-version: ${{ matrix.python-version }}
 
-      # --frozen installs exactly what's in uv.lock (no re-resolution).
+      # --locked installs exactly what's in uv.lock and fails if the lock has
+      # drifted from pyproject.toml (see the lint job for why not --frozen).
       # The dev group (pytest) is included by default.
       - name: Install dependencies
-        run: uv sync --frozen
+        run: uv sync --locked
 
       # Tests are fully offline (fake embedding + chat models), so no
       # ANTHROPIC_API_KEY / secrets are required.

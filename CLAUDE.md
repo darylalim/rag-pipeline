@@ -26,8 +26,16 @@ pytest on 3.11 and 3.13. Both must stay green.
 
 `.python-version` pins local work to 3.13. It does *not* weaken the test matrix:
 `setup-uv`'s `python-version:` input sets `UV_PYTHON`, which takes precedence
-over the file, so the 3.11 CI leg really does run on 3.11. Use `uv run -p 3.11`
-to reproduce that leg locally.
+over the file, so the 3.11 CI leg really does run on 3.11.
+
+To reproduce that leg locally, send it to a *separate* environment:
+
+```bash
+UV_PROJECT_ENVIRONMENT=.venv311 uv run -p 3.11 pytest
+```
+
+Plain `uv run -p 3.11` would recreate `.venv` itself at 3.11, and the next
+ordinary `uv run` would rebuild it at 3.13 — two full torch reinstalls.
 
 Add dependencies with `uv add` / `uv add --dev` rather than hand-editing
 `pyproject.toml`, so constraints and `uv.lock` stay derived rather than invented.
