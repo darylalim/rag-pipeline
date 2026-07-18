@@ -9,10 +9,10 @@ which is what the ingest/pipeline tests exercise.
 from __future__ import annotations
 
 import pytest
-from chromadb.api.shared_system_client import SharedSystemClient
 from langchain_core.embeddings import DeterministicFakeEmbedding
 
 from rag_pipeline.config import Settings
+from rag_pipeline.ingest import reset_store_cache
 
 
 @pytest.fixture
@@ -57,6 +57,6 @@ def _reset_chroma_client_cache():
     """chromadb caches its client per directory within a process. Clear it at
     each test boundary so tests don't see another test's client, and so an
     in-process re-ingest behaves like a fresh CLI run."""
-    SharedSystemClient.clear_system_cache()
+    reset_store_cache()
     yield
-    SharedSystemClient.clear_system_cache()
+    reset_store_cache()

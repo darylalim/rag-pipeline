@@ -9,40 +9,29 @@ once per session rather than on every rerun.
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import streamlit as st
-from chromadb.api.shared_system_client import SharedSystemClient
 
 from rag_pipeline.config import Settings
+from rag_pipeline.ingest import index_version, reset_store_cache
 from rag_pipeline.pipeline import RAGPipeline, unique_sources
 
 st.set_page_config(page_title="RAG Pipeline", page_icon="🔎", layout="centered")
 
 
-def _index_version(persist_dir: Path) -> float:
-    """Newest mtime under the index directory.
-
-    Changes whenever `rag ingest` rebuilds the store, so it can key the cache
-    below and make the app pick up a re-ingest without a manual restart.
-    """
-    if not persist_dir.exists():
-        return 0.0
-    return max((p.stat().st_mtime for p in persist_dir.rglob("*")), default=0.0)
-
-
 @st.cache_resource(show_spinner="Loading index and embedding model...")
-def load_pipeline(index_version: float) -> RAGPipeline:
+def load_pipeline(_settings: Settings, version: float) -> RAGPipeline:
     """Build the pipeline, cached until the on-disk index changes.
 
-    `index_version` busts this cache when `rag ingest` rebuilds the store.
-    chromadb caches its client per directory within a process, so we also clear
-    that cache here — otherwise the rebuilt pipeline would reuse a stale cached
-    client instead of reading the fresh index from disk.
+    `version` (the index's fingerprint) is the cache key: it changes when
+    `rag ingest` rebuilds the store, busting this cache. `_settings` is passed
+    in — the leading underscore tells Streamlit not to hash it — so we don't
+    re-read the environment here. On a rebuild we clear chromadb's client cache
+    first, or the fresh pipeline would reuse a stale cached client instead of
+    reading the new index from disk.
     """
-    del index_version  # used only as the cache key; not needed in the body
-    SharedSystemClient.clear_system_cache()
-    return RAGPipeline(Settings.from_env())
+    del version  # used only as the cache key; not needed in the body
+    reset_store_cache()
+    return RAGPipeline(_settings)
 
 
 st.title("🔎 RAG Pipeline")
@@ -55,7 +44,7 @@ st.caption(
 # a clear on-screen message instead of a stack trace.
 try:
     cfg = Settings.from_env()
-    pipeline = load_pipeline(_index_version(cfg.persist_dir))
+    pipeline = load_pipeline(cfg, index_version(cfg))
 except (FileNotFoundError, RuntimeError, ValueError) as exc:
     # FileNotFoundError: no/empty index. RuntimeError: missing API key.
     # ValueError: a malformed numeric env var (e.g. CHUNK_SIZE=abc).

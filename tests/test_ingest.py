@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import pytest
-from chromadb.api.shared_system_client import SharedSystemClient
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 
@@ -70,13 +69,13 @@ def test_ingest_is_idempotent(settings, fake_embeddings):
     n1 = ingest_mod.ingest(settings, embeddings=fake_embeddings)
 
     # Emulate a fresh CLI process, then re-ingest the same data.
-    SharedSystemClient.clear_system_cache()
+    ingest_mod.reset_store_cache()
     n2 = ingest_mod.ingest(settings, embeddings=fake_embeddings)
 
     assert n1 == n2 >= 2
 
     # The rebuilt store holds n2 vectors, not 2*n2 — no duplicate append.
-    SharedSystemClient.clear_system_cache()
+    ingest_mod.reset_store_cache()
     store = Chroma(
         collection_name=settings.collection_name,
         embedding_function=fake_embeddings,

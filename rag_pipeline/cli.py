@@ -23,17 +23,11 @@ def cmd_ingest(settings: Settings) -> int:
 
 
 def cmd_query(settings: Settings, question: str) -> int:
-    import anthropic
-
     from rag_pipeline.pipeline import RAGPipeline, unique_sources
 
     pipeline = RAGPipeline(settings)
-    try:
-        result = pipeline.answer(question)
-    except anthropic.APIError as exc:
-        # Bad/expired key, rate limit, network error — surface a friendly
-        # message via main()'s handler instead of a raw traceback.
-        raise RuntimeError(f"Claude API request failed: {exc}") from exc
+    # answer() translates provider errors to RuntimeError, which main() reports.
+    result = pipeline.answer(question)
 
     print(f"\nQ: {question}\n")
     print(result.text)

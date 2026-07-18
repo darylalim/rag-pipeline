@@ -10,6 +10,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+from chromadb.api.shared_system_client import SharedSystemClient
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
@@ -32,6 +33,44 @@ def build_embeddings(settings: Settings) -> HuggingFaceEmbeddings:
     return HuggingFaceEmbeddings(model_name=settings.embedding_model)
 
 
+def open_store(settings: Settings, embeddings: Embeddings | None = None) -> Chroma:
+    """Open the persisted Chroma collection.
+
+    The store's identity (collection name, persist dir, embedding function) must
+    match between indexing and querying, so both stages open it through this one
+    factory. ``embeddings`` is injectable for tests; production leaves it None
+    and builds the local model.
+    """
+    return Chroma(
+        collection_name=settings.collection_name,
+        embedding_function=embeddings or build_embeddings(settings),
+        persist_directory=str(settings.persist_dir),
+    )
+
+
+def reset_store_cache() -> None:
+    """Drop chromadb's per-process client cache.
+
+    chromadb caches one client per persist directory within a process. A caller
+    that re-opens a store after it was rebuilt on disk (e.g. the Streamlit app
+    after `rag ingest`) must clear this first, or it reuses the stale client and
+    reads the old index. Centralized here so callers don't reach into chromadb
+    internals themselves.
+    """
+    SharedSystemClient.clear_system_cache()
+
+
+def index_version(settings: Settings) -> float:
+    """A value that changes whenever the on-disk index is rebuilt.
+
+    The Streamlit app keys its pipeline cache on this so a `rag ingest` is
+    picked up automatically. Reads one sentinel file's mtime (chromadb bumps it
+    on every write) rather than walking the whole index directory.
+    """
+    sentinel = settings.persist_dir / "chroma.sqlite3"
+    return sentinel.stat().st_mtime if sentinel.exists() else 0.0
+
+
 def _read_pdf(path: Path) -> str:
     """Extract text from every page of a PDF and join it."""
     from pypdf import PdfReader
@@ -51,12 +90,13 @@ def load_documents(data_dir: Path) -> list[Document]:
 
     documents: list[Document] = []
     for path in sorted(data_dir.rglob("*")):
-        if not path.is_file() or path.suffix.lower() not in SUPPORTED_SUFFIXES:
+        suffix = path.suffix.lower()
+        if not path.is_file() or suffix not in SUPPORTED_SUFFIXES:
             continue
 
         source = path.relative_to(data_dir).as_posix()
         try:
-            if path.suffix.lower() == ".pdf":
+            if suffix == ".pdf":
                 text = _read_pdf(path)
             else:
                 text = path.read_text(encoding="utf-8")
@@ -108,15 +148,12 @@ def ingest(settings: Settings, embeddings: Embeddings | None = None) -> int:
 
     chunks = split_documents(documents, settings)
 
-    store = Chroma(
-        collection_name=settings.collection_name,
-        embedding_function=embeddings or build_embeddings(settings),
-        persist_directory=str(settings.persist_dir),
-    )
+    store = open_store(settings, embeddings)
     # Rebuild this collection in place: drop its existing vectors (if any), then
     # add the fresh chunks. Scoped to the collection, so re-ingest never touches
-    # other files in the persist directory.
-    existing_ids = store.get()["ids"]
+    # other files in the persist directory. `include=[]` fetches only the ids,
+    # not every chunk's text and metadata.
+    existing_ids = store.get(include=[])["ids"]
     if existing_ids:
         store.delete(ids=existing_ids)
     store.add_documents(chunks)

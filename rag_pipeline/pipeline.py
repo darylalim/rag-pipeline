@@ -10,8 +10,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+import anthropic
 from langchain_anthropic import ChatAnthropic
-from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_core.language_models import BaseChatModel
@@ -20,7 +20,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import Runnable
 
 from rag_pipeline.config import Settings
-from rag_pipeline.ingest import build_embeddings
+from rag_pipeline.ingest import open_store
 
 # Grounding prompt: the model must answer from the retrieved context only, and
 # admit when the context does not contain the answer. This is what turns a
@@ -61,12 +61,8 @@ def format_docs(docs: list[Document]) -> str:
 
 def unique_sources(docs: list[Document]) -> list[str]:
     """Distinct source files across the retrieved chunks, in retrieval order."""
-    seen: list[str] = []
-    for doc in docs:
-        src = doc.metadata.get("source", "unknown")
-        if src not in seen:
-            seen.append(src)
-    return seen
+    # dict.fromkeys preserves insertion order while dropping duplicates.
+    return list(dict.fromkeys(doc.metadata.get("source", "unknown") for doc in docs))
 
 
 def build_chat_model(settings: Settings) -> BaseChatModel:
@@ -106,15 +102,11 @@ class RAGPipeline:
 
         self.settings = settings
 
-        # Reload the existing store; the same embedding model that indexed the
-        # documents must embed the queries, so we reuse the shared factory.
+        # Reload the existing store via the shared factory, so the same
+        # embedding model that indexed the documents also embeds queries.
         # `embeddings` and `llm` are injectable for tests; production leaves
         # both as None and gets local embeddings + ChatAnthropic.
-        vectorstore = Chroma(
-            collection_name=settings.collection_name,
-            embedding_function=embeddings or build_embeddings(settings),
-            persist_directory=str(settings.persist_dir),
-        )
+        vectorstore = open_store(settings, embeddings)
         # `persist_dir.exists()` alone is too weak: an empty directory or a
         # COLLECTION_NAME that doesn't match what was ingested yields a
         # silently-empty collection (get_or_create), so every question would be
@@ -140,7 +132,13 @@ class RAGPipeline:
     def answer(self, question: str) -> Answer:
         """Retrieve context, then generate a grounded answer with sources."""
         docs = self.retrieve(question)
-        text = self._chain.invoke(
-            {"context": format_docs(docs), "question": question}
-        )
+        try:
+            text = self._chain.invoke(
+                {"context": format_docs(docs), "question": question}
+            )
+        except anthropic.APIError as exc:
+            # Translate provider errors (bad/expired key, rate limit, network)
+            # into a generic RuntimeError, so frontends handle a failed
+            # generation uniformly without depending on the Anthropic SDK.
+            raise RuntimeError(f"Claude API request failed: {exc}") from exc
         return Answer(text=text, sources=docs)
