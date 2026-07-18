@@ -2,6 +2,11 @@ name: CI
 
 on: push
 
+# Neither job writes anything back to the repo; least privilege limits what a
+# compromised dependency build backend could reach during `uv sync`.
+permissions:
+  contents: read
+
 # Cancel superseded runs on the same ref so only the latest push is tested.
 concurrency:
   group: ci-${{ github.ref }}
@@ -22,17 +27,28 @@ jobs:
           enable-cache: true
           python-version: "3.13"
 
+      # ruff is a standalone binary and needs none of the project's dependencies,
+      # so install just the dev group first — seconds, versus minutes for the ML
+      # stack. A ruff failure then costs nothing further.
+      #
       # --locked installs from uv.lock *and* asserts the lock is up to date with
       # pyproject.toml. --frozen would skip that check, so a dependency added by
       # hand without re-locking would silently never install and CI would pass.
-      - name: Install dependencies
-        run: uv sync --locked
+      - name: Install lint tools
+        run: uv sync --locked --only-group dev
 
+      # --no-sync is load-bearing: a plain `uv run` re-syncs the full project
+      # first, which would install torch and undo the step above.
       - name: Lint
-        run: uv run ruff check .
+        run: uv run --no-sync ruff check .
 
       - name: Check formatting
-        run: uv run ruff format --check .
+        run: uv run --no-sync ruff format --check .
+
+      # ty, unlike ruff, needs the real dependencies installed — it resolves
+      # imports through them, and reports unresolved-import without them.
+      - name: Install project dependencies
+        run: uv sync --locked
 
       - name: Type check
         run: uv run ty check

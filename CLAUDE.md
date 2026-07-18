@@ -20,10 +20,6 @@ uv run ty check                      # type check
 When working with Python, invoke the relevant `/astral:<skill>` — `/astral:uv`,
 `/astral:ty`, `/astral:ruff` — to ensure best practices are followed.
 
-CI (`.github/workflows/ci.yml`) has two jobs: `lint` runs
-`ruff check` + `ruff format --check` + `ty check` once on 3.13, and `test` runs
-pytest on 3.11 and 3.13. Both must stay green.
-
 `.python-version` pins local work to 3.13. It does *not* weaken the test matrix:
 `setup-uv`'s `python-version:` input sets `UV_PYTHON`, which takes precedence
 over the file, so the 3.11 CI leg really does run on 3.11.
@@ -40,14 +36,19 @@ ordinary `uv run` would rebuild it at 3.13 — two full torch reinstalls.
 Add dependencies with `uv add` / `uv add --dev` rather than hand-editing
 `pyproject.toml`, so constraints and `uv.lock` stay derived rather than invented.
 
-Ruff and ty are configured in `pyproject.toml` and pinned in the dev group, so
-local runs match CI — prefer `uv run ruff`/`uv run ty` over `uvx`. The lint
-select list is deliberately broad (`E,W,F,I,UP,B,SIM,C4,PT,RUF`) and the tree is
-clean against it; `E501` is off because line length is `ruff format`'s job.
-Fix findings rather than adding `# noqa` / `# ty: ignore`.
+Lint policy: the select list is deliberately broad (`E,W,F,I,UP,B,SIM,C4,PT,RUF`)
+and the tree is clean against it; `E501` is off because line length is
+`ruff format`'s job. **Fix findings rather than adding `# noqa` / `# ty: ignore`.**
+Prefer `uv run ruff`/`uv run ty` over `uvx`, so versions match the lock.
 
-`README.md` covers setup, configuration variables, and usage in detail — consult
-it rather than duplicating that material here.
+The CI lint job installs only the dev group before running ruff, then the full
+environment before `ty check` — ruff needs no project dependencies, ty resolves
+imports through them. Keep `--no-sync` on the ruff steps: a plain `uv run`
+re-syncs the whole project first and reinstalls torch.
+
+`README.md` covers setup, configuration variables, usage, and what CI runs —
+consult it rather than duplicating that material here. Every CI job must stay
+green.
 
 ## Architecture
 
