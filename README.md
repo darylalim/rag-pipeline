@@ -114,8 +114,21 @@ uv run ty check              # type check
 Run `ruff check` before `ruff format` — lint fixes can reorder code that
 formatting then tidies.
 
-A GitHub Actions workflow (`.github/workflows/ci.yml`) runs on every push: a
-`lint` job (ruff + ty) and a `test` job (pytest on Python 3.11 and 3.13).
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on every push, as two jobs:
+
+| Job    | Status check name                     | Runs                                             |
+| ------ | ------------------------------------- | ------------------------------------------------ |
+| `lint` | `ruff + ty`                           | `ruff check`, `ruff format --check`, `ty check`   |
+| `test` | `pytest (py3.11)`, `pytest (py3.13)`  | the pytest suite on both ends of `requires-python` |
+
+Both install with `uv sync --locked`, which fails if `uv.lock` has drifted from
+`pyproject.toml` — so a dependency added by hand without re-locking is caught
+rather than silently skipped. The `lint` job installs only the dev group before
+running ruff, and the full environment only for `ty check`.
+
+Tests need no secrets: the suite is fully offline.
 
 ## Project structure
 
