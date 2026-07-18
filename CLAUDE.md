@@ -24,6 +24,14 @@ CI (`.github/workflows/ci.yml`) has two jobs: `lint` runs
 `ruff check` + `ruff format --check` + `ty check` once on 3.13, and `test` runs
 pytest on 3.11 and 3.13. Both must stay green.
 
+`.python-version` pins local work to 3.13. It does *not* weaken the test matrix:
+`setup-uv`'s `python-version:` input sets `UV_PYTHON`, which takes precedence
+over the file, so the 3.11 CI leg really does run on 3.11. Use `uv run -p 3.11`
+to reproduce that leg locally.
+
+Add dependencies with `uv add` / `uv add --dev` rather than hand-editing
+`pyproject.toml`, so constraints and `uv.lock` stay derived rather than invented.
+
 Ruff and ty are configured in `pyproject.toml` and pinned in the dev group, so
 local runs match CI — prefer `uv run ruff`/`uv run ty` over `uvx`. The lint
 select list is deliberately broad (`E,W,F,I,UP,B,SIM,C4,PT,RUF`) and the tree is
