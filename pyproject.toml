@@ -11,6 +11,9 @@ dependencies = [
     "langchain-chroma>=0.2",
     "langchain-anthropic>=0.3",
     "sentence-transformers>=3.0",
+    # Pulled in by sentence-transformers; declared here so the PyTorch CPU
+    # wheel index (see [tool.uv.sources] below) applies to it.
+    "torch>=2.0",
     "chromadb>=0.5",
     "streamlit>=1.40",
     "python-dotenv>=1.0",
@@ -35,3 +38,17 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+
+# On Linux/Windows the default PyPI torch wheel bundles CUDA (multi-GB). Pull
+# torch from PyTorch's CPU-only index there instead — much smaller, so CI
+# installs are fast. macOS wheels on PyPI are already CPU/MPS, so darwin is
+# left on the default index.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cpu", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
