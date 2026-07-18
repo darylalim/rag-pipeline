@@ -73,12 +73,14 @@ required; the rest have sensible defaults:
 | ----------------- | ------------------------------------------ | ---------------------------------------- |
 | `ANTHROPIC_API_KEY` | —                                        | Claude key (query step only)             |
 | `CHAT_MODEL`      | `claude-haiku-4-5`                         | Generation model (e.g. `claude-opus-4-8` for higher-quality answers) |
+| `MAX_TOKENS`      | `1024`                                     | Maximum length of a generated answer     |
 | `EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2`   | Local embedding model                    |
 | `RETRIEVAL_K`     | `4`                                        | Chunks retrieved per question            |
 | `CHUNK_SIZE`      | `1000`                                     | Characters per chunk                     |
 | `CHUNK_OVERLAP`   | `200`                                      | Overlap between adjacent chunks          |
 | `DATA_DIR`        | `./data`                                   | Source documents                         |
 | `PERSIST_DIR`     | `./chroma_db`                              | Where the index is stored                |
+| `COLLECTION_NAME` | `rag_docs`                                 | Chroma collection holding the vectors — must match between ingest and query |
 
 Optional LangSmith tracing (`LANGSMITH_TRACING=true` + `LANGSMITH_API_KEY`) is
 picked up automatically if set — see `.env.example`.
