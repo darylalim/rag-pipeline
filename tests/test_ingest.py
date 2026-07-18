@@ -61,7 +61,9 @@ def test_ingest_empty_dir_raises(tmp_path, fake_embeddings):
     empty.mkdir()
     s = Settings(data_dir=empty, persist_dir=tmp_path / "chroma")
 
-    with pytest.raises(ValueError):
+    # `match` pins this to the empty-corpus ValueError; without it the test
+    # would also pass on an unrelated ValueError (e.g. a bad numeric env var).
+    with pytest.raises(ValueError, match="No readable documents found"):
         ingest_mod.ingest(s, embeddings=fake_embeddings)
 
 

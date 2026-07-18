@@ -26,7 +26,8 @@ def test_from_env_overrides(monkeypatch, tmp_path):
     s = Settings.from_env()
 
     assert s.chat_model == "claude-opus-4-8"
-    assert s.retrieval_k == 7 and isinstance(s.retrieval_k, int)
+    assert s.retrieval_k == 7
+    assert isinstance(s.retrieval_k, int)
     assert s.chunk_size == 512
     assert s.collection_name == "custom"
     assert s.data_dir == tmp_path.resolve()
@@ -34,8 +35,14 @@ def test_from_env_overrides(monkeypatch, tmp_path):
 
 def test_from_env_uses_defaults_when_unset(monkeypatch):
     for var in (
-        "CHAT_MODEL", "RETRIEVAL_K", "CHUNK_SIZE", "CHUNK_OVERLAP",
-        "COLLECTION_NAME", "DATA_DIR", "PERSIST_DIR", "EMBEDDING_MODEL",
+        "CHAT_MODEL",
+        "RETRIEVAL_K",
+        "CHUNK_SIZE",
+        "CHUNK_OVERLAP",
+        "COLLECTION_NAME",
+        "DATA_DIR",
+        "PERSIST_DIR",
+        "EMBEDDING_MODEL",
         "MAX_TOKENS",
     ):
         monkeypatch.delenv(var, raising=False)

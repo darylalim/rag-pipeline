@@ -99,8 +99,23 @@ loader/splitter, ingest idempotency, the source helpers, the setup guards, an
 ingest→retrieve round-trip, and the generation path end-to-end (answer text plus
 source citations, and that retrieved context is injected into the prompt).
 
-A GitHub Actions workflow (`.github/workflows/ci.yml`) runs this suite on every
-push, on Python 3.11 and 3.13.
+## Linting and type checking
+
+[Ruff](https://docs.astral.sh/ruff/) (lint + format) and
+[ty](https://docs.astral.sh/ty/) (type check) are pinned in the dev dependency
+group and configured in `pyproject.toml`:
+
+```bash
+uv run ruff check --fix .    # lint, applying safe fixes
+uv run ruff format .         # format
+uv run ty check              # type check
+```
+
+Run `ruff check` before `ruff format` — lint fixes can reorder code that
+formatting then tidies.
+
+A GitHub Actions workflow (`.github/workflows/ci.yml`) runs on every push: a
+`lint` job (ruff + ty) and a `test` job (pytest on Python 3.11 and 3.13).
 
 ## Project structure
 

@@ -33,8 +33,10 @@ def test_format_docs_labels_each_source():
         Document(page_content="world", metadata={"source": "b.md"}),
     ]
     out = format_docs(docs)
-    assert "[Source: a.md]" in out and "hello" in out
-    assert "[Source: b.md]" in out and "world" in out
+    assert "[Source: a.md]" in out
+    assert "hello" in out
+    assert "[Source: b.md]" in out
+    assert "world" in out
 
 
 def test_pipeline_requires_index(settings, monkeypatch):
@@ -63,7 +65,8 @@ def test_pipeline_rejects_mismatched_collection(settings, fake_embeddings, monke
     import dataclasses
 
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-fake")
-    ingest_mod.ingest(settings, embeddings=fake_embeddings)  # into settings.collection_name
+    # Ingests into settings.collection_name; we then query a different one.
+    ingest_mod.ingest(settings, embeddings=fake_embeddings)
     other = dataclasses.replace(settings, collection_name="different")
     with pytest.raises(FileNotFoundError):
         RAGPipeline(other, embeddings=fake_embeddings)
@@ -84,7 +87,9 @@ def test_retrieve_round_trip(settings, fake_embeddings, monkeypatch):
     assert results[0].metadata["source"] == target.metadata["source"]
 
 
-def test_answer_returns_model_output_and_sources(settings, fake_embeddings, monkeypatch):
+def test_answer_returns_model_output_and_sources(
+    settings, fake_embeddings, monkeypatch
+):
     # Injecting an llm skips building ChatAnthropic, so no real key is needed.
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     ingest_mod.ingest(settings, embeddings=fake_embeddings)
@@ -100,7 +105,9 @@ def test_answer_returns_model_output_and_sources(settings, fake_embeddings, monk
     assert all("source" in doc.metadata for doc in result.sources)
 
 
-def test_answer_injects_retrieved_context_into_prompt(settings, fake_embeddings, monkeypatch):
+def test_answer_injects_retrieved_context_into_prompt(
+    settings, fake_embeddings, monkeypatch
+):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     ingest_mod.ingest(settings, embeddings=fake_embeddings)
 

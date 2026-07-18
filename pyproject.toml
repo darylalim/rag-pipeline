@@ -33,11 +33,35 @@ packages = ["rag_pipeline"]
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
+    "ruff>=0.14",
+    "ty>=0.0.1a24",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+
+# Formatting: the codebase was already written to ~88 columns, so adopting
+# ruff's default line length codifies the existing style rather than churning it.
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+# Beyond ruff's default (E4/E7/E9 + F): import sorting (I), 3.11+ idioms (UP),
+# likely-bug patterns (B), and pytest style (PT), which is what caught the
+# over-broad `pytest.raises` in test_ingest.py.
+select = ["E", "W", "F", "I", "UP", "B", "SIM", "C4", "PT", "RUF"]
+# E501 is the formatter's job; leaving it on would double-report every long line
+# and fight `ruff format` over strings and comments it can't split.
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["rag_pipeline"]
+
+# Check against the floor of requires-python, so anything that would only work
+# on a newer interpreter is caught here rather than in the 3.11 CI leg.
+[tool.ty.environment]
+python-version = "3.11"
 
 # On Linux/Windows the default PyPI torch wheel bundles CUDA (multi-GB). Pull
 # torch from PyTorch's CPU-only index there instead — much smaller, so CI

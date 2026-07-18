@@ -32,10 +32,14 @@ def sample_data_dir(tmp_path):
     whitespace-only file, and an unsupported extension (both must be skipped)."""
     root = tmp_path / "data"
     (root / "sub").mkdir(parents=True)
-    (root / "a.md").write_text("Alpha topic about apples and orchards.\n", encoding="utf-8")
-    (root / "sub" / "b.txt").write_text("Beta topic about bicycles and boats.\n", encoding="utf-8")
-    (root / "empty.md").write_text("   \n", encoding="utf-8")  # whitespace only -> skipped
-    (root / "notes.rst").write_text("unsupported extension -> skipped", encoding="utf-8")
+    files = {
+        "a.md": "Alpha topic about apples and orchards.\n",
+        "sub/b.txt": "Beta topic about bicycles and boats.\n",
+        "empty.md": "   \n",  # whitespace only -> skipped
+        "notes.rst": "unsupported extension -> skipped",  # bad suffix -> skipped
+    }
+    for name, content in files.items():
+        (root / name).write_text(content, encoding="utf-8")
     return root
 
 

@@ -70,7 +70,7 @@ class Settings:
     retrieval_k: int = 4
 
     @classmethod
-    def from_env(cls) -> "Settings":
+    def from_env(cls) -> Settings:
         """Build settings, letting environment variables override defaults."""
         return cls(
             data_dir=_env_path("DATA_DIR", cls.data_dir),

@@ -12,11 +12,23 @@ uv run streamlit run app.py          # chat UI over the same pipeline
 uv run pytest                        # full suite (~7s wall: ~4s torch import, ~0.5s tests; offline)
 uv run pytest tests/test_config.py::test_defaults   # single test
 uv run pytest -k idempotent -v                      # by keyword
+uv run ruff check --fix .            # lint (fix before formatting — fixes reorder code)
+uv run ruff format .                 # format
+uv run ty check                      # type check
 ```
 
-No linter or formatter is configured; CI (`.github/workflows/ci.yml`) runs only
-`uv run pytest`, on Python 3.11 and 3.13. Don't add lint commands to CI without
-being asked.
+When working with Python, invoke the relevant `/astral:<skill>` — `/astral:uv`,
+`/astral:ty`, `/astral:ruff` — to ensure best practices are followed.
+
+CI (`.github/workflows/ci.yml`) has two jobs: `lint` runs
+`ruff check` + `ruff format --check` + `ty check` once on 3.13, and `test` runs
+pytest on 3.11 and 3.13. Both must stay green.
+
+Ruff and ty are configured in `pyproject.toml` and pinned in the dev group, so
+local runs match CI — prefer `uv run ruff`/`uv run ty` over `uvx`. The lint
+select list is deliberately broad (`E,W,F,I,UP,B,SIM,C4,PT,RUF`) and the tree is
+clean against it; `E501` is off because line length is `ruff format`'s job.
+Fix findings rather than adding `# noqa` / `# ty: ignore`.
 
 `README.md` covers setup, configuration variables, and usage in detail — consult
 it rather than duplicating that material here.

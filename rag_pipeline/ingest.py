@@ -103,7 +103,9 @@ def load_documents(data_dir: Path) -> list[Document]:
         except Exception as exc:
             # One unreadable file (bad encoding, corrupt PDF, permissions)
             # must not abort the whole ingest — skip it with a warning.
-            print(f"Warning: skipping unreadable file {source!r}: {exc}", file=sys.stderr)
+            print(
+                f"Warning: skipping unreadable file {source!r}: {exc}", file=sys.stderr
+            )
             continue
 
         if not text.strip():
