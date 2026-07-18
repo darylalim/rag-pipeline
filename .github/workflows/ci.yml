@@ -1,0 +1,36 @@
+name: CI
+
+on: push
+
+# Cancel superseded runs on the same ref so only the latest push is tested.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: pytest (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Minimum supported and latest — the ends of requires-python.
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+
+      # --frozen installs exactly what's in uv.lock (no re-resolution).
+      # The dev group (pytest) is included by default.
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      # Tests are fully offline (fake embedding + chat models), so no
+      # ANTHROPIC_API_KEY / secrets are required.
+      - name: Run tests
+        run: uv run pytest

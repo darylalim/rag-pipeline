@@ -96,6 +96,9 @@ ingest idempotency, the source helpers, the setup guards, an ingest→retrieve
 round-trip, and the generation path end-to-end (answer text plus source
 citations, and that retrieved context is injected into the prompt).
 
+A GitHub Actions workflow (`.github/workflows/ci.yml`) runs this suite on every
+push, on Python 3.11 and 3.13.
+
 ## Project structure
 
 ```
