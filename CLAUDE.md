@@ -12,8 +12,7 @@ uv run streamlit run app.py          # chat UI over the same pipeline
 uv run pytest                        # full suite (~7s wall: ~4s torch import, ~0.5s tests; offline)
 uv run pytest tests/test_config.py::test_defaults   # single test
 uv run pytest -k idempotent -v                      # by keyword
-uv run ruff check --fix .            # lint (fix before formatting — fixes reorder code)
-uv run ruff format .                 # format
+uv run ruff check --fix . && uv run ruff format .   # lint, then format (order matters)
 uv run ty check                      # type check
 ```
 
@@ -36,19 +35,15 @@ ordinary `uv run` would rebuild it at 3.13 — two full torch reinstalls.
 Add dependencies with `uv add` / `uv add --dev` rather than hand-editing
 `pyproject.toml`, so constraints and `uv.lock` stay derived rather than invented.
 
-Lint policy: the select list is deliberately broad (`E,W,F,I,UP,B,SIM,C4,PT,RUF`)
-and the tree is clean against it; `E501` is off because line length is
-`ruff format`'s job. **Fix findings rather than adding `# noqa` / `# ty: ignore`.**
-Prefer `uv run ruff`/`uv run ty` over `uvx`, so versions match the lock.
+The lint select list is broad and the tree is clean against it. **Fix findings
+rather than adding `# noqa` / `# ty: ignore`.** Prefer `uv run ruff`/`uv run ty`
+over `uvx`, so versions match the lock. Ruff's line length and ty's target
+version are both inherited (from the default and from `requires-python`) — don't
+re-pin them in `pyproject.toml`.
 
-The CI lint job installs only the dev group before running ruff, then the full
-environment before `ty check` — ruff needs no project dependencies, ty resolves
-imports through them. Keep `--no-sync` on the ruff steps: a plain `uv run`
-re-syncs the whole project first and reinstalls torch.
-
-`README.md` covers setup, configuration variables, usage, and what CI runs —
-consult it rather than duplicating that material here. Every CI job must stay
-green.
+`README.md` covers setup, configuration variables, usage, and what CI runs;
+`ci.yml`'s own comments cover why its steps are ordered as they are. Consult
+both rather than duplicating that material here. Every CI job must stay green.
 
 ## Architecture
 
