@@ -58,9 +58,12 @@ def main(argv: list[str] | None = None) -> int:
     query_parser.add_argument("question", help="The question to answer")
 
     args = parser.parse_args(argv)
-    settings = Settings.from_env()
 
     try:
+        # Inside the try: a malformed numeric env var (e.g. CHUNK_SIZE=abc)
+        # raises ValueError here, which the handler below turns into a friendly
+        # message rather than a traceback.
+        settings = Settings.from_env()
         if args.command == "ingest":
             return cmd_ingest(settings)
         # `required=True` guarantees a subcommand; "query" is the only other one.

@@ -45,3 +45,16 @@ def test_from_env_uses_defaults_when_unset(monkeypatch):
     assert s.chat_model == "claude-haiku-4-5"
     assert s.retrieval_k == 4
     assert s.chunk_size == 1000
+
+
+def test_from_env_empty_string_falls_back_to_default(monkeypatch):
+    # A set-but-empty var should fall back to the default, not pass "" through.
+    monkeypatch.setenv("CHAT_MODEL", "")
+    monkeypatch.setenv("COLLECTION_NAME", "")
+    monkeypatch.setenv("EMBEDDING_MODEL", "")
+
+    s = Settings.from_env()
+
+    assert s.chat_model == "claude-haiku-4-5"
+    assert s.collection_name == "rag_docs"
+    assert "MiniLM" in s.embedding_model

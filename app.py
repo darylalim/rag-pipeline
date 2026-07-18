@@ -33,7 +33,9 @@ st.caption(
 # a clear on-screen message instead of a stack trace.
 try:
     pipeline = load_pipeline()
-except (FileNotFoundError, RuntimeError) as exc:
+except (FileNotFoundError, RuntimeError, ValueError) as exc:
+    # FileNotFoundError: no/empty index. RuntimeError: missing API key.
+    # ValueError: a malformed numeric env var (e.g. CHUNK_SIZE=abc).
     st.error(str(exc))
     st.info("Then reload this page.")
     st.stop()

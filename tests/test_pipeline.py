@@ -51,6 +51,24 @@ def test_pipeline_requires_api_key(settings, fake_embeddings, monkeypatch):
         RAGPipeline(settings, embeddings=fake_embeddings)
 
 
+def test_pipeline_rejects_empty_index(settings, fake_embeddings, monkeypatch):
+    # persist_dir exists but nothing was ingested -> loud error, not silent empty.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-fake")
+    settings.persist_dir.mkdir(parents=True, exist_ok=True)
+    with pytest.raises(FileNotFoundError):
+        RAGPipeline(settings, embeddings=fake_embeddings)
+
+
+def test_pipeline_rejects_mismatched_collection(settings, fake_embeddings, monkeypatch):
+    import dataclasses
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-fake")
+    ingest_mod.ingest(settings, embeddings=fake_embeddings)  # into settings.collection_name
+    other = dataclasses.replace(settings, collection_name="different")
+    with pytest.raises(FileNotFoundError):
+        RAGPipeline(other, embeddings=fake_embeddings)
+
+
 def test_retrieve_round_trip(settings, fake_embeddings, monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-fake")
     ingest_mod.ingest(settings, embeddings=fake_embeddings)

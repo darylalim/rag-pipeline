@@ -33,6 +33,14 @@ def _env_int(name: str, default: int) -> int:
     return int(value) if value else default
 
 
+def _env_str(name: str, default: str) -> str:
+    # A set-but-empty var (e.g. `CHAT_MODEL=`) falls back to the default, so
+    # string settings behave like the int/path helpers rather than passing ""
+    # straight through to the model/store.
+    value = os.getenv(name)
+    return value if value else default
+
+
 @dataclass(frozen=True)
 class Settings:
     """Immutable bundle of pipeline configuration."""
@@ -67,9 +75,9 @@ class Settings:
         return cls(
             data_dir=_env_path("DATA_DIR", cls.data_dir),
             persist_dir=_env_path("PERSIST_DIR", cls.persist_dir),
-            collection_name=os.getenv("COLLECTION_NAME", cls.collection_name),
-            embedding_model=os.getenv("EMBEDDING_MODEL", cls.embedding_model),
-            chat_model=os.getenv("CHAT_MODEL", cls.chat_model),
+            collection_name=_env_str("COLLECTION_NAME", cls.collection_name),
+            embedding_model=_env_str("EMBEDDING_MODEL", cls.embedding_model),
+            chat_model=_env_str("CHAT_MODEL", cls.chat_model),
             max_tokens=_env_int("MAX_TOKENS", cls.max_tokens),
             chunk_size=_env_int("CHUNK_SIZE", cls.chunk_size),
             chunk_overlap=_env_int("CHUNK_OVERLAP", cls.chunk_overlap),

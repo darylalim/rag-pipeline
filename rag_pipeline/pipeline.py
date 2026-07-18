@@ -115,6 +115,16 @@ class RAGPipeline:
             embedding_function=embeddings or build_embeddings(settings),
             persist_directory=str(settings.persist_dir),
         )
+        # `persist_dir.exists()` alone is too weak: an empty directory or a
+        # COLLECTION_NAME that doesn't match what was ingested yields a
+        # silently-empty collection (get_or_create), so every question would be
+        # answered "I don't know". Fail loudly instead.
+        if not vectorstore.get(limit=1)["ids"]:
+            raise FileNotFoundError(
+                f"Index at {settings.persist_dir} (collection "
+                f"'{settings.collection_name}') is empty. Run `rag ingest` first, "
+                "and check COLLECTION_NAME matches the one used to ingest."
+            )
         self._retriever = vectorstore.as_retriever(
             search_kwargs={"k": settings.retrieval_k}
         )
