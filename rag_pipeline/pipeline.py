@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from langchain_anthropic import ChatAnthropic
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 
@@ -69,7 +70,7 @@ def unique_sources(docs: list[Document]) -> list[str]:
 class RAGPipeline:
     """Loads the persisted index and answers questions against it."""
 
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, embeddings: Embeddings | None = None) -> None:
         if not settings.persist_dir.exists():
             raise FileNotFoundError(
                 f"No index found at {settings.persist_dir}. "
@@ -86,9 +87,10 @@ class RAGPipeline:
 
         # Reload the existing store; the same embedding model that indexed the
         # documents must embed the queries, so we reuse the shared factory.
+        # `embeddings` is injectable for tests; production leaves it as None.
         vectorstore = Chroma(
             collection_name=settings.collection_name,
-            embedding_function=build_embeddings(settings),
+            embedding_function=embeddings or build_embeddings(settings),
             persist_directory=str(settings.persist_dir),
         )
         self._retriever = vectorstore.as_retriever(

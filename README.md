@@ -83,6 +83,17 @@ required; the rest have sensible defaults:
 Optional LangSmith tracing (`LANGSMITH_TRACING=true` + `LANGSMITH_API_KEY`) is
 picked up automatically if set — see `.env.example`.
 
+## Tests
+
+```bash
+uv run pytest
+```
+
+The suite runs fast and fully offline — it uses a deterministic fake embedding
+model (no `torch`, no model download) and never calls Claude, so no API key is
+needed. It covers configuration, the loader/splitter, ingest idempotency, the
+source helpers, the setup guards, and an ingest→retrieve round-trip.
+
 ## Project structure
 
 ```

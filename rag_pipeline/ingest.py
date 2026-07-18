@@ -12,6 +12,7 @@ from pathlib import Path
 
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
@@ -83,12 +84,13 @@ def split_documents(documents: list[Document], settings: Settings) -> list[Docum
     return splitter.split_documents(documents)
 
 
-def ingest(settings: Settings) -> int:
+def ingest(settings: Settings, embeddings: Embeddings | None = None) -> int:
     """Run the full indexing phase and persist the vector store.
 
     The persist directory is wiped first so re-ingesting is idempotent — you get
     a fresh index rather than duplicate chunks appended to the old one. Returns
-    the number of chunks indexed.
+    the number of chunks indexed. ``embeddings`` is injectable so tests can
+    substitute a lightweight fake; production callers leave it as None.
     """
     documents = load_documents(settings.data_dir)
     if not documents:
@@ -105,7 +107,7 @@ def ingest(settings: Settings) -> int:
 
     Chroma.from_documents(
         documents=chunks,
-        embedding=build_embeddings(settings),
+        embedding=embeddings or build_embeddings(settings),
         collection_name=settings.collection_name,
         persist_directory=str(settings.persist_dir),
     )
