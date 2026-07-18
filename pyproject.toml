@@ -1,0 +1,28 @@
+[project]
+name = "rag-pipeline"
+version = "0.1.0"
+description = "A local-embeddings RAG pipeline built with LangChain and Claude"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "langchain-core>=0.3",
+    "langchain-text-splitters>=0.3",
+    "langchain-huggingface>=0.1",
+    "langchain-chroma>=0.2",
+    "langchain-anthropic>=0.3",
+    "sentence-transformers>=3.0",
+    "chromadb>=0.5",
+    "streamlit>=1.40",
+    "python-dotenv>=1.0",
+    "pypdf>=5.0",
+]
+
+[project.scripts]
+rag = "rag_pipeline.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["rag_pipeline"]
