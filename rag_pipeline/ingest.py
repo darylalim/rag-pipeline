@@ -7,7 +7,7 @@ Chroma index from disk.
 
 from __future__ import annotations
 
-import shutil
+import sys
 from pathlib import Path
 
 from langchain_chroma import Chroma
@@ -54,15 +54,21 @@ def load_documents(data_dir: Path) -> list[Document]:
         if not path.is_file() or path.suffix.lower() not in SUPPORTED_SUFFIXES:
             continue
 
-        if path.suffix.lower() == ".pdf":
-            text = _read_pdf(path)
-        else:
-            text = path.read_text(encoding="utf-8")
+        source = path.relative_to(data_dir).as_posix()
+        try:
+            if path.suffix.lower() == ".pdf":
+                text = _read_pdf(path)
+            else:
+                text = path.read_text(encoding="utf-8")
+        except Exception as exc:
+            # One unreadable file (bad encoding, corrupt PDF, permissions)
+            # must not abort the whole ingest — skip it with a warning.
+            print(f"Warning: skipping unreadable file {source!r}: {exc}", file=sys.stderr)
+            continue
 
         if not text.strip():
-            continue  # skip empty / unreadable files
+            continue  # skip empty files
 
-        source = path.relative_to(data_dir).as_posix()
         documents.append(Document(page_content=text, metadata={"source": source}))
 
     return documents
@@ -87,9 +93,10 @@ def split_documents(documents: list[Document], settings: Settings) -> list[Docum
 def ingest(settings: Settings, embeddings: Embeddings | None = None) -> int:
     """Run the full indexing phase and persist the vector store.
 
-    The persist directory is wiped first so re-ingesting is idempotent — you get
-    a fresh index rather than duplicate chunks appended to the old one. Returns
-    the number of chunks indexed. ``embeddings`` is injectable so tests can
+    Only this collection's existing vectors are cleared before the fresh chunks
+    are added, so re-ingesting is idempotent (no duplicate chunks) *without*
+    deleting the persist directory — which may hold unrelated data. Returns the
+    number of chunks indexed. ``embeddings`` is injectable so tests can
     substitute a lightweight fake; production callers leave it as None.
     """
     documents = load_documents(settings.data_dir)
@@ -101,14 +108,16 @@ def ingest(settings: Settings, embeddings: Embeddings | None = None) -> int:
 
     chunks = split_documents(documents, settings)
 
-    # Rebuild from scratch: remove any prior index so we don't append duplicates.
-    if settings.persist_dir.exists():
-        shutil.rmtree(settings.persist_dir)
-
-    Chroma.from_documents(
-        documents=chunks,
-        embedding=embeddings or build_embeddings(settings),
+    store = Chroma(
         collection_name=settings.collection_name,
+        embedding_function=embeddings or build_embeddings(settings),
         persist_directory=str(settings.persist_dir),
     )
+    # Rebuild this collection in place: drop its existing vectors (if any), then
+    # add the fresh chunks. Scoped to the collection, so re-ingest never touches
+    # other files in the persist directory.
+    existing_ids = store.get()["ids"]
+    if existing_ids:
+        store.delete(ids=existing_ids)
+    store.add_documents(chunks)
     return len(chunks)

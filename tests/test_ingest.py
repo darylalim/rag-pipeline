@@ -24,6 +24,28 @@ def test_load_documents_missing_dir(tmp_path):
         ingest_mod.load_documents(tmp_path / "does-not-exist")
 
 
+def test_load_documents_skips_unreadable_file(tmp_path):
+    root = tmp_path / "data"
+    root.mkdir()
+    (root / "good.md").write_text("readable content", encoding="utf-8")
+    # Invalid UTF-8 bytes: must be skipped, not abort the whole load.
+    (root / "bad.txt").write_bytes(b"\xff\xfe not valid utf-8 \x80\x81")
+
+    docs = ingest_mod.load_documents(root)
+
+    assert [d.metadata["source"] for d in docs] == ["good.md"]
+
+
+def test_ingest_preserves_unrelated_files_in_persist_dir(settings, fake_embeddings):
+    settings.persist_dir.mkdir(parents=True, exist_ok=True)
+    sentinel = settings.persist_dir / "KEEP_ME.txt"
+    sentinel.write_text("do not delete", encoding="utf-8")
+
+    ingest_mod.ingest(settings, embeddings=fake_embeddings)
+
+    assert sentinel.exists(), "ingest must not delete unrelated files in persist_dir"
+
+
 def test_split_preserves_source_and_bounds_chunk_size(settings):
     long_text = "sentence. " * 400  # ~4000 chars -> many 200-char chunks
     doc = Document(page_content=long_text, metadata={"source": "big.md"})

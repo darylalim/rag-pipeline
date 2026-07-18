@@ -79,8 +79,19 @@ if question := st.chat_input("Ask a question about the documents..."):
         st.markdown(question)
 
     with st.chat_message("assistant"):
-        with st.spinner("Retrieving context and generating an answer..."):
-            result = pipeline.answer(question)
+        try:
+            with st.spinner("Retrieving context and generating an answer..."):
+                result = pipeline.answer(question)
+        except Exception as exc:
+            # Any failure (bad/expired key, rate limit, network) — show it in
+            # the chat instead of a raw traceback, and record it so the
+            # question isn't left unanswered in the replayed history.
+            error_msg = f"⚠️ Generation failed: {exc}"
+            st.error(error_msg)
+            st.session_state.messages.append(
+                {"role": "assistant", "content": error_msg, "sources": []}
+            )
+            st.stop()
         st.markdown(result.text)
         sources = unique_sources(result.sources)
         _render_sources(sources)
