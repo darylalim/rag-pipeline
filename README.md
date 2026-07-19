@@ -112,13 +112,26 @@ the run being torn down mid-answer — so a question can never be left in the
 history with nothing under it.
 
 Two files enforce the project's own invariants rather than its behavior.
-`tests/test_invariants.py` checks every tracked `.py` file against the rules in
-`tests/invariants.py` — no inline store/embedding construction outside the
-factories, lazy CLI imports, no lint suppressions, and that every setting is
-documented here and in `.env.example`. `tests/test_hooks.py` covers the two
-optional Claude Code hooks in `.claude/` that report the same problems earlier;
-they are a convenience for one editor, and deleting them changes nothing about
-what CI enforces.
+`tests/test_invariants.py` checks every tracked `.py` file against the rules
+declared in `tests/invariants.py`:
+
+| Rule                  | Forbids                                                        | Why |
+| --------------------- | -------------------------------------------------------------- | --- |
+| `chroma-factory`      | constructing `Chroma(...)` outside `ingest.py`                   | a collection's identity is (persist dir, name, embedding function); ingest and query must open it the same way |
+| `embeddings-factory`  | constructing `HuggingFaceEmbeddings(...)` outside `ingest.py`    | the same model must embed documents and questions; in tests, inject a fake instead |
+| `lazy-cli-imports`    | top-level `ingest`/`pipeline` imports in `cli.py`                | they pull in torch (~4.3s versus ~0.08s for `rag --help`) |
+| `no-suppressions`     | lint/type suppression comments                                   | fix the finding instead |
+| `no-rmtree`           | `rmtree` in `ingest.py`                                          | ingest is a scoped collection rebuild; the persist dir may hold unrelated data |
+| `no-sampling-params`  | setting `temperature`/`top_p` in `pipeline.py`                   | grounding comes from retrieved context, and some models reject sampling params outright |
+
+Plus the settings triad: every `Settings` field must be documented here and in
+`.env.example`. This table is itself checked — `test_every_rule_is_documented`
+fails if a rule is added without a row, the same way `test_every_setting_is_documented`
+guards the config table above.
+
+`tests/test_hooks.py` covers the two optional Claude Code hooks in `.claude/`
+that report the same problems earlier; they are a convenience for one editor,
+and deleting them changes nothing about what CI enforces.
 
 ## Linting and type checking
 

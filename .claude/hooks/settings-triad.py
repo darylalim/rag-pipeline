@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
-"""Stop hook: check that a new Settings field is documented before the turn ends.
+"""Stop hook: check the derived-documentation rules before the turn ends.
 
-Thin by design, like its sibling. The rule lives in ``tests/invariants.py`` and
-is enforced for everyone by ``tests/test_invariants.py``; this hook only makes
-the feedback arrive while config.py is still on screen instead of at the next
-pytest run.
+Two of them, and they are the same rule twice: a Settings field must reach
+`.env.example` and the README config table, and an invariant in ``RULES`` must
+reach the README rule table. Both exist because the documentation site is the
+one place nothing else looks -- ruff, ty and the whole suite stay green against
+a stale README -- so both are derived from the declaration rather than kept by
+hand.
+
+Thin by design, like its sibling. The rules live in ``tests/invariants.py`` and
+are enforced for everyone by ``tests/test_invariants.py``; this hook only makes
+the feedback arrive while the declaration is still on screen instead of at the
+next pytest run.
 
 Stop rather than PostToolUse: when config.py is written, `.env.example` and the
 README legitimately do not have their entry yet, so a per-edit check would fire
@@ -55,14 +62,13 @@ def load_invariants(project_root: Path) -> ModuleType | None:
     return module
 
 
-def sites_touched(project: Path, sites: tuple[str, ...]) -> bool | None:
-    """Has the working tree modified config.py or any documentation site?
+def paths_touched(project: Path, paths: tuple[str, ...]) -> bool | None:
+    """Has the working tree modified a declaration or its documentation site?
 
     None when git cannot answer, which the caller treats as "report anyway"
     rather than "nothing changed" -- an unavailable git must not silently
     disable enforcement.
     """
-    paths = ["rag_pipeline/config.py", *sites]
     try:
         result = subprocess.run(
             ["git", "-C", str(project), "status", "--porcelain", "--", *paths],
@@ -88,15 +94,32 @@ if invariants is None:
     print("settings-triad: cannot load rules, not enforcing", file=sys.stderr)
     sys.exit(1)
 
-problems = invariants.settings_problems(root)
+# Each check pairs its problems with the paths whose modification makes those
+# problems this turn's business, and with how to explain them.
+checks = (
+    (
+        invariants.settings_problems(root),
+        ("rag_pipeline/config.py", *invariants.SETTINGS_SITES),
+        "Settings sites incomplete (CLAUDE.md: adding a Settings field means "
+        "config.py + .env.example + the README config table).",
+    ),
+    (
+        invariants.rules_problems(root),
+        ("tests/invariants.py", invariants.RULES_SITE),
+        "Invariant rules undocumented (CLAUDE.md: adding a rule means a Rule in "
+        "RULES + a row in the README rule table).",
+    ),
+)
 
 # The git call is the expensive part of this hook (~11.6ms, versus ~0.07ms to
 # read and scan the files), so consult it only once there is something to
 # report. On a consistent tree -- the steady state -- git is never forked.
-if problems and sites_touched(root, invariants.SETTINGS_SITES) is not False:
-    print(
-        "Settings sites incomplete (CLAUDE.md: adding a Settings field means "
-        "config.py + .env.example + the README config table).\n" + "\n".join(problems),
-        file=sys.stderr,
-    )
+reports = [
+    header + "\n" + "\n".join(problems)
+    for problems, paths, header in checks
+    if problems and paths_touched(root, paths) is not False
+]
+
+if reports:
+    print("\n\n".join(reports), file=sys.stderr)
     sys.exit(2)

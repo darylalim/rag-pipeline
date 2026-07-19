@@ -17,7 +17,13 @@ from pathlib import Path
 import pytest
 
 from rag_pipeline.config import ENV_VARS, Settings
-from tests.invariants import RULES, settings_fields, settings_problems, violations
+from tests.invariants import (
+    RULES,
+    rules_problems,
+    settings_fields,
+    settings_problems,
+    violations,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -188,6 +194,27 @@ def test_every_rule_has_a_case_in_both_directions() -> None:
     """A rule with no test is a rule that can rot unnoticed."""
     assert len(RULES) == 6
     assert len({rule.name for rule in RULES}) == len(RULES)
+
+
+def test_every_rule_is_documented() -> None:
+    """The README's rule table lists every rule that actually exists.
+
+    The counterpart to `test_every_setting_is_documented` below, and added for
+    the same reason after the same failure: the prose had fallen two rules behind
+    `RULES` with the whole suite green, because a rule's existence is invisible
+    to every other check.
+    """
+    assert rules_problems(ROOT) == []
+
+
+def test_an_undocumented_rule_is_reported(tmp_path: Path) -> None:
+    """The check fails when a rule is missing, not merely when it is present.
+
+    Without this, `rules_problems` returning [] unconditionally — a bad regex, a
+    renamed table — would read as success forever.
+    """
+    (tmp_path / "README.md").write_text("| `chroma-factory` | only this one |\n")
+    assert len(rules_problems(tmp_path)) == len(RULES) - 1
 
 
 # --- the Settings documentation rule -----------------------------------------

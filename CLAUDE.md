@@ -175,10 +175,13 @@ second source of truth: delete `.claude/` and nothing stops being enforced.
 | ----- | ------ | ---- |
 | `tests/test_invariants.py` | the whole tree, everyone | CI and `uv run pytest` |
 | `.claude/hooks/invariant-guard.py` (`PreToolUse` on `Edit`\|`Write`) | the text about to be written | during a Claude session |
-| `.claude/hooks/settings-triad.py` (`Stop`) | Settings documented at all three sites | end of a Claude turn |
+| `.claude/hooks/settings-triad.py` (`Stop`) | Settings documented at all three sites; every rule documented in the README rule table | end of a Claude turn |
 
-Adding a rule means adding a `Rule` to `RULES` plus a case in each direction in
-`test_invariants.py`. Two properties are load-bearing and easy to break:
+Adding a rule means adding a `Rule` to `RULES`, a case in each direction in
+`test_invariants.py`, and a row in the README rule table —
+`test_every_rule_is_documented` is what catches the last one, and it exists
+because the README's prose had already fallen two rules behind `RULES` with the
+whole suite green. Two properties are load-bearing and easy to break:
 
 - Rules match a **masked** copy of the text: string literals are blanked for
   every rule, comments too for all but the suppression rule. Without that, a

@@ -173,6 +173,38 @@ def violations(relpath: str, text: str) -> list[str]:
     ]
 
 
+# --- the rule documentation rule ---------------------------------------------
+
+# Where a rule must be documented, beyond RULES itself.
+RULES_SITE = "README.md"
+
+
+def rules_problems(root: Path) -> list[str]:
+    """Report any rule in :data:`RULES` with no row in the README's rule table.
+
+    A rule is met as a test failure, so an undocumented rule is one the
+    contributor was never told about — they read a style preference and get a
+    hard CI failure naming a rule no document mentions. Nothing else catches
+    that: a rule's existence is invisible to ruff, ty and the rest of the suite,
+    which is exactly the hole the settings triad already found the hard way (the
+    README's prose fell two rules behind ``RULES`` while everything stayed
+    green). Deriving the requirement from ``RULES`` costs one test and makes that
+    drift inexpressible rather than merely detectable — the same trade
+    ``config.ENV_VARS`` makes for environment variables.
+    """
+    readme = root / RULES_SITE
+    if not readme.is_file():
+        return []
+
+    readme_text = readme.read_text(errors="ignore")
+    return [
+        f"  {rule.name}: missing from {RULES_SITE} (add a row for `{rule.name}`)"
+        for rule in RULES
+        # A row in the README rule table, e.g. "| `no-rmtree` | ... |".
+        if not re.search(rf"^\|\s*`{rule.name}`\s*\|", readme_text, re.MULTILINE)
+    ]
+
+
 # --- the Settings documentation rule -----------------------------------------
 
 # Where a Settings field must appear, beyond config.py itself.

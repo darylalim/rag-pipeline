@@ -21,6 +21,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.invariants import RULES
+
 ROOT = Path(__file__).resolve().parent.parent
 GUARD = ROOT / ".claude" / "hooks" / "invariant-guard.py"
 TRIAD = ROOT / ".claude" / "hooks" / "settings-triad.py"
@@ -183,12 +185,20 @@ def test_guard_ignores_irrelevant_payloads(payload: dict[str, object]) -> None:
 # --- settings-triad: the working-tree gate -----------------------------------
 
 
-def build_project(tmp_path: Path, *, documented: bool) -> Path:
+def build_project(
+    tmp_path: Path, *, documented: bool, rules_documented: bool = True
+) -> Path:
     """A minimal project declaring two settings, one of them undocumented.
 
     Hand-built rather than copied from the repo: the hook only parses a Settings
     dataclass and two documentation files, so a faithful copy would add coupling
     without adding coverage.
+
+    The rule rows are the exception, and are generated from the real `RULES`
+    rather than written out: the hook loads the repo's own `invariants.py`, so
+    the rules this project must document are whatever that module declares. A
+    hand-written list here would be a third copy of exactly the list the rule
+    under test exists to stop anyone from keeping by hand.
     """
     (tmp_path / "rag_pipeline").mkdir()
     (tmp_path / "rag_pipeline" / "config.py").write_text(
@@ -203,6 +213,8 @@ def build_project(tmp_path: Path, *, documented: bool) -> Path:
     if documented:
         env += "# RERANK_TOP_N=5\n"
         readme += "| `RERANK_TOP_N` | `5` | Rerank |\n"
+    if rules_documented:
+        readme += "".join(f"| `{rule.name}` | forbids | why |\n" for rule in RULES)
     (tmp_path / ".env.example").write_text(env)
     (tmp_path / "README.md").write_text(readme)
 
@@ -248,6 +260,19 @@ def test_triad_blocks_an_undocumented_setting(tmp_path: Path) -> None:
 def test_triad_passes_when_documented(tmp_path: Path) -> None:
     project = build_project(tmp_path, documented=True)
     assert run_hook(TRIAD, {}, project).returncode == ALLOW
+
+
+def test_triad_blocks_an_undocumented_rule(tmp_path: Path) -> None:
+    """The rule table is gated exactly like the settings sites.
+
+    Same hook, second derived-documentation check: a rule that reaches `RULES`
+    without reaching the README is reported by name, so the omission is fixed
+    while invariants.py is still on screen.
+    """
+    project = build_project(tmp_path, documented=True, rules_documented=False)
+    result = run_hook(TRIAD, {}, project)
+    assert result.returncode == BLOCK
+    assert "no-rmtree" in result.stderr
 
 
 def test_triad_ignores_committed_drift_when_nothing_changed(tmp_path: Path) -> None:
