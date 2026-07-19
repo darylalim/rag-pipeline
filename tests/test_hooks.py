@@ -333,6 +333,12 @@ def build_project(
     test_config_override: str | None = None,
 ) -> Path:
     """A fake project root declaring `var`, documented only where asked."""
+    if in_delenv and test_config_override is not None:
+        raise ValueError(
+            "in_delenv and test_config_override both set: the override replaces "
+            "the whole file, so in_delenv would be silently discarded."
+        )
+
     (tmp_path / "rag_pipeline").mkdir()
     (tmp_path / "tests").mkdir()
 
@@ -341,6 +347,9 @@ def build_project(
     # `_env_*("NAME"` with double quotes, so re-quoting the anchor would drop
     # RETRIEVAL_K from the fixture's declared set and weaken every case below.
     anchor = 'retrieval_k=_env_int("RETRIEVAL_K", cls.retrieval_k),'
+    # Without this, a reformatted config.py makes `replace` a no-op and every
+    # BLOCK case fails as `0 == 2`, pointing at the hook instead of the anchor.
+    assert anchor in config, f"anchor no longer present in config.py: {anchor!r}"
     (tmp_path / "rag_pipeline/config.py").write_text(
         config.replace(anchor, f'{anchor}\n            extra={helper}("{var}", 5),')
     )
@@ -361,8 +370,10 @@ def build_project(
 
     test_config = (ROOT / "tests/test_config.py").read_text()
     if in_delenv:
+        delenv_anchor = '        "MAX_TOKENS",'
+        assert delenv_anchor in test_config, "delenv tuple no longer ends as expected"
         test_config = test_config.replace(
-            '        "MAX_TOKENS",', f'        "MAX_TOKENS",\n        "{var}",', 1
+            delenv_anchor, f'{delenv_anchor}\n        "{var}",', 1
         )
     if test_config_override is not None:
         test_config = test_config_override
@@ -371,8 +382,34 @@ def build_project(
     return tmp_path
 
 
+def make_git_repo(project: Path) -> None:
+    """Commit everything in `project`, so its working tree starts clean.
+
+    Isolated from the developer's global git config: a signing key or hook
+    there would otherwise make these tests fail for unrelated reasons.
+    """
+    env = {
+        **os.environ,
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_SYSTEM": os.devnull,
+    }
+    for args in (
+        ["init", "-q"],
+        ["add", "-A"],
+        ["-c", "user.email=t@example.com", "-c", "user.name=T", "commit", "-qm", "x"],
+    ):
+        subprocess.run(
+            ["git", "-C", str(project), *args], capture_output=True, check=True, env=env
+        )
+
+
 def test_triad_passes_on_the_real_repo() -> None:
-    """All 9 settings are documented at all four sites today."""
+    """The hook never blocks a turn in this repo.
+
+    Note this passes for either of two reasons — the working-tree gate finding
+    no settings site dirty, or the full check running clean. The fixture tests
+    below cover the validation itself; this one is the end-to-end smoke test.
+    """
     assert run_hook(TRIAD, {}).returncode == ALLOW
 
 
@@ -437,6 +474,48 @@ def test_triad_survives_renaming_the_defaults_test(tmp_path: Path) -> None:
         tmp_path, in_env_example=True, in_readme=True, test_config_override=renamed
     )
     assert run_hook(TRIAD, {}, project).returncode == ALLOW
+
+
+def test_triad_ignores_committed_drift_when_nothing_changed(tmp_path: Path) -> None:
+    """An unrelated turn must not be blocked by drift it did not cause.
+
+    Without the working-tree gate, one stale README row would exit 2 at the end
+    of every turn until someone fixed it — including turns that never touched
+    config.py.
+    """
+    project = build_project(tmp_path)  # declares a var documented nowhere
+    make_git_repo(project)  # ...but the tree is clean, so this turn is unrelated
+    assert run_hook(TRIAD, {}, project).returncode == ALLOW
+
+
+def test_triad_checks_once_a_settings_site_is_dirty(tmp_path: Path) -> None:
+    """The gate is about *scope*, not about weakening the check."""
+    project = build_project(tmp_path)
+    make_git_repo(project)
+
+    config = project / "rag_pipeline" / "config.py"
+    config.write_text(
+        config.read_text().replace(
+            "extra=_env_int(", "extra2=_env_int('X', 1)\n            extra=_env_int("
+        )
+    )
+
+    result = run_hook(TRIAD, {}, project)
+    assert result.returncode == BLOCK
+    assert "RERANK_TOP_N" in result.stderr
+
+
+def test_triad_checks_when_git_cannot_answer(tmp_path: Path) -> None:
+    """No repo means the gate must fail toward enforcing, not toward silence."""
+    project = build_project(tmp_path)  # no git init
+    assert not (project / ".git").exists()
+    assert run_hook(TRIAD, {}, project).returncode == BLOCK
+
+
+def test_build_project_rejects_conflicting_delenv_arguments(tmp_path: Path) -> None:
+    """Passing both would silently discard in_delenv and test the wrong state."""
+    with pytest.raises(ValueError, match="silently discarded"):
+        build_project(tmp_path, in_delenv=True, test_config_override="whatever")
 
 
 def test_triad_reports_once_when_the_delenv_loop_is_gone(tmp_path: Path) -> None:

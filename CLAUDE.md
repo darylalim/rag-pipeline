@@ -9,7 +9,7 @@ uv sync                              # install deps (creates .venv)
 uv run rag ingest                    # rebuild the Chroma index from data/
 uv run rag query "your question"     # ask from the terminal
 uv run streamlit run app.py          # chat UI over the same pipeline
-uv run pytest                        # full suite (~6.5s wall: ~4s torch import, ~1.8s tests; offline)
+uv run pytest                        # full suite (~7s wall: ~4s torch import, ~2.5s tests; offline)
 uv run pytest tests/test_config.py::test_defaults   # single test
 uv run pytest -k idempotent -v                      # by keyword
 uv run ruff check --fix . && uv run ruff format .   # lint, then format (order matters)
@@ -161,6 +161,17 @@ Two design points worth preserving if you edit them:
   written the other three sites legitimately do not have their entry yet, so a
   per-edit check would fire on every *correct* change. It honors
   `stop_hook_active` so it nudges once rather than looping.
+- `settings-triad` only runs when the working tree has touched one of the four
+  sites, so a turn about something else is never blocked by drift it did not
+  cause. Within that scope it validates *all* settings, not just the changed
+  one. The tradeoff: drift that is already committed goes unreported until
+  someone next touches one of the four files. If git cannot answer, the check
+  runs unconditionally — the failure direction is "enforce anyway".
+
+Both hooks exit 1, not 2, on an unparseable payload: a shape change in a future
+Claude Code release must not wedge every turn, but it must not disable
+enforcement silently either, so they print one line saying they are not
+enforcing. Treat that line as a bug report about the hook.
 
 These scripts are linted by CI like any other file — `ruff check .` does not
 exclude dot-directories, so a `# noqa`-free, formatted hook is not optional.
