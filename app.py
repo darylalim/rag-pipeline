@@ -110,19 +110,27 @@ for message in st.session_state.messages:
             _render_sources(message.get("sources", []))
 
 # Handle a new question.
-# submit_mode="disable" is load-bearing, not cosmetic: answering blocks for
-# seconds, and a second submit during it reruns the script, killing this one
-# between the user append below and the assistant append at the end. That leaves
-# a question in the history with no answer under it, permanently — the same state
-# the error branch below exists to prevent. Disabling the input makes it
-# unreachable.
+# submit_mode="disable" removes the common way to interrupt an in-flight answer
+# (submitting again), but it is not sufficient on its own: the toolbar Stop
+# button raises a BaseException that no `except Exception` sees, and streaming
+# leaves it reachable for the whole generation. The pairing below, not this
+# parameter, is what actually guarantees a consistent history.
 if question := st.chat_input(
     "Ask a question about the documents...", submit_mode="disable"
 ):
-    st.session_state.messages.append({"role": "user", "content": question})
+    # Rendered now but deliberately not stored yet — the turn is committed as a
+    # pair in the `finally` below.
     with st.chat_message("user"):
         st.text(question)
 
+    # Stands unless a branch below replaces it, so an interruption still records
+    # *something* under the question rather than leaving it dangling.
+    reply = {
+        "role": "assistant",
+        "content": "Interrupted before an answer was generated.",
+        "sources": [],
+        "error": True,
+    }
     with st.chat_message("assistant"):
         try:
             # Retrieval is a separate step so the spinner covers only the part
@@ -132,31 +140,33 @@ if question := st.chat_input(
             with st.spinner("Retrieving context..."):
                 docs = pipeline.retrieve(question)
             answer_text = st.write_stream(pipeline.stream_answer(question, docs))
+            # write_stream already rendered the text; it is only re-read here to
+            # store it. The join covers the declared list[Any] return — the
+            # chain yields str, but replay feeds this to st.markdown, which
+            # needs one. Inside the try because join raises on a non-str list,
+            # and that belongs in the handler rather than as a crash page.
+            text = answer_text if isinstance(answer_text, str) else "".join(answer_text)
+            sources = unique_sources(docs)
+            _render_sources(sources)
+            reply = {"role": "assistant", "content": text, "sources": sources}
         except Exception as exc:
             # Any failure (bad/expired key, rate limit, network) — show it in
-            # the chat instead of a raw traceback, and record it so the
-            # question isn't left unanswered in the replayed history.
-            # The `error` flag keeps the stored text free of presentation, so the
-            # replay above can route it back through st.error rather than
-            # rendering a failure as if it were an answer.
+            # the chat instead of a raw traceback. The `error` flag keeps the
+            # stored text free of presentation, so the replay above can route it
+            # back through st.error rather than rendering a failure as if it
+            # were an answer.
             error_msg = f"Generation failed: {exc}"
             st.error(error_msg, icon=":material/error:")
-            st.session_state.messages.append(
-                {
-                    "role": "assistant",
-                    "content": error_msg,
-                    "sources": [],
-                    "error": True,
-                }
+            reply = {
+                "role": "assistant",
+                "content": error_msg,
+                "sources": [],
+                "error": True,
+            }
+        finally:
+            # Both halves land together, so no exit path — success, handled
+            # failure, or an interruption that unwinds past the handler — can
+            # leave a question in the history with no answer under it.
+            st.session_state.messages.extend(
+                [{"role": "user", "content": question}, reply]
             )
-            st.stop()
-        # write_stream already rendered the text; it is only re-read here to
-        # store it. The join guards the declared list[Any] return — the chain
-        # yields str, but replay feeds this to st.markdown, which needs one.
-        text = answer_text if isinstance(answer_text, str) else "".join(answer_text)
-        sources = unique_sources(docs)
-        _render_sources(sources)
-
-    st.session_state.messages.append(
-        {"role": "assistant", "content": text, "sources": sources}
-    )
