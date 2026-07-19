@@ -8,6 +8,7 @@ single pipeline and reuse it across queries.
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 import anthropic
@@ -129,11 +130,19 @@ class RAGPipeline:
         """Return the chunks most relevant to the question."""
         return self._retriever.invoke(question)
 
-    def answer(self, question: str) -> Answer:
-        """Retrieve context, then generate a grounded answer with sources."""
-        docs = self.retrieve(question)
+    def stream_answer(self, question: str, docs: list[Document]) -> Iterator[str]:
+        """Yield the grounded answer in pieces, as the model produces them.
+
+        Retrieval is the caller's (`retrieve()`) rather than this method's, so a
+        frontend can display sources without searching twice.
+
+        This is the single generation path — `answer()` is a join over it — so
+        the provider-error translation lives here only. It must wrap the
+        *iteration*: `.stream()` is lazy, so a failed request surfaces while the
+        generator is being consumed, not when it is created.
+        """
         try:
-            text = self._chain.invoke(
+            yield from self._chain.stream(
                 {"context": format_docs(docs), "question": question}
             )
         except anthropic.APIError as exc:
@@ -141,4 +150,13 @@ class RAGPipeline:
             # into a generic RuntimeError, so frontends handle a failed
             # generation uniformly without depending on the Anthropic SDK.
             raise RuntimeError(f"Claude API request failed: {exc}") from exc
-        return Answer(text=text, sources=docs)
+
+    def answer(self, question: str) -> Answer:
+        """Retrieve context, then generate a grounded answer with sources.
+
+        Consumes `stream_answer()` to completion rather than calling the chain
+        itself, so the streaming and all-at-once shapes share one code path and
+        one provider-error translation.
+        """
+        docs = self.retrieve(question)
+        return Answer(text="".join(self.stream_answer(question, docs)), sources=docs)

@@ -26,13 +26,20 @@ def cmd_query(settings: Settings, question: str) -> int:
     from rag_pipeline.pipeline import RAGPipeline, unique_sources
 
     pipeline = RAGPipeline(settings)
-    # answer() translates provider errors to RuntimeError, which main() reports.
-    result = pipeline.answer(question)
+    docs = pipeline.retrieve(question)
 
     print(f"\nQ: {question}\n")
-    print(result.text)
+    # Printed as it arrives rather than after the full generation, so a long
+    # answer starts appearing immediately. stream_answer() translates provider
+    # errors to RuntimeError, which main() reports — note that a mid-stream
+    # failure leaves the partial answer on screen above the error, which is the
+    # cost of streaming at all.
+    for chunk in pipeline.stream_answer(question, docs):
+        print(chunk, end="", flush=True)
+    print()
+
     print("\nSources:")
-    for src in unique_sources(result.sources):
+    for src in unique_sources(docs):
         print(f"  - {src}")
     return 0
 

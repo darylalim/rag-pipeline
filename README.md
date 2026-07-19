@@ -47,7 +47,8 @@ whenever the documents change — it rebuilds from scratch, so no duplicates.
 uv run rag query "What is chunking and why do we overlap chunks?"
 ```
 
-Prints a grounded answer followed by the source files it drew from.
+Streams the grounded answer as Claude produces it, then prints the source files
+it drew from.
 
 ### 3. Or use the chat app
 
@@ -55,8 +56,8 @@ Prints a grounded answer followed by the source files it drew from.
 uv run streamlit run app.py
 ```
 
-A browser chat UI over the same pipeline, with per-answer source citations and a
-sidebar showing the active configuration.
+A browser chat UI over the same pipeline, streaming each answer token by token,
+with per-answer source citations and a sidebar showing the active configuration.
 
 ## Add your own documents
 
@@ -152,7 +153,7 @@ beforehand, see the commands above.
 rag_pipeline/
   config.py     Settings, loaded from environment variables
   ingest.py     load -> split -> embed -> store (build_embeddings lives here)
-  pipeline.py   RAGPipeline: load index + Claude, answer(question) -> (text, sources)
+  pipeline.py   RAGPipeline: load index + Claude, stream_answer(...) / answer(...)
 cli.py entrypoint ->  rag_pipeline/cli.py   (rag ingest | rag query "...")
 app.py                Streamlit chat UI
 data/                 sample documents (swap in your own)
@@ -167,7 +168,9 @@ data/                 sample documents (swap in your own)
   reloads the index instead of re-embedding.
 - **Claude generation** (`langchain-anthropic`) is prompted to answer only from
   the retrieved context and to cite its sources, which is what turns a general
-  chat model into a document-grounded question-answerer.
+  chat model into a document-grounded question-answerer. Both frontends stream
+  it: `stream_answer()` is the single generation path, and `answer()` — for
+  library callers who just want the finished string — is a join over it.
 
 Because these are LangChain integrations, swapping any piece — a different
 embedding model, vector store, or chat model — is a one-line change in

@@ -189,8 +189,12 @@ CI like any other file: `ruff check .` does not exclude dot-directories.
 - New failure modes must fit `FileNotFoundError | RuntimeError | ValueError` —
   the union both frontends catch (`cli.py:65`, `app.py:60`; see the comment at
   `app.py:61-62` for the precise per-type mapping). Don't add a fourth type.
-- Preserve `answer()`'s `anthropic.APIError` → `RuntimeError` translation, so
-  frontends never import the Anthropic SDK.
+- Preserve `stream_answer()`'s `anthropic.APIError` → `RuntimeError`
+  translation, so frontends never import the Anthropic SDK. It lives there and
+  nowhere else: `answer()` is a join over `stream_answer()`, so both shapes
+  inherit one translation. Note it wraps the *iteration*, not the `.stream()`
+  call — the chain is lazy, so a provider error surfaces during consumption.
+  Both frontends stream, so that generator is the path users actually take.
 - Keep the empty-collection guard in `RAGPipeline.__init__`: Chroma's
   `get_or_create` silently returns an *empty* collection on a `COLLECTION_NAME`
   mismatch, so without it every question is answered "I don't know."

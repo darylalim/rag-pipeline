@@ -125,8 +125,13 @@ if question := st.chat_input(
 
     with st.chat_message("assistant"):
         try:
-            with st.spinner("Retrieving context and generating an answer..."):
-                result = pipeline.answer(question)
+            # Retrieval is a separate step so the spinner covers only the part
+            # with nothing to show; generation then streams in visibly, and the
+            # sources below come from these same docs rather than a second
+            # search.
+            with st.spinner("Retrieving context..."):
+                docs = pipeline.retrieve(question)
+            answer_text = st.write_stream(pipeline.stream_answer(question, docs))
         except Exception as exc:
             # Any failure (bad/expired key, rate limit, network) — show it in
             # the chat instead of a raw traceback, and record it so the
@@ -145,10 +150,13 @@ if question := st.chat_input(
                 }
             )
             st.stop()
-        st.markdown(result.text)
-        sources = unique_sources(result.sources)
+        # write_stream already rendered the text; it is only re-read here to
+        # store it. The join guards the declared list[Any] return — the chain
+        # yields str, but replay feeds this to st.markdown, which needs one.
+        text = answer_text if isinstance(answer_text, str) else "".join(answer_text)
+        sources = unique_sources(docs)
         _render_sources(sources)
 
     st.session_state.messages.append(
-        {"role": "assistant", "content": result.text, "sources": sources}
+        {"role": "assistant", "content": text, "sources": sources}
     )

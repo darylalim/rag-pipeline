@@ -109,6 +109,32 @@ def test_answer_returns_model_output_and_sources(
     assert all("source" in doc.metadata for doc in result.sources)
 
 
+def test_stream_answer_agrees_with_answer(settings, fake_embeddings, monkeypatch):
+    """The two shapes must not drift: `answer()` is a join over `stream_answer()`.
+
+    Both frontends stream; `answer()` is what the tests above and any library
+    caller use. Pinning them equal is what keeps the single-code-path refactor
+    honest — a future `answer()` that stopped delegating would pass every other
+    test in this file.
+    """
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    ingest_mod.ingest(settings, embeddings=fake_embeddings)
+
+    canned = "Chunks overlap to preserve context across boundaries. (rag_concepts.md)"
+    pipeline = RAGPipeline(
+        settings,
+        embeddings=fake_embeddings,
+        llm=FakeListChatModel(responses=[canned]),
+    )
+
+    question = "Why do chunks overlap?"
+    docs = pipeline.retrieve(question)
+    streamed = "".join(pipeline.stream_answer(question, docs))
+
+    assert streamed == canned
+    assert streamed == pipeline.answer(question).text
+
+
 def test_answer_injects_retrieved_context_into_prompt(
     settings, fake_embeddings, monkeypatch
 ):
@@ -224,6 +250,25 @@ def _fail_answer_on_provider_error(settings, fake_embeddings, monkeypatch, tmp_p
     pipeline.answer("Why do chunks overlap?")
 
 
+def _fail_stream_answer_on_provider_error(
+    settings, fake_embeddings, monkeypatch, tmp_path
+):
+    ingest_mod.ingest(settings, embeddings=fake_embeddings)
+
+    def explode(_prompt_value):
+        raise anthropic.APIConnectionError(
+            request=httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+        )
+
+    pipeline = RAGPipeline(
+        settings, embeddings=fake_embeddings, llm=RunnableLambda(explode)
+    )
+    # Consumed to exhaustion: `.stream()` is lazy, so merely calling
+    # stream_answer() raises nothing. This is the shape both frontends use, and
+    # it is where the translation has to hold.
+    list(pipeline.stream_answer("Why do chunks overlap?", pipeline.retrieve("q")))
+
+
 @pytest.mark.parametrize(
     ("failing_call", "expected_type", "expected_message"),
     [
@@ -262,6 +307,12 @@ def _fail_answer_on_provider_error(settings, fake_embeddings, monkeypatch, tmp_p
             RuntimeError,
             "Claude API request failed",
             id="answer-provider-error",
+        ),
+        pytest.param(
+            _fail_stream_answer_on_provider_error,
+            RuntimeError,
+            "Claude API request failed",
+            id="stream-answer-provider-error",
         ),
     ],
 )
