@@ -65,17 +65,19 @@ def app(settings, fake_embeddings, monkeypatch) -> AppTest:
 
 
 def _fail_mid_stream(exc: BaseException):
-    """A `stream_answer` that emits, then fails — as a real one would.
+    """A generation step that emits, then fails — as a real one would.
 
-    Failing partway rather than at the call is the honest shape: `.stream()` is
-    lazy, so a provider error lands while the frontend is already rendering.
+    Patched at `_generate` rather than `stream_answer` so real retrieval still
+    runs and the frontend still receives real sources. Failing partway rather
+    than at the call is the honest shape: generation is lazy, so a provider
+    error lands while the frontend is already rendering.
     """
 
-    def stream(_self, _question, _docs):
+    def generate(_self, _question, _docs):
         yield "a partial ans"
         raise exc
 
-    return stream
+    return generate
 
 
 def _roles(at: AppTest) -> list[str]:
@@ -110,7 +112,7 @@ def test_failed_generation_is_recorded_as_an_error_turn(app, monkeypatch):
     """A failure must replay as an error, not as an ordinary answer."""
     monkeypatch.setattr(
         pipeline_mod.RAGPipeline,
-        "stream_answer",
+        "_generate",
         _fail_mid_stream(RuntimeError("Claude API request failed: rate limited")),
     )
     at = app.run()
@@ -139,7 +141,7 @@ def test_an_interrupted_run_still_pairs_the_turn(app, monkeypatch):
     """
     monkeypatch.setattr(
         pipeline_mod.RAGPipeline,
-        "stream_answer",
+        "_generate",
         _fail_mid_stream(StopException("user pressed stop")),
     )
     at = app.run()
@@ -164,14 +166,14 @@ def test_every_turn_stays_paired_across_mixed_outcomes(app, monkeypatch):
 
     monkeypatch.setattr(
         pipeline_mod.RAGPipeline,
-        "stream_answer",
+        "_generate",
         _fail_mid_stream(RuntimeError("Claude API request failed: boom")),
     )
     at.chat_input[0].set_value("second").run()
 
     monkeypatch.setattr(
         pipeline_mod.RAGPipeline,
-        "stream_answer",
+        "_generate",
         _fail_mid_stream(StopException("stop")),
     )
     at.chat_input[0].set_value("third").run()
@@ -179,6 +181,29 @@ def test_every_turn_stays_paired_across_mixed_outcomes(app, monkeypatch):
     assert _roles(at) == ["user", "assistant"] * 3
     contents = [m["content"] for m in at.session_state["messages"]]
     assert contents[0::2] == ["first", "second", "third"]
+
+
+def test_an_empty_answer_is_not_stored_as_a_grounded_turn(app, monkeypatch):
+    """Whitespace-only generation must not look like a cited answer.
+
+    Stored as-is it would render a blank assistant bubble above a populated
+    Sources expander — the strongest possible claim of grounding attached to no
+    content at all.
+    """
+
+    def blank(_self, _question, _docs):
+        yield "   "
+
+    monkeypatch.setattr(pipeline_mod.RAGPipeline, "_generate", blank)
+    at = app.run()
+    at.chat_input[0].set_value("Why do chunks overlap?").run()
+    assert not at.exception, [e.value for e in at.exception]
+
+    assert _roles(at) == ["user", "assistant"]
+    reply = at.session_state["messages"][1]
+    assert reply["error"] is True
+    assert reply["sources"] == [], "an empty answer must cite nothing"
+    assert "empty answer" in reply["content"]
 
 
 def test_clear_conversation_empties_the_history(app):

@@ -176,8 +176,9 @@ data/                 sample documents (swap in your own)
 - **Claude generation** (`langchain-anthropic`) is prompted to answer only from
   the retrieved context and to cite its sources, which is what turns a general
   chat model into a document-grounded question-answerer. Both frontends stream
-  it: `stream_answer()` is the single generation path, and `answer()` — for
-  library callers who just want the finished string — is a join over it.
+  it: `stream_answer(question)` hands back the retrieved sources and a lazy
+  stream of the answer together, and `answer()` — for library callers who just
+  want the finished string — is a join over the same path.
 
 Because these are LangChain integrations, swapping any piece — a different
 embedding model, vector store, or chat model — is a one-line change in

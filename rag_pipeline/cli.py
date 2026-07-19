@@ -26,7 +26,7 @@ def cmd_query(settings: Settings, question: str) -> int:
     from rag_pipeline.pipeline import RAGPipeline, unique_sources
 
     pipeline = RAGPipeline(settings)
-    docs = pipeline.retrieve(question)
+    docs, chunks = pipeline.stream_answer(question)
 
     print(f"\nQ: {question}\n")
     # Printed as it arrives rather than after the full generation, so a long
@@ -34,9 +34,14 @@ def cmd_query(settings: Settings, question: str) -> int:
     # errors to RuntimeError, which main() reports — note that a mid-stream
     # failure leaves the partial answer on screen above the error, which is the
     # cost of streaming at all.
-    for chunk in pipeline.stream_answer(question, docs):
-        print(chunk, end="", flush=True)
-    print()
+    try:
+        for chunk in chunks:
+            print(chunk, end="", flush=True)
+    finally:
+        # Terminate the streamed line even when generation failed partway,
+        # otherwise main()'s "Error: ..." collides with the partial answer on
+        # the same line.
+        print()
 
     print("\nSources:")
     for src in unique_sources(docs):

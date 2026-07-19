@@ -25,12 +25,17 @@ st.set_page_config(
 st.session_state.setdefault("messages", [])
 
 
-# max_entries=1 because `version` is a deliberately changing key: every rebuild
-# mints a new entry, and cache_resource never evicts on its own. Unbounded, each
-# `rag ingest` against a running server would strand another embedding model and
-# Chroma client in memory for the life of the process. Only the newest index is
-# ever wanted, so one entry is enough.
-@st.cache_resource(max_entries=1, show_spinner="Loading index and embedding model...")
+# Bounded because `version` is a deliberately changing key: every rebuild mints
+# a new entry, and cache_resource never evicts on its own, so unbounded each
+# `rag ingest` against a running server strands another embedding model and
+# Chroma client for the life of the process.
+#
+# Two entries rather than one. The cache is process-wide, not per-session, and
+# during an ingest two browser sessions can read `chroma.sqlite3` at different
+# moments and derive different mtimes. At size one those keys evict each other
+# on every rerun, reloading the embedding model each time; the second slot lets
+# the outgoing and incoming versions coexist until the writes settle.
+@st.cache_resource(max_entries=2, show_spinner="Loading index and embedding model...")
 def load_pipeline(_settings: Settings, version: float) -> RAGPipeline:
     """Build the pipeline, cached until the on-disk index changes.
 
@@ -137,15 +142,24 @@ if question := st.chat_input(
             # with nothing to show; generation then streams in visibly, and the
             # sources below come from these same docs rather than a second
             # search.
+            # stream_answer() has finished retrieving when it returns but has
+            # not started generating, so the spinner covers exactly the step
+            # with nothing to show.
             with st.spinner("Retrieving context..."):
-                docs = pipeline.retrieve(question)
-            answer_text = st.write_stream(pipeline.stream_answer(question, docs))
+                docs, chunks = pipeline.stream_answer(question)
+            answer_text = st.write_stream(chunks)
             # write_stream already rendered the text; it is only re-read here to
             # store it. The join covers the declared list[Any] return — the
             # chain yields str, but replay feeds this to st.markdown, which
             # needs one. Inside the try because join raises on a non-str list,
             # and that belongs in the handler rather than as a crash page.
             text = answer_text if isinstance(answer_text, str) else "".join(answer_text)
+            if not text.strip():
+                # Storing this would leave a blank bubble above a populated
+                # Sources expander, implying the listed documents grounded an
+                # answer that does not exist. Routed through the handler below
+                # so it reads as the failure it is.
+                raise RuntimeError("the model returned an empty answer")
             sources = unique_sources(docs)
             _render_sources(sources)
             reply = {"role": "assistant", "content": text, "sources": sources}

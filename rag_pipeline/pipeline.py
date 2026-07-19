@@ -130,16 +130,13 @@ class RAGPipeline:
         """Return the chunks most relevant to the question."""
         return self._retriever.invoke(question)
 
-    def stream_answer(self, question: str, docs: list[Document]) -> Iterator[str]:
+    def _generate(self, question: str, docs: list[Document]) -> Iterator[str]:
         """Yield the grounded answer in pieces, as the model produces them.
 
-        Retrieval is the caller's (`retrieve()`) rather than this method's, so a
-        frontend can display sources without searching twice.
-
-        This is the single generation path — `answer()` is a join over it — so
-        the provider-error translation lives here only. It must wrap the
-        *iteration*: `.stream()` is lazy, so a failed request surfaces while the
-        generator is being consumed, not when it is created.
+        The single generation path, so the provider-error translation lives here
+        only. It must wrap the *iteration*: `.stream()` is lazy, so a failed
+        request surfaces while the generator is being consumed, not when it is
+        created.
         """
         try:
             yield from self._chain.stream(
@@ -151,12 +148,28 @@ class RAGPipeline:
             # generation uniformly without depending on the Anthropic SDK.
             raise RuntimeError(f"Claude API request failed: {exc}") from exc
 
+    def stream_answer(self, question: str) -> tuple[list[Document], Iterator[str]]:
+        """Search, then hand back the sources and a lazy stream of the answer.
+
+        Both halves in one call because every frontend needs both, and splitting
+        them made each frontend re-implement the same three steps. Returning the
+        docs alongside the stream also means the citations shown are provably the
+        ones the answer was generated from, not a second search that could drift.
+
+        Note the two halves evaluate at different times: retrieval has already
+        run when this returns (so a caller can put a spinner around just this
+        call), while generation has not started and will not until the iterator
+        is consumed.
+        """
+        docs = self.retrieve(question)
+        return docs, self._generate(question, docs)
+
     def answer(self, question: str) -> Answer:
         """Retrieve context, then generate a grounded answer with sources.
 
-        Consumes `stream_answer()` to completion rather than calling the chain
-        itself, so the streaming and all-at-once shapes share one code path and
-        one provider-error translation.
+        The all-at-once shape, for library callers that just want the finished
+        string; both frontends stream instead. A join over the same path rather
+        than a second call into the chain.
         """
-        docs = self.retrieve(question)
-        return Answer(text="".join(self.stream_answer(question, docs)), sources=docs)
+        docs, chunks = self.stream_answer(question)
+        return Answer(text="".join(chunks), sources=docs)

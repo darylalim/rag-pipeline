@@ -128,11 +128,58 @@ def test_stream_answer_agrees_with_answer(settings, fake_embeddings, monkeypatch
     )
 
     question = "Why do chunks overlap?"
-    docs = pipeline.retrieve(question)
-    streamed = "".join(pipeline.stream_answer(question, docs))
+    _docs, chunks = pipeline.stream_answer(question)
+    streamed = "".join(chunks)
 
     assert streamed == canned
     assert streamed == pipeline.answer(question).text
+
+
+def test_stream_answer_yields_incrementally(settings, fake_embeddings, monkeypatch):
+    """Guards the point of streaming, which no other test would notice losing.
+
+    Rewriting the generator as a single `yield self._chain.invoke(...)` removes
+    token-by-token delivery entirely while still passing every other test here —
+    the joined text is identical and the error translation still holds. Chunk
+    count is the only observable that changes.
+    """
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    ingest_mod.ingest(settings, embeddings=fake_embeddings)
+
+    canned = "Chunks overlap to preserve context across boundaries."
+    pipeline = RAGPipeline(
+        settings,
+        embeddings=fake_embeddings,
+        llm=FakeListChatModel(responses=[canned]),
+    )
+
+    _docs, chunks = pipeline.stream_answer("Why do chunks overlap?")
+    pieces = list(chunks)
+
+    assert len(pieces) > 1, "generation arrived as one piece — no longer streaming"
+    assert "".join(pieces) == canned
+
+
+def test_stream_answer_retrieves_before_generating(
+    settings, fake_embeddings, monkeypatch
+):
+    """The docs must be ready on return; only generation stays lazy.
+
+    Frontends put a spinner around the call and render sources from its first
+    return value, so retrieval has to have happened by then. If it were deferred
+    into the generator, the sources would be empty until the answer was consumed.
+    """
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    ingest_mod.ingest(settings, embeddings=fake_embeddings)
+
+    pipeline = RAGPipeline(
+        settings, embeddings=fake_embeddings, llm=FakeListChatModel(responses=["ok"])
+    )
+    docs, chunks = pipeline.stream_answer("Why do chunks overlap?")
+
+    assert docs, "retrieval had not run by the time stream_answer returned"
+    assert all("source" in doc.metadata for doc in docs)
+    assert "".join(chunks) == "ok"
 
 
 def test_answer_injects_retrieved_context_into_prompt(
@@ -263,10 +310,11 @@ def _fail_stream_answer_on_provider_error(
     pipeline = RAGPipeline(
         settings, embeddings=fake_embeddings, llm=RunnableLambda(explode)
     )
-    # Consumed to exhaustion: `.stream()` is lazy, so merely calling
+    # Consumed to exhaustion: generation is lazy, so merely calling
     # stream_answer() raises nothing. This is the shape both frontends use, and
     # it is where the translation has to hold.
-    list(pipeline.stream_answer("Why do chunks overlap?", pipeline.retrieve("q")))
+    _docs, chunks = pipeline.stream_answer("Why do chunks overlap?")
+    list(chunks)
 
 
 @pytest.mark.parametrize(
