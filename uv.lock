@@ -2644,6 +2644,7 @@ name = "rag-pipeline"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "anthropic" },
     { name = "chromadb" },
     { name = "langchain-anthropic" },
     { name = "langchain-chroma" },
@@ -2667,6 +2668,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "anthropic", specifier = ">=0.117.0" },
     { name = "chromadb", specifier = ">=0.5" },
     { name = "langchain-anthropic", specifier = ">=0.3" },
     { name = "langchain-chroma", specifier = ">=0.2" },

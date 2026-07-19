@@ -39,7 +39,9 @@ uv run rag ingest
 
 Loads every `.md`/`.txt`/`.pdf` in `data/`, splits them into overlapping chunks,
 embeds them locally, and persists a Chroma index to `chroma_db/`. Re-run this
-whenever the documents change — it rebuilds from scratch, so no duplicates.
+whenever the documents change — it clears this collection's existing vectors and
+re-adds fresh chunks, so no duplicates, and nothing else in `chroma_db/` is
+touched.
 
 ### 2. Ask questions from the terminal
 

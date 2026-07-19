@@ -106,6 +106,9 @@ internals directly. Callers (`grep reset_store_cache`):
   re-ingest behaves like a fresh CLI run.
 - `tests/test_ingest.py::test_ingest_is_idempotent` calls it directly between
   ingests to emulate a fresh CLI process.
+- `tests/test_pipeline.py` does the same around the collection-mismatch tests,
+  which re-open a store after it was written and so need the state a real
+  `rag query` starts from.
 
 The Streamlit cache key is `index_version()` — the mtime of `chroma.sqlite3`,
 which chromadb bumps on every write. That's how the running app picks up a

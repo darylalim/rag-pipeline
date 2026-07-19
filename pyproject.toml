@@ -3,6 +3,8 @@ name = "rag-pipeline"
 version = "0.1.0"
 description = "A local-embeddings RAG pipeline built with LangChain and Claude"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = [
     "langchain-core>=0.3",
@@ -10,6 +12,12 @@ dependencies = [
     "langchain-huggingface>=0.1",
     "langchain-chroma>=0.2",
     "langchain-anthropic>=0.3",
+    # Imported directly by pipeline.py, which catches anthropic.APIError to
+    # translate provider failures into RuntimeError. Declared rather than left
+    # transitive through langchain-anthropic: an import we name ourselves is an
+    # import we must depend on ourselves, or a repin upstream breaks `rag query`
+    # with nothing in CI predicting it.
+    "anthropic>=0.117.0",
     "sentence-transformers>=3.0",
     # Pulled in by sentence-transformers; declared here so the PyTorch CPU
     # wheel index (see [tool.uv.sources] below) applies to it.
