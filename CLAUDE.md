@@ -9,7 +9,7 @@ uv sync                              # install deps (creates .venv)
 uv run rag ingest                    # rebuild the Chroma index from data/
 uv run rag query "your question"     # ask from the terminal
 uv run streamlit run app.py          # chat UI over the same pipeline
-uv run pytest                        # full suite (~7s wall: ~4s torch import, ~0.5s tests; offline)
+uv run pytest                        # full suite (~6.5s wall: ~4s torch import, ~1.8s tests; offline)
 uv run pytest tests/test_config.py::test_defaults   # single test
 uv run pytest -k idempotent -v                      # by keyword
 uv run ruff check --fix . && uv run ruff format .   # lint, then format (order matters)

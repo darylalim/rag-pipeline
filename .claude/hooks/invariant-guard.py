@@ -25,9 +25,11 @@ try:
 except ValueError:
     sys.exit(0)  # outside the repo
 
-# The hook scripts quote the banned patterns in their own messages; excluding
-# .claude/ is what stops the guard from making itself uneditable.
-if rel.startswith(".claude/"):
+# Files that exist to *describe* the rules necessarily contain the patterns
+# they ban: the hooks quote them in their own error messages, and the hook test
+# uses them as fixtures. Without this exemption the guard makes both
+# permanently uneditable.
+if rel.startswith(".claude/") or rel == "tests/test_hooks.py":
     sys.exit(0)
 
 chunks = [tool_input.get("content"), tool_input.get("new_string")]
