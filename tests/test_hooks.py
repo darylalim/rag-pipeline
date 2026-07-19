@@ -17,6 +17,7 @@ import json
 import os
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -28,34 +29,50 @@ TRIAD = ROOT / ".claude" / "hooks" / "settings-triad.py"
 ALLOW = 0
 BLOCK = 2  # the exit code Claude Code reads as "reject this edit / turn"
 
-# Every file the guard must stay silent on. Kept explicit rather than globbed so
-# a new source file is a deliberate addition here.
-REAL_FILES = [
-    "app.py",
-    "rag_pipeline/config.py",
-    "rag_pipeline/ingest.py",
-    "rag_pipeline/pipeline.py",
-    "rag_pipeline/cli.py",
-    "tests/conftest.py",
-    "tests/test_config.py",
-    "tests/test_ingest.py",
-    "tests/test_pipeline.py",
-    ".claude/hooks/invariant-guard.py",
-    ".claude/hooks/settings-triad.py",
-]
+# Every tracked .py file, globbed rather than listed: a hardcoded list fails by
+# silently not covering a new file, which is the wrong direction for a guard.
+REAL_FILES = sorted(
+    subprocess.run(
+        ["git", "-C", str(ROOT), "ls-files", "*.py"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split()
+)
+
+
+def run_script(
+    argv: list[str],
+    stdin: str,
+    project_dir: Path = ROOT,
+    cwd: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run a hook with the environment Claude Code gives it.
+
+    Separate from run_hook so the wiring tests can vary one axis each — the
+    interpreter, the cwd, a non-JSON payload — without restating the other
+    four arguments, which are the load-bearing part.
+    """
+    return subprocess.run(
+        argv,
+        input=stdin,
+        capture_output=True,
+        text=True,
+        cwd=cwd,
+        env={**os.environ, "CLAUDE_PROJECT_DIR": str(project_dir)},
+        check=False,
+    )
 
 
 def run_hook(
-    script: Path, payload: dict[str, object], project_dir: Path = ROOT
+    script: Path,
+    payload: dict[str, object],
+    project_dir: Path = ROOT,
+    cwd: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Invoke a hook the way Claude Code does: JSON on stdin, exit code out."""
-    return subprocess.run(
-        [sys.executable, str(script)],
-        input=json.dumps(payload),
-        capture_output=True,
-        text=True,
-        env={**os.environ, "CLAUDE_PROJECT_DIR": str(project_dir)},
-        check=False,
+    return run_script(
+        [sys.executable, str(script)], json.dumps(payload), project_dir, cwd
     )
 
 
@@ -149,8 +166,11 @@ ALLOWED = [
         id="docstring-naming-sampling-params",
     ),
     pytest.param(
+        # The guard quotes every banned pattern in its own rule table and
+        # messages. Masking is what lets it edit itself; there is no longer a
+        # path exemption doing that work.
         ".claude/hooks/invariant-guard.py",
-        're.compile(r"Chroma\\(")  # noqa: E501\nrmtree\ntemperature=1',
+        're.compile(r"Chroma\\(")\nMSG = "rmtree and temperature= are banned"',
         id="guard-may-rewrite-itself",
     ),
     pytest.param(
@@ -241,18 +261,11 @@ def test_guard_resolves_a_relative_path_against_the_project(tmp_path: Path) -> N
     skip enforcement — a silent fail-open, which is the worst outcome for a
     guard because the green result is indistinguishable from a real pass.
     """
-    result = subprocess.run(
-        [sys.executable, str(GUARD)],
-        input=json.dumps(
-            {"tool_input": {"file_path": "app.py", "content": 'Chroma(name="x")'}}
-        ),
-        capture_output=True,
-        text=True,
-        cwd=tmp_path,  # deliberately not the project directory
-        env={**os.environ, "CLAUDE_PROJECT_DIR": str(ROOT)},
-        check=False,
-    )
-    assert result.returncode == BLOCK
+    payload: dict[str, object] = {
+        "tool_input": {"file_path": "app.py", "content": 'Chroma(name="x")'}
+    }
+    # cwd deliberately not the project directory
+    assert run_hook(GUARD, payload, cwd=tmp_path).returncode == BLOCK
 
 
 @pytest.mark.parametrize("script", [GUARD, TRIAD], ids=["guard", "triad"])
@@ -263,14 +276,7 @@ def test_hooks_report_rather_than_crash_on_bad_payloads(script: Path) -> None:
     first stderr line surfaces, so a payload-shape change in a future release
     cannot disable enforcement without anyone noticing.
     """
-    result = subprocess.run(
-        [sys.executable, str(script)],
-        input="not json",
-        capture_output=True,
-        text=True,
-        env={**os.environ, "CLAUDE_PROJECT_DIR": str(ROOT)},
-        check=False,
-    )
+    result = run_script([sys.executable, str(script)], "not json")
     assert result.returncode == 1
     assert "not enforcing" in result.stderr
     assert "Traceback" not in result.stderr
@@ -308,14 +314,7 @@ def test_settings_json_points_at_hooks_that_exist() -> None:
 def test_hooks_run_under_their_shebang(script: Path) -> None:
     """settings.json execs the scripts directly, so the shebang is the real
     entry point — not the venv interpreter every other test uses."""
-    result = subprocess.run(
-        [str(script)],
-        input=json.dumps({"stop_hook_active": True}),
-        capture_output=True,
-        text=True,
-        env={**os.environ, "CLAUDE_PROJECT_DIR": str(ROOT)},
-        check=False,
-    )
+    result = run_script([str(script)], json.dumps({"stop_hook_active": True}))
     assert result.returncode == ALLOW, result.stderr
 
 
@@ -330,15 +329,13 @@ def build_project(
     in_env_example: bool = False,
     in_readme: bool = False,
     in_delenv: bool = False,
-    test_config_override: str | None = None,
+    edit_test_config: Callable[[str], str] = lambda text: text,
 ) -> Path:
-    """A fake project root declaring `var`, documented only where asked."""
-    if in_delenv and test_config_override is not None:
-        raise ValueError(
-            "in_delenv and test_config_override both set: the override replaces "
-            "the whole file, so in_delenv would be silently discarded."
-        )
+    """A fake project root declaring `var`, documented only where asked.
 
+    `edit_test_config` transforms tests/test_config.py before the `in_delenv`
+    insertion, so the two compose instead of one silently replacing the other.
+    """
     (tmp_path / "rag_pipeline").mkdir()
     (tmp_path / "tests").mkdir()
 
@@ -368,15 +365,13 @@ def build_project(
         )
     (tmp_path / "README.md").write_text(readme)
 
-    test_config = (ROOT / "tests/test_config.py").read_text()
+    test_config = edit_test_config((ROOT / "tests/test_config.py").read_text())
     if in_delenv:
         delenv_anchor = '        "MAX_TOKENS",'
         assert delenv_anchor in test_config, "delenv tuple no longer ends as expected"
         test_config = test_config.replace(
             delenv_anchor, f'{delenv_anchor}\n        "{var}",', 1
         )
-    if test_config_override is not None:
-        test_config = test_config_override
     (tmp_path / "tests/test_config.py").write_text(test_config)
 
     return tmp_path
@@ -462,16 +457,14 @@ def test_triad_catches_a_future_env_helper(tmp_path: Path) -> None:
 
 def test_triad_survives_renaming_the_defaults_test(tmp_path: Path) -> None:
     """Anchored on `monkeypatch.delenv`, not the test's name."""
-    renamed = (
-        (ROOT / "tests/test_config.py")
-        .read_text()
-        .replace("def test_from_env_uses_defaults_when_unset", "def test_renamed")
-        .replace(
-            '        "MAX_TOKENS",', '        "MAX_TOKENS",\n        "RERANK_TOP_N",', 1
-        )
-    )
     project = build_project(
-        tmp_path, in_env_example=True, in_readme=True, test_config_override=renamed
+        tmp_path,
+        in_env_example=True,
+        in_readme=True,
+        in_delenv=True,  # composes with the rename below
+        edit_test_config=lambda text: text.replace(
+            "def test_from_env_uses_defaults_when_unset", "def test_renamed"
+        ),
     )
     assert run_hook(TRIAD, {}, project).returncode == ALLOW
 
@@ -512,24 +505,15 @@ def test_triad_checks_when_git_cannot_answer(tmp_path: Path) -> None:
     assert run_hook(TRIAD, {}, project).returncode == BLOCK
 
 
-def test_build_project_rejects_conflicting_delenv_arguments(tmp_path: Path) -> None:
-    """Passing both would silently discard in_delenv and test the wrong state."""
-    with pytest.raises(ValueError, match="silently discarded"):
-        build_project(tmp_path, in_delenv=True, test_config_override="whatever")
-
-
 def test_triad_reports_once_when_the_delenv_loop_is_gone(tmp_path: Path) -> None:
     """One message, not one per variable — nine would read as a broken hook."""
-    without_loop = (
-        (ROOT / "tests/test_config.py")
-        .read_text()
-        .replace("monkeypatch.delenv", "monkeypatch.setenv")
-    )
     project = build_project(
         tmp_path,
         in_env_example=True,
         in_readme=True,
-        test_config_override=without_loop,
+        edit_test_config=lambda text: text.replace(
+            "monkeypatch.delenv", "monkeypatch.setenv"
+        ),
     )
     result = run_hook(TRIAD, {}, project)
     assert result.returncode == BLOCK

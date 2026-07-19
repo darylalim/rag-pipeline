@@ -49,12 +49,6 @@ try:
 except ValueError:
     sys.exit(0)  # outside the repo
 
-# The hook scripts and their test quote the banned patterns; masking (below)
-# already covers the quoted forms, but these files exist to describe the rules
-# and have no business being policed by them.
-if rel.startswith(".claude/") or rel == "tests/test_hooks.py":
-    sys.exit(0)
-
 chunks = [tool_input.get("content"), tool_input.get("new_string")]
 text = "\n".join(c for c in chunks if isinstance(c, str))
 if not text.strip():
@@ -66,19 +60,34 @@ def blank(match: re.Match[str]) -> str:
     return "\n" * match.group(0).count("\n")
 
 
-# Applied in order: triple-quoted strings, then single-line strings, then
-# comments. Text may be an Edit fragment rather than a parseable module, so
-# this is deliberately regex-based rather than tokenize/ast.
-TRIPLE_QUOTED = re.compile(r"(\"\"\"|''')(?:\\.|(?!\1).)*?\1", re.DOTALL)
-QUOTED = re.compile(r"(\"|')(?:\\.|(?!\1)[^\n])*?\1")
+# One alternation, longest opener first, rather than a triple-quote pass
+# followed by a single-quote pass. Every branch is unambiguous -- `[^\\]` and
+# `\\.` cannot both match the same character -- which keeps this linear. The
+# earlier two-pass form used `(?:\\.|(?!\1).)*?`, whose branches BOTH match a
+# backslash: on an unterminated quote followed by backslash-heavy text (a regex
+# literal, say) that backtracks exponentially. Measured on the old pattern, an
+# unterminated ''' plus 8 lines of `re.compile(r"\d+\w*\s")` took 6.5s, and 12
+# lines never finished -- a PreToolUse hook that hangs wedges the whole edit.
+#
+# Text may be an Edit fragment rather than a parseable module, so this stays
+# regex-based rather than tokenize/ast: an unbalanced fragment is the common
+# case, and it is exactly what a real parser rejects.
+STRING = re.compile(
+    r'"""(?:[^\\]|\\.)*?"""'
+    r"|'''(?:[^\\]|\\.)*?'''"
+    r'|"(?:[^"\\\n]|\\.)*"'
+    r"|'(?:[^'\\\n]|\\.)*'",
+    re.DOTALL,
+)
 COMMENT = re.compile(r"#[^\n]*")
 
-with_comments = QUOTED.sub(blank, TRIPLE_QUOTED.sub(blank, text))
-code_only = COMMENT.sub(blank, with_comments)
-
-CODE = "code"
-COMMENTS = "comments"
-
+# `scan_comments` selects the corpus: the suppression rule needs comments kept,
+# since finding a suppression directive in one is its whole job; every other
+# rule needs them gone so prose describing a rule does not trip it.
+#
+# Note this comment cannot spell that directive literally -- the rule below
+# would match it, and ruff would read it as a real directive. The module
+# docstring can, because string literals are masked.
 RULES = [
     (
         lambda p: (
@@ -87,7 +96,7 @@ RULES = [
             and p != "rag_pipeline/ingest.py"
         ),
         re.compile(r"(?<![\w.])Chroma\s*\("),
-        CODE,
+        False,
         "Constructing Chroma(...) inline. A collection's identity is (persist dir, "
         "collection name, embedding function), so indexing and querying must go "
         "through open_store() in rag_pipeline/ingest.py.",
@@ -98,7 +107,7 @@ RULES = [
         # model would download ~90MB and put the suite back on the network.
         lambda p: p.endswith(".py") and p != "rag_pipeline/ingest.py",
         re.compile(r"(?<![\w.])HuggingFaceEmbeddings\s*\("),
-        CODE,
+        False,
         "Constructing HuggingFaceEmbeddings(...) inline. Route through "
         "build_embeddings() in rag_pipeline/ingest.py -- vectors from different "
         "models are incomparable, and in tests this breaks the offline guarantee "
@@ -115,7 +124,7 @@ RULES = [
             r"|import\s+rag_pipeline\.(?:ingest|pipeline)\b)",
             re.MULTILINE,
         ),
-        CODE,
+        False,
         "Top-level import of ingest/pipeline in cli.py. These pull in "
         "sentence-transformers/torch (~4.3s vs ~0.08s for `rag --help`). Keep the "
         "import inside the command function.",
@@ -123,30 +132,42 @@ RULES = [
     (
         lambda p: p.endswith(".py"),
         re.compile(r"#\s*(?:noqa|ty:\s*ignore)"),
-        COMMENTS,
+        True,
         "Adding a lint/type suppression. CLAUDE.md: fix the finding instead.",
     ),
     (
         lambda p: p == "rag_pipeline/ingest.py",
         re.compile(r"\brmtree\b"),
-        CODE,
+        False,
         "rmtree in ingest.py. ingest() is a scoped collection rebuild and must never "
         "wipe the persist directory -- it may hold unrelated data.",
     ),
     (
         lambda p: p == "rag_pipeline/pipeline.py",
         re.compile(r"\b(?:temperature|top_p)\s*="),
-        CODE,
+        False,
         "Setting temperature/top_p. build_chat_model() deliberately sets neither -- "
         "some models (Opus 4.8) reject sampling params outright.",
     ),
 ]
 
-haystack = {CODE: code_only, COMMENTS: with_comments}
+# Select rules before masking: for a write to anything but a .py file no rule
+# can fire, and masking a large payload to reach that conclusion is pure waste.
+applicable = [
+    (pattern, scan_comments, msg)
+    for applies, pattern, scan_comments, msg in RULES
+    if applies(rel)
+]
+if not applicable:
+    sys.exit(0)
+
+with_comments = STRING.sub(blank, text)
+code_only = COMMENT.sub(blank, with_comments)
+
 hits = [
     msg
-    for applies, pattern, scope, msg in RULES
-    if applies(rel) and pattern.search(haystack[scope])
+    for pattern, scan_comments, msg in applicable
+    if pattern.search(with_comments if scan_comments else code_only)
 ]
 
 if hits:

@@ -12,10 +12,11 @@ import time, so a variable missing from the delenv tuple in
 own environment instead of its default — the test keeps passing while quietly
 no longer testing that default.
 
-Scope: the check runs only when the working tree has touched one of the four
-sites. It validates all declared settings rather than just the changed one —
-cheap, and it catches drift the turn did not cause — but gating on the tree
-means a turn about something else is never blocked by pre-existing drift. The
+Scope: problems are reported only when the working tree has touched one of the
+four sites. Validation itself is cheap enough to run unconditionally and covers
+all declared settings rather than just the changed one — it catches drift the
+turn did not cause — but gating the *report* on the tree means a turn about
+something else is never blocked by pre-existing drift. The
 tradeoff is that drift already committed goes unreported until someone next
 touches one of the four files. If git cannot answer (no repo, not installed)
 the check runs unconditionally, so the failure direction is "enforce anyway".
@@ -84,11 +85,6 @@ test_config = root / "tests" / "test_config.py"
 if not config.is_file():
     sys.exit(0)
 
-# Nothing related changed this turn: do not block work on an unrelated topic,
-# and skip four file reads on every Stop event.
-if sites_touched(root) is False:
-    sys.exit(0)
-
 # `_env_\w+` (not an explicit path|int|str list) so a future `_env_bool` helper
 # is covered the day it is added rather than silently escaping the check.
 declared = re.findall(r'_env_\w+\(\s*"([A-Z0-9_]+)"', config.read_text())
@@ -137,7 +133,10 @@ if not delenv_tuple and test_text:
         "Restore it or update this hook."
     )
 
-if problems:
+# The git call is the expensive part of this hook (~11.6ms, versus ~0.07ms to
+# read and scan all four files), so consult it only once there is something to
+# report. On a consistent tree -- the steady state -- git is never forked.
+if problems and sites_touched(root) is not False:
     print(
         "Settings sites incomplete (CLAUDE.md: adding a Settings field is a "
         "four-file change - config.py + .env.example + README config table + "
