@@ -9,7 +9,7 @@ uv sync                              # install deps (creates .venv)
 uv run rag ingest                    # rebuild the Chroma index from data/
 uv run rag query "your question"     # ask from the terminal
 uv run streamlit run app.py          # chat UI over the same pipeline
-uv run pytest                        # full suite (~6s wall: ~4s torch import, ~1.5s tests; offline)
+uv run pytest                        # full suite (~7.5s wall: ~4s torch import, ~3s tests; offline)
 uv run pytest tests/test_config.py::test_defaults   # single test
 uv run pytest -k idempotent -v                      # by keyword
 uv run ruff check --fix . && uv run ruff format .   # lint, then format (order matters)
@@ -135,6 +135,16 @@ blocks `socket.socket`/`create_connection`. A test that simply forgets
 socket, and that fails. Do not pair it with `HF_HUB_OFFLINE=1`: that makes
 `huggingface_hub` skip its revision check, so a cached model loads with no socket
 at all and the fixture goes blind. The two are antagonistic, not complementary.
+
+`app.py` takes no such parameters — it is a script, not a function — so
+`test_app.py` reaches the same seam through the factories instead, patching
+`ingest.build_embeddings` and `pipeline.build_chat_model` on their modules. That
+works only because both are looked up as module globals at call time, which is a
+second reason the never-construct-inline rule above is load-bearing: inline a
+`HuggingFaceEmbeddings(...)` anywhere and the frontend stops being testable
+offline, not just inconsistent. `st.cache_resource` is cleared per test, since
+its key deliberately ignores `_settings` and would otherwise serve one test's
+pipeline to the next.
 
 ## Gotchas
 
