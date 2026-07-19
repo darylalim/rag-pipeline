@@ -101,7 +101,7 @@ citations, and that retrieved context is injected into the prompt).
 
 `tests/test_hooks.py` additionally exercises the two enforcement hooks in
 `.claude/hooks/` (see CLAUDE.md) by running them as subprocesses, which is how
-Claude Code invokes them. It is ~2.1s of the test time — 60 interpreter
+Claude Code invokes them. It is ~2.2s of the test time — 61 interpreter
 startups plus a few throwaway git repos — and is the only part of the suite
 that shells out.
 
