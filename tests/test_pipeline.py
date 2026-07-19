@@ -20,7 +20,12 @@ from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableLambda
 
 from rag_pipeline import ingest as ingest_mod
-from rag_pipeline.pipeline import RAGPipeline, format_docs, unique_sources
+from rag_pipeline.pipeline import (
+    RAGPipeline,
+    format_docs,
+    source_excerpts,
+    unique_sources,
+)
 
 
 def test_unique_sources_dedupes_in_order():
@@ -31,6 +36,29 @@ def test_unique_sources_dedupes_in_order():
         Document(page_content="4", metadata={}),  # missing source -> "unknown"
     ]
     assert unique_sources(docs) == ["b.md", "a.md", "unknown"]
+
+
+def test_source_excerpts_keeps_retrieval_order_and_repeats():
+    """The panel is a transcript of the prompt, so neither order nor repeats go.
+
+    `format_docs` joins in list order, so reordering here would show a reader a
+    prompt the model never saw -- and collapsing two chunks from one file would
+    hide that a claim rests on two passages rather than one. Both are the
+    opposite of `unique_sources`, which exists to shorten a citation line.
+    """
+    docs = [
+        Document(page_content="first", metadata={"source": "b.md"}),
+        Document(page_content="second", metadata={"source": "a.md"}),
+        Document(page_content="third", metadata={"source": "b.md"}),
+        Document(page_content="fourth", metadata={}),  # missing source
+    ]
+
+    assert source_excerpts(docs) == [
+        {"source": "b.md", "text": "first"},
+        {"source": "a.md", "text": "second"},
+        {"source": "b.md", "text": "third"},
+        {"source": "unknown", "text": "fourth"},
+    ]
 
 
 def test_format_docs_labels_each_source():

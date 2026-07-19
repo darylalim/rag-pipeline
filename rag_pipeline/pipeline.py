@@ -66,6 +66,26 @@ def unique_sources(docs: list[Document]) -> list[str]:
     return list(dict.fromkeys(doc.metadata.get("source", "unknown") for doc in docs))
 
 
+def source_excerpts(docs: list[Document]) -> list[dict[str, str]]:
+    """The retrieved passages in a form a frontend can store and replay.
+
+    Beside :func:`unique_sources` and :func:`format_docs` because all three
+    derive their label from the same ``source`` key, and a displayed label that
+    drifts from the prompt label turns a citation panel into a transcript of a
+    prompt that was never sent. Plain dicts rather than Documents because a chat
+    history outlives the objects that filled it.
+
+    Retrieval order is preserved and repeated sources are not collapsed:
+    ``format_docs`` joins in list order, so this order *is* the order the model
+    read them in, and two chunks from one file are two pieces of evidence rather
+    than one repeated citation.
+    """
+    return [
+        {"source": doc.metadata.get("source", "unknown"), "text": doc.page_content}
+        for doc in docs
+    ]
+
+
 def build_chat_model(settings: Settings) -> BaseChatModel:
     """Construct the Claude chat model used for generation.
 

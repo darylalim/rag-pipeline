@@ -99,6 +99,43 @@ def test_app_answers_a_question_with_sources(app):
     assert "error" not in assistant
 
 
+def test_the_stored_sources_carry_the_passage_text_and_survive_replay(app):
+    """A citation the reader cannot check is the failure this panel exists for.
+
+    Asserted against the retrieved chunk rather than a literal, so it stays true
+    if the fixture corpus changes -- and re-run afterwards, because the passage
+    lives in session_state and a replayed turn that dropped it would still look
+    correct on the run that produced it.
+    """
+    at = app.run()
+    at.chat_input[0].set_value("Why do chunks overlap?").run()
+
+    _, assistant = at.session_state["messages"]
+    excerpt = assistant["sources"][0]
+    assert excerpt["source"].endswith((".md", ".txt"))
+    assert excerpt["text"].strip(), "a passage stored with no text cites nothing"
+
+    at.run()  # replay from session_state, the path a rerun takes
+    assert at.session_state["messages"][1]["sources"] == assistant["sources"]
+    assert excerpt["text"] in [t.value for t in at.text]
+
+
+def test_a_retrieved_passage_is_shown_unparsed(app):
+    """The corpus is Markdown, and a chunk is a fragment of it.
+
+    Parsed, a passage's own `#` heading would render as a heading inside the
+    chat and an unpaired code fence could swallow the rest of the panel -- so
+    the audit surface would be formatted by the documents it exists to audit.
+    """
+    at = app.run()
+    at.chat_input[0].set_value("Tell me about apples.").run()
+    at.run()
+
+    passages = [t.value for t in at.text if "Alpha" in t.value]
+    assert passages, "the retrieved passage was not rendered as text"
+    assert "# Alpha" in passages[0], "the heading was parsed instead of shown"
+
+
 def test_user_turn_is_echoed_unparsed(app):
     """A question containing Markdown must come back as typed, not rendered."""
     at = app.run()

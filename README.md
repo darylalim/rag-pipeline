@@ -59,7 +59,9 @@ uv run streamlit run app.py
 ```
 
 A browser chat UI over the same pipeline, streaming each answer token by token,
-with per-answer source citations and a sidebar showing the active configuration.
+with a sidebar showing the active configuration and a per-answer Sources panel
+holding the retrieved passages themselves — so a claim can be checked against
+the text it was generated from, not just against a filename.
 
 ## Add your own documents
 

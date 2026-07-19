@@ -13,7 +13,7 @@ import streamlit as st
 
 from rag_pipeline.config import Settings
 from rag_pipeline.ingest import index_version, reset_store_cache
-from rag_pipeline.pipeline import RAGPipeline, unique_sources
+from rag_pipeline.pipeline import RAGPipeline, source_excerpts
 
 st.set_page_config(
     page_title="RAG Pipeline", page_icon=":material/search:", layout="centered"
@@ -54,7 +54,7 @@ def load_pipeline(_settings: Settings, version: float) -> RAGPipeline:
 st.title(":material/search: RAG Pipeline")
 st.caption(
     "Ask questions about the indexed documents. Answers are grounded in "
-    "retrieved context and cite their source files."
+    "retrieved context, and each one shows the passages it was generated from."
 )
 
 # Build the pipeline, turning setup errors (no index yet, missing API key) into
@@ -100,12 +100,29 @@ def _error_reply(text: str) -> dict:
     return {"role": "assistant", "content": text, "sources": [], "error": True}
 
 
-def _render_sources(sources: list[str]) -> None:
-    if sources:
-        with st.expander("Sources", icon=":material/description:"):
-            # One markdown body, not one call per item: separate calls render as
-            # separate single-item lists, each with its own block spacing.
-            st.markdown("\n".join(f"- `{src}`" for src in sources))
+def _render_sources(excerpts: list[dict[str, str]]) -> None:
+    """Show the passages, not only the names of the files they came from.
+
+    A filename is not checkable evidence: it tells a reader which document to go
+    and search, which is the work the citation was supposed to save them. The
+    passage text is what lets them see whether a sentence came from the
+    retrieved context or was invented around it -- the one thing a RAG interface
+    exists to make checkable -- and `stream_answer` already handed it over.
+
+    Unparsed, for the reason the user's question is: a chunk is a *fragment*,
+    and the splitter does not pair code fences, so rendering one as Markdown
+    lets a half-open fence swallow the rest of the very panel that exists to
+    audit the answer. `st.code` would wrap nothing by default, which turns a
+    PDF page -- extracted as one long line -- into a horizontal scrollbar.
+    """
+    if excerpts:
+        with st.expander(
+            f"Sources ({len(excerpts)} retrieved passages)",
+            icon=":material/description:",
+        ):
+            for rank, excerpt in enumerate(excerpts, start=1):
+                st.caption(f"{rank}. `{excerpt['source']}`")
+                st.text(excerpt["text"])
 
 
 # Replay the conversation so far.
@@ -154,7 +171,7 @@ if question := st.chat_input(
             # inside the try so a non-str list raises into the handler below
             # rather than as a crash page.
             text = "".join(answer_text)
-            sources = unique_sources(docs)
+            sources = source_excerpts(docs)
             _render_sources(sources)
             reply = {"role": "assistant", "content": text, "sources": sources}
         except Exception as exc:

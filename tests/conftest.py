@@ -31,10 +31,15 @@ def fake_embeddings() -> DeterministicFakeEmbedding:
 @pytest.fixture
 def sample_data_dir(tmp_path):
     """A data directory that exercises the loader: a nested subdirectory, a
-    whitespace-only file, and an unsupported extension (both must be skipped)."""
+    whitespace-only file, and an unsupported extension (both must be skipped).
+
+    `a.md` opens with a Markdown heading because the corpus is Markdown and one
+    frontend renders retrieved passages back to the user: without syntax in the
+    fixture, nothing distinguishes displaying a passage as text from parsing it.
+    """
     root = tmp_path / "data"
     files = {
-        "a.md": "Alpha topic about apples and orchards.\n",
+        "a.md": "# Alpha\n\nAlpha topic about apples and orchards.\n",
         "sub/b.txt": "Beta topic about bicycles and boats.\n",
         "empty.md": "   \n",  # whitespace only -> skipped
         "notes.rst": "unsupported extension -> skipped",  # bad suffix -> skipped
