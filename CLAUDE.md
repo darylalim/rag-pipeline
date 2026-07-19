@@ -75,7 +75,7 @@ All tunables live here — never inline a literal at a call site. Adding one is 
 Leaving either of the latter two stale is a bug, and nothing else in the repo
 catches it — `ruff`, `ty` and the full suite are all green against a stale
 README. `test_every_setting_is_documented` is what catches it; the
-`settings-triad` hook reports the same thing sooner.
+`derived-docs` hook reports the same thing sooner.
 
 There is no fourth site. `config.ENV_VARS` derives every variable name from the
 dataclass fields, and `tests/test_config.py` clears *that* rather than a
@@ -175,7 +175,7 @@ second source of truth: delete `.claude/` and nothing stops being enforced.
 | ----- | ------ | ---- |
 | `tests/test_invariants.py` | the whole tree, everyone | CI and `uv run pytest` |
 | `.claude/hooks/invariant-guard.py` (`PreToolUse` on `Edit`\|`Write`) | the text about to be written | during a Claude session |
-| `.claude/hooks/settings-triad.py` (`Stop`) | Settings documented at all three sites; every rule documented in the README rule table | end of a Claude turn |
+| `.claude/hooks/derived-docs.py` (`Stop`) | Settings documented at all three sites; every rule documented in the README rule table | end of a Claude turn |
 
 Adding a rule means adding a `Rule` to `RULES`, a case in each direction in
 `test_invariants.py`, and a row in the README rule table —

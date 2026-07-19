@@ -41,7 +41,7 @@ try:
 except ValueError as exc:
     # Exit 1, not 2: unparseable input must not wedge the turn, but it means the
     # hook is not enforcing, so report rather than exit silently.
-    print(f"settings-triad: unreadable payload, not enforcing ({exc})", file=sys.stderr)
+    print(f"derived-docs: unreadable payload, not enforcing ({exc})", file=sys.stderr)
     sys.exit(1)
 
 if data.get("stop_hook_active"):
@@ -87,11 +87,11 @@ def paths_touched(project: Path, paths: tuple[str, ...]) -> bool | None:
 try:
     invariants = load_invariants(root)
 except (OSError, SyntaxError) as exc:
-    print(f"settings-triad: cannot load rules, not enforcing ({exc})", file=sys.stderr)
+    print(f"derived-docs: cannot load rules, not enforcing ({exc})", file=sys.stderr)
     sys.exit(1)
 
 if invariants is None:
-    print("settings-triad: cannot load rules, not enforcing", file=sys.stderr)
+    print("derived-docs: cannot load rules, not enforcing", file=sys.stderr)
     sys.exit(1)
 
 # Each check pairs its problems with the paths whose modification makes those

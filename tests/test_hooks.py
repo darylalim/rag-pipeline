@@ -25,7 +25,7 @@ from tests.invariants import RULES
 
 ROOT = Path(__file__).resolve().parent.parent
 GUARD = ROOT / ".claude" / "hooks" / "invariant-guard.py"
-TRIAD = ROOT / ".claude" / "hooks" / "settings-triad.py"
+DOCS = ROOT / ".claude" / "hooks" / "derived-docs.py"
 
 ALLOW = 0
 BLOCK = 2  # the exit code Claude Code reads as "reject this edit / turn"
@@ -94,7 +94,7 @@ def test_settings_json_points_at_hooks_that_exist() -> None:
         assert os.access(script, os.X_OK), f"{command} is not executable"
 
 
-@pytest.mark.parametrize("script", [GUARD, TRIAD], ids=["guard", "triad"])
+@pytest.mark.parametrize("script", [GUARD, DOCS], ids=["guard", "docs"])
 def test_hooks_run_under_their_shebang(script: Path) -> None:
     """settings.json execs the scripts directly, so the shebang is the real
     entry point — not the venv interpreter every other test uses."""
@@ -102,7 +102,7 @@ def test_hooks_run_under_their_shebang(script: Path) -> None:
     assert result.returncode == ALLOW, result.stderr
 
 
-@pytest.mark.parametrize("script", [GUARD, TRIAD], ids=["guard", "triad"])
+@pytest.mark.parametrize("script", [GUARD, DOCS], ids=["guard", "docs"])
 def test_hooks_report_rather_than_crash_on_bad_payloads(script: Path) -> None:
     """Malformed stdin must not block, and must not exit silently either.
 
@@ -116,7 +116,7 @@ def test_hooks_report_rather_than_crash_on_bad_payloads(script: Path) -> None:
     assert "Traceback" not in result.stderr
 
 
-@pytest.mark.parametrize("script", [GUARD, TRIAD], ids=["guard", "triad"])
+@pytest.mark.parametrize("script", [GUARD, DOCS], ids=["guard", "docs"])
 def test_hooks_report_when_the_rules_are_unreachable(
     script: Path, tmp_path: Path
 ) -> None:
@@ -182,7 +182,7 @@ def test_guard_ignores_irrelevant_payloads(payload: dict[str, object]) -> None:
     assert run_hook(GUARD, payload).returncode == ALLOW
 
 
-# --- settings-triad: the working-tree gate -----------------------------------
+# --- derived-docs: the working-tree gate -------------------------------------
 
 
 def build_project(
@@ -240,29 +240,29 @@ def make_git_repo(project: Path) -> None:
         )
 
 
-def test_triad_passes_on_the_real_repo() -> None:
+def test_derived_docs_passes_on_the_real_repo() -> None:
     """End-to-end smoke test; completeness itself is test_invariants.py's job."""
-    assert run_hook(TRIAD, {}).returncode == ALLOW
+    assert run_hook(DOCS, {}).returncode == ALLOW
 
 
-def test_triad_honors_stop_hook_active() -> None:
+def test_derived_docs_honors_stop_hook_active() -> None:
     """Nudge once rather than looping — Claude Code overrides after 8 blocks."""
-    assert run_hook(TRIAD, {"stop_hook_active": True}).returncode == ALLOW
+    assert run_hook(DOCS, {"stop_hook_active": True}).returncode == ALLOW
 
 
-def test_triad_blocks_an_undocumented_setting(tmp_path: Path) -> None:
+def test_derived_docs_blocks_an_undocumented_setting(tmp_path: Path) -> None:
     project = build_project(tmp_path, documented=False)
-    result = run_hook(TRIAD, {}, project)
+    result = run_hook(DOCS, {}, project)
     assert result.returncode == BLOCK
     assert "RERANK_TOP_N" in result.stderr
 
 
-def test_triad_passes_when_documented(tmp_path: Path) -> None:
+def test_derived_docs_passes_when_documented(tmp_path: Path) -> None:
     project = build_project(tmp_path, documented=True)
-    assert run_hook(TRIAD, {}, project).returncode == ALLOW
+    assert run_hook(DOCS, {}, project).returncode == ALLOW
 
 
-def test_triad_blocks_an_undocumented_rule(tmp_path: Path) -> None:
+def test_derived_docs_blocks_an_undocumented_rule(tmp_path: Path) -> None:
     """The rule table is gated exactly like the settings sites.
 
     Same hook, second derived-documentation check: a rule that reaches `RULES`
@@ -270,12 +270,14 @@ def test_triad_blocks_an_undocumented_rule(tmp_path: Path) -> None:
     while invariants.py is still on screen.
     """
     project = build_project(tmp_path, documented=True, rules_documented=False)
-    result = run_hook(TRIAD, {}, project)
+    result = run_hook(DOCS, {}, project)
     assert result.returncode == BLOCK
     assert "no-rmtree" in result.stderr
 
 
-def test_triad_ignores_committed_drift_when_nothing_changed(tmp_path: Path) -> None:
+def test_derived_docs_ignores_committed_drift_when_nothing_changed(
+    tmp_path: Path,
+) -> None:
     """An unrelated turn must not be blocked by drift it did not cause.
 
     The CI sweep in test_invariants.py is what catches this case; the hook is
@@ -283,18 +285,18 @@ def test_triad_ignores_committed_drift_when_nothing_changed(tmp_path: Path) -> N
     """
     project = build_project(tmp_path, documented=False)
     make_git_repo(project)  # tree now clean, so this turn is unrelated
-    assert run_hook(TRIAD, {}, project).returncode == ALLOW
+    assert run_hook(DOCS, {}, project).returncode == ALLOW
 
 
-def test_triad_reports_once_a_site_is_dirty(tmp_path: Path) -> None:
+def test_derived_docs_reports_once_a_site_is_dirty(tmp_path: Path) -> None:
     project = build_project(tmp_path, documented=False)
     make_git_repo(project)
     (project / ".env.example").write_text("# CHAT_MODEL=x\n# touched\n")
-    assert run_hook(TRIAD, {}, project).returncode == BLOCK
+    assert run_hook(DOCS, {}, project).returncode == BLOCK
 
 
-def test_triad_reports_when_git_cannot_answer(tmp_path: Path) -> None:
+def test_derived_docs_reports_when_git_cannot_answer(tmp_path: Path) -> None:
     """No repo means the gate must fail toward enforcing, not toward silence."""
     project = build_project(tmp_path, documented=False)
     assert not (project / ".git").exists()
-    assert run_hook(TRIAD, {}, project).returncode == BLOCK
+    assert run_hook(DOCS, {}, project).returncode == BLOCK
