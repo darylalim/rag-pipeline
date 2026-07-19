@@ -187,8 +187,8 @@ CI like any other file: `ruff check .` does not exclude dot-directories.
 ## Conventions
 
 - New failure modes must fit `FileNotFoundError | RuntimeError | ValueError` —
-  the union both frontends catch (`cli.py:65`, `app.py:48`; see the comment at
-  `app.py:49-50` for the precise per-type mapping). Don't add a fourth type.
+  the union both frontends catch (`cli.py:65`, `app.py:60`; see the comment at
+  `app.py:61-62` for the precise per-type mapping). Don't add a fourth type.
 - Preserve `answer()`'s `anthropic.APIError` → `RuntimeError` translation, so
   frontends never import the Anthropic SDK.
 - Keep the empty-collection guard in `RAGPipeline.__init__`: Chroma's
