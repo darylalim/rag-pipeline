@@ -1,12 +1,15 @@
 name: CI
 
-# `pull_request` is required, not decorative: a PR from a fork produces no push
-# event in this repo, so with `push` alone none of the required status checks
-# would ever report and the PR could never merge. `push` is scoped to main so a
-# PR branch gets one run (via pull_request) rather than two.
+# `push` is unscoped so every branch gets CI immediately, not only once a PR is
+# open — a branch that has been broken for six commits is worth knowing about
+# before review.
+#
+# `pull_request` is still required, not decorative: a PR from a fork produces no
+# push event in this repo, so without it none of the required status checks would
+# ever report and the PR could never merge. The `if:` on each job below is what
+# stops a same-repo PR running everything twice.
 on:
   push:
-    branches: [main]
   pull_request:
 
 # Neither job writes anything back to the repo; least privilege limits what a
@@ -29,11 +32,21 @@ concurrency:
 # silently stops the gate matching — it still reads as configured while
 # enforcing nothing. Update both together:
 #     gh api repos/darylalim/rag-pipeline/rulesets
+#
+# Both jobs carry the same `if:`. A same-repo PR branch already got a full run
+# from its own push event on the identical SHA, so the pull_request run skips
+# instead of repeating it; GitHub reports a skipped required check as passing,
+# so the ruleset is still satisfied. A fork PR has no push event here, so the
+# condition is true and the checks run for real. Comparing `full_name` never
+# reaches a shell -- it is an expression, not interpolation into `run:`.
 jobs:
   # Lint and type checks are interpreter-independent, so they run once on a
   # single version rather than across the test matrix.
   lint:
     name: ruff + ty  # ← required status check
+    if: >-
+      github.event_name == 'push'
+      || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -72,6 +85,9 @@ jobs:
 
   test:
     name: pytest (py${{ matrix.python-version }})  # ← required status check
+    if: >-
+      github.event_name == 'push'
+      || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
