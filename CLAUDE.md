@@ -199,12 +199,15 @@ CI like any other file: `ruff check .` does not exclude dot-directories.
 - New failure modes must fit `FileNotFoundError | RuntimeError | ValueError` —
   the union both frontends catch (`cli.py:77`, `app.py:65`; see the comment at
   `app.py:66-67` for the precise per-type mapping). Don't add a fourth type.
-- Preserve `_generate()`'s `anthropic.APIError` → `RuntimeError` translation, so
-  frontends never import the Anthropic SDK. It lives there and nowhere else —
-  `stream_answer()` wraps it and `answer()` joins over that — so all three
-  shapes inherit one translation. Note it wraps the *iteration*, not the
-  `.stream()` call: the chain is lazy, so a provider error surfaces during
-  consumption, and a `try` around the call alone would catch nothing.
+- Generation-level failures are raised in `_generate()` and nowhere else — the
+  `anthropic.APIError` → `RuntimeError` translation that keeps the SDK out of
+  both frontends, and the empty-response guard that stops a frontend presenting
+  no content under a full citation list. `stream_answer()` wraps `_generate()`
+  and `answer()` joins over that, so every shape inherits both. A new failure
+  belongs here rather than in a frontend: the one that goes in `app.py` is the
+  one `cli.py` silently doesn't get. Note the translation wraps the *iteration*,
+  not the `.stream()` call: the chain is lazy, so a provider error surfaces
+  during consumption, and a `try` around the call alone would catch nothing.
 - `stream_answer()` returns `(docs, chunks)` because every frontend needs both,
   and handing back the docs the answer was actually generated from is what stops
   displayed citations from drifting via a second search. Its two halves settle at

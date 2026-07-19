@@ -133,20 +133,30 @@ class RAGPipeline:
     def _generate(self, question: str, docs: list[Document]) -> Iterator[str]:
         """Yield the grounded answer in pieces, as the model produces them.
 
-        The single generation path, so the provider-error translation lives here
-        only. It must wrap the *iteration*: `.stream()` is lazy, so a failed
-        request surfaces while the generator is being consumed, not when it is
-        created.
+        The single generation path, so every generation-level failure is raised
+        here rather than in each frontend: a provider error, and a response that
+        arrives empty. The provider translation must wrap the *iteration* —
+        `.stream()` is lazy, so a failed request surfaces while the generator is
+        being consumed, not when it is created.
         """
+        produced_content = False
         try:
-            yield from self._chain.stream(
+            for chunk in self._chain.stream(
                 {"context": format_docs(docs), "question": question}
-            )
+            ):
+                produced_content = produced_content or bool(chunk.strip())
+                yield chunk
         except anthropic.APIError as exc:
             # Translate provider errors (bad/expired key, rate limit, network)
             # into a generic RuntimeError, so frontends handle a failed
             # generation uniformly without depending on the Anthropic SDK.
             raise RuntimeError(f"Claude API request failed: {exc}") from exc
+        if not produced_content:
+            # Otherwise each frontend presents nothing as a cited answer — a
+            # blank chat bubble above a full Sources expander, or the CLI's
+            # "Sources:" block under an empty line — claiming the strongest
+            # possible grounding for no content at all.
+            raise RuntimeError("Claude returned an empty answer")
 
     def stream_answer(self, question: str) -> tuple[list[Document], Iterator[str]]:
         """Search, then hand back the sources and a lazy stream of the answer.

@@ -91,6 +91,15 @@ with st.sidebar:
         st.session_state.messages = []
 
 
+def _error_reply(text: str) -> dict:
+    """A stored assistant turn that failed rather than answered.
+
+    Cites nothing, because an unanswered turn has no grounding to claim, and
+    carries the flag the replay loop routes on.
+    """
+    return {"role": "assistant", "content": text, "sources": [], "error": True}
+
+
 def _render_sources(sources: list[str]) -> None:
     if sources:
         with st.expander("Sources", icon=":material/description:"):
@@ -130,53 +139,33 @@ if question := st.chat_input(
 
     # Stands unless a branch below replaces it, so an interruption still records
     # *something* under the question rather than leaving it dangling.
-    reply = {
-        "role": "assistant",
-        "content": "Interrupted before an answer was generated.",
-        "sources": [],
-        "error": True,
-    }
+    reply = _error_reply("Interrupted before an answer was generated.")
     with st.chat_message("assistant"):
         try:
-            # Retrieval is a separate step so the spinner covers only the part
-            # with nothing to show; generation then streams in visibly, and the
-            # sources below come from these same docs rather than a second
-            # search.
             # stream_answer() has finished retrieving when it returns but has
             # not started generating, so the spinner covers exactly the step
             # with nothing to show.
             with st.spinner("Retrieving context..."):
                 docs, chunks = pipeline.stream_answer(question)
             answer_text = st.write_stream(chunks)
-            # write_stream already rendered the text; it is only re-read here to
-            # store it. The join covers the declared list[Any] return — the
-            # chain yields str, but replay feeds this to st.markdown, which
-            # needs one. Inside the try because join raises on a non-str list,
-            # and that belongs in the handler rather than as a crash page.
-            text = answer_text if isinstance(answer_text, str) else "".join(answer_text)
-            if not text.strip():
-                # Storing this would leave a blank bubble above a populated
-                # Sources expander, implying the listed documents grounded an
-                # answer that does not exist. Routed through the handler below
-                # so it reads as the failure it is.
-                raise RuntimeError("the model returned an empty answer")
+            # write_stream already rendered this; it is re-read only to store
+            # it, and joined because the declared return is list[Any] | str —
+            # a str is itself an iterable of str, so one join covers both. Kept
+            # inside the try so a non-str list raises into the handler below
+            # rather than as a crash page.
+            text = "".join(answer_text)
             sources = unique_sources(docs)
             _render_sources(sources)
             reply = {"role": "assistant", "content": text, "sources": sources}
         except Exception as exc:
-            # Any failure (bad/expired key, rate limit, network) — show it in
-            # the chat instead of a raw traceback. The `error` flag keeps the
-            # stored text free of presentation, so the replay above can route it
-            # back through st.error rather than rendering a failure as if it
-            # were an answer.
+            # Any failure (bad/expired key, rate limit, empty response) — show
+            # it in the chat instead of a raw traceback. The `error` flag keeps
+            # the stored text free of presentation, so the replay above can
+            # route it back through st.error rather than rendering a failure as
+            # if it were an answer.
             error_msg = f"Generation failed: {exc}"
             st.error(error_msg, icon=":material/error:")
-            reply = {
-                "role": "assistant",
-                "content": error_msg,
-                "sources": [],
-                "error": True,
-            }
+            reply = _error_reply(error_msg)
         finally:
             # Both halves land together, so no exit path — success, handled
             # failure, or an interruption that unwinds past the handler — can

@@ -281,38 +281,52 @@ def _fail_pipeline_empty_collection(settings, fake_embeddings, monkeypatch, tmp_
     RAGPipeline(settings, embeddings=fake_embeddings)
 
 
-def _fail_answer_on_provider_error(settings, fake_embeddings, monkeypatch, tmp_path):
+def _ingested_pipeline(settings, fake_embeddings, llm) -> RAGPipeline:
+    """A pipeline over a freshly ingested index, generating through `llm`."""
     ingest_mod.ingest(settings, embeddings=fake_embeddings)
+    return RAGPipeline(settings, embeddings=fake_embeddings, llm=llm)
+
+
+def _exploding_llm() -> RunnableLambda:
+    """A model that fails the way a real provider does.
+
+    A real failure (bad key, rate limit, network) surfaces as an
+    anthropic.APIError subclass; raise one offline instead of calling out.
+    """
 
     def explode(_prompt_value):
-        # A real provider failure (bad key, rate limit, network) surfaces as an
-        # anthropic.APIError subclass; raise one offline instead of calling out.
         raise anthropic.APIConnectionError(
             request=httpx.Request("POST", "https://api.anthropic.com/v1/messages")
         )
 
-    pipeline = RAGPipeline(
-        settings, embeddings=fake_embeddings, llm=RunnableLambda(explode)
-    )
+    return RunnableLambda(explode)
+
+
+def _fail_answer_on_provider_error(settings, fake_embeddings, monkeypatch, tmp_path):
+    pipeline = _ingested_pipeline(settings, fake_embeddings, _exploding_llm())
     pipeline.answer("Why do chunks overlap?")
 
 
 def _fail_stream_answer_on_provider_error(
     settings, fake_embeddings, monkeypatch, tmp_path
 ):
-    ingest_mod.ingest(settings, embeddings=fake_embeddings)
-
-    def explode(_prompt_value):
-        raise anthropic.APIConnectionError(
-            request=httpx.Request("POST", "https://api.anthropic.com/v1/messages")
-        )
-
-    pipeline = RAGPipeline(
-        settings, embeddings=fake_embeddings, llm=RunnableLambda(explode)
-    )
+    pipeline = _ingested_pipeline(settings, fake_embeddings, _exploding_llm())
     # Consumed to exhaustion: generation is lazy, so merely calling
     # stream_answer() raises nothing. This is the shape both frontends use, and
     # it is where the translation has to hold.
+    _docs, chunks = pipeline.stream_answer("Why do chunks overlap?")
+    list(chunks)
+
+
+def _fail_stream_answer_on_empty_response(
+    settings, fake_embeddings, monkeypatch, tmp_path
+):
+    # Guarded in the pipeline rather than per-frontend: an answer that arrives
+    # empty would otherwise be presented with a full citation list by whichever
+    # frontend forgot to check.
+    pipeline = _ingested_pipeline(
+        settings, fake_embeddings, FakeListChatModel(responses=["   "])
+    )
     _docs, chunks = pipeline.stream_answer("Why do chunks overlap?")
     list(chunks)
 
@@ -361,6 +375,12 @@ def _fail_stream_answer_on_provider_error(
             RuntimeError,
             "Claude API request failed",
             id="stream-answer-provider-error",
+        ),
+        pytest.param(
+            _fail_stream_answer_on_empty_response,
+            RuntimeError,
+            "empty answer",
+            id="stream-answer-empty-response",
         ),
     ],
 )

@@ -27,6 +27,7 @@ from streamlit.testing.v1 import AppTest
 
 from rag_pipeline import ingest as ingest_mod
 from rag_pipeline import pipeline as pipeline_mod
+from rag_pipeline.config import ENV_VARS
 
 APP = Path(__file__).resolve().parent.parent / "app.py"
 
@@ -39,13 +40,12 @@ def app(settings, fake_embeddings, monkeypatch) -> AppTest:
     ingest_mod.ingest(settings, embeddings=fake_embeddings)
 
     # app.py builds its own Settings.from_env(), so the environment is how the
-    # fixture's temp index gets through to it.
-    monkeypatch.setenv("DATA_DIR", str(settings.data_dir))
-    monkeypatch.setenv("PERSIST_DIR", str(settings.persist_dir))
-    monkeypatch.setenv("COLLECTION_NAME", settings.collection_name)
-    monkeypatch.setenv("CHUNK_SIZE", str(settings.chunk_size))
-    monkeypatch.setenv("CHUNK_OVERLAP", str(settings.chunk_overlap))
-    monkeypatch.setenv("RETRIEVAL_K", str(settings.retrieval_k))
+    # fixture's temp index gets through to it. Derived from ENV_VARS rather than
+    # spelled out: a hand-kept list would silently stop covering a new setting,
+    # and config.py's import-time load_dotenv() means the developer's own .env
+    # would answer whichever name was missed.
+    for var in ENV_VARS:
+        monkeypatch.setenv(var, str(getattr(settings, var.lower())))
     # RAGPipeline fast-fails on a missing key whenever it builds the model
     # itself, which it does here. The factory is patched below, so nothing ever
     # authenticates with this value.
@@ -64,8 +64,8 @@ def app(settings, fake_embeddings, monkeypatch) -> AppTest:
     return AppTest.from_file(str(APP), default_timeout=60)
 
 
-def _fail_mid_stream(exc: BaseException):
-    """A generation step that emits, then fails — as a real one would.
+def _fail_mid_stream(monkeypatch, exc: BaseException) -> None:
+    """Make generation emit, then fail — as a real one would.
 
     Patched at `_generate` rather than `stream_answer` so real retrieval still
     runs and the frontend still receives real sources. Failing partway rather
@@ -77,7 +77,7 @@ def _fail_mid_stream(exc: BaseException):
         yield "a partial ans"
         raise exc
 
-    return generate
+    monkeypatch.setattr(pipeline_mod.RAGPipeline, "_generate", generate)
 
 
 def _roles(at: AppTest) -> list[str]:
@@ -110,10 +110,8 @@ def test_user_turn_is_echoed_unparsed(app):
 
 def test_failed_generation_is_recorded_as_an_error_turn(app, monkeypatch):
     """A failure must replay as an error, not as an ordinary answer."""
-    monkeypatch.setattr(
-        pipeline_mod.RAGPipeline,
-        "_generate",
-        _fail_mid_stream(RuntimeError("Claude API request failed: rate limited")),
+    _fail_mid_stream(
+        monkeypatch, RuntimeError("Claude API request failed: rate limited")
     )
     at = app.run()
     at.chat_input[0].set_value("Why do chunks overlap?").run()
@@ -139,11 +137,7 @@ def test_an_interrupted_run_still_pairs_the_turn(app, monkeypatch):
     together, session_state keeps a question with nothing under it, on every
     later rerun, with no code path that ever fills it in.
     """
-    monkeypatch.setattr(
-        pipeline_mod.RAGPipeline,
-        "_generate",
-        _fail_mid_stream(StopException("user pressed stop")),
-    )
+    _fail_mid_stream(monkeypatch, StopException("user pressed stop"))
     at = app.run()
     at.chat_input[0].set_value("Why do chunks overlap?").run()
 
@@ -164,18 +158,10 @@ def test_every_turn_stays_paired_across_mixed_outcomes(app, monkeypatch):
     at = app.run()
     at.chat_input[0].set_value("first").run()
 
-    monkeypatch.setattr(
-        pipeline_mod.RAGPipeline,
-        "_generate",
-        _fail_mid_stream(RuntimeError("Claude API request failed: boom")),
-    )
+    _fail_mid_stream(monkeypatch, RuntimeError("Claude API request failed: boom"))
     at.chat_input[0].set_value("second").run()
 
-    monkeypatch.setattr(
-        pipeline_mod.RAGPipeline,
-        "_generate",
-        _fail_mid_stream(StopException("stop")),
-    )
+    _fail_mid_stream(monkeypatch, StopException("stop"))
     at.chat_input[0].set_value("third").run()
 
     assert _roles(at) == ["user", "assistant"] * 3
@@ -188,13 +174,15 @@ def test_an_empty_answer_is_not_stored_as_a_grounded_turn(app, monkeypatch):
 
     Stored as-is it would render a blank assistant bubble above a populated
     Sources expander — the strongest possible claim of grounding attached to no
-    content at all.
+    content at all. The model is faked rather than `_generate`, so the guard
+    under test is the real one in the pipeline.
     """
+    monkeypatch.setattr(
+        pipeline_mod,
+        "build_chat_model",
+        lambda _s: FakeListChatModel(responses=["   "]),
+    )
 
-    def blank(_self, _question, _docs):
-        yield "   "
-
-    monkeypatch.setattr(pipeline_mod.RAGPipeline, "_generate", blank)
     at = app.run()
     at.chat_input[0].set_value("Why do chunks overlap?").run()
     assert not at.exception, [e.value for e in at.exception]
