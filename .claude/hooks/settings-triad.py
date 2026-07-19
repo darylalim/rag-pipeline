@@ -21,7 +21,17 @@ import re
 import sys
 from pathlib import Path
 
-data = json.load(sys.stdin)
+try:
+    data = json.load(sys.stdin)
+except ValueError as exc:
+    # Exit 1, not 2: an unparseable payload must not wedge the turn, but it
+    # means the hook is not enforcing, so report rather than exit silently.
+    print(
+        f"settings-triad: unreadable hook payload, not enforcing ({exc})",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
 if data.get("stop_hook_active"):
     sys.exit(0)  # already nudged once; let the turn end
 
