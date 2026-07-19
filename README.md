@@ -95,12 +95,12 @@ uv run pytest
 The suite runs fully offline — it injects a deterministic fake embedding model
 (no model download, no network) and a fake chat model in place of Claude, so no
 API key is needed. An autouse fixture blocks network sockets, so a test that
-forgets to inject a fake fails instead of quietly downloading a model. Much of
-its ~7.5s wall time is the transitive `torch` import; the tests themselves take
-~3s. It covers configuration, the loader/splitter, ingest idempotency, the
-source helpers, the setup guards, an ingest→retrieve round-trip, and the
-generation path end-to-end (answer text plus source citations, and that
-retrieved context is injected into the prompt).
+forgets to inject a fake fails instead of quietly downloading a model. Most of
+its ~9s warm wall time is process startup and the transitive `torch` import; the
+tests themselves take ~3s. It covers configuration, the loader/splitter, ingest
+idempotency, the source helpers, the setup guards, an ingest→retrieve
+round-trip, and the generation path end-to-end (answer text plus source
+citations, and that retrieved context is injected into the prompt).
 
 `tests/test_app.py` drives the Streamlit app itself headlessly, through the same
 fakes, so the frontend is covered by CI rather than by hand. Its main job is the

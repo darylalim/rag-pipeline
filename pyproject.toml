@@ -15,7 +15,7 @@ dependencies = [
     # wheel index (see [tool.uv.sources] below) applies to it.
     "torch>=2.0",
     "chromadb>=0.5",
-    "streamlit>=1.40",
+    "streamlit>=1.59",
     "python-dotenv>=1.0",
     "pypdf>=5.0",
 ]

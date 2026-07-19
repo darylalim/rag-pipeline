@@ -1,8 +1,10 @@
-"""Tests for the query phase: helpers, guards, and retrieval round-trip.
+"""Tests for the query phase: helpers, guards, retrieval, and generation.
 
-Generation (the Claude call) is not exercised here — it requires a real API
-key. These tests cover everything up to it: the source helpers, the setup
-guards, and that an ingested chunk can be retrieved by its own text.
+Generation *is* exercised here, through an injected fake chat model rather than
+a real one — so no API key and no network, per the injection seam described in
+CLAUDE.md. That covers both shapes (`stream_answer()` and the `answer()` join
+over it), that they cannot drift apart, that streaming stays incremental, and
+that every generation failure lands in the union both frontends catch.
 """
 
 from __future__ import annotations
