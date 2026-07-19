@@ -1,0 +1,245 @@
+"""Enforce the CLAUDE.md invariants across the tree, in CI, for everyone.
+
+This is the primary enforcement layer. The hooks in `.claude/` answer the same
+questions earlier, but only inside a Claude Code session — a human editing in
+vim, or a PR from a fork, is covered by these tests and nothing else.
+
+Rules are exercised in-process here rather than through the hooks, so a rule
+case costs microseconds instead of an interpreter startup. `test_hooks.py`
+covers the thin wiring that carries them.
+"""
+
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from rag_pipeline.config import ENV_VARS, Settings
+from tests.invariants import RULES, settings_fields, settings_problems, violations
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def tracked_python_files() -> list[str]:
+    """Every tracked .py file, or [] when this is not a git work tree.
+
+    Globbed rather than listed because a hardcoded list fails by silently not
+    covering a new file. Returning [] rather than raising matters: this runs at
+    collection time, and an exception here takes down the whole suite — including
+    the product tests — in a release tarball or a Docker build with no .git.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(ROOT), "ls-files", "*.py"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return sorted(result.stdout.split()) if result.returncode == 0 else []
+
+
+TRACKED = tracked_python_files()
+
+
+# --- the tree-wide sweep: the invariant, enforced for everyone ---------------
+
+
+@pytest.mark.skipif(not TRACKED, reason="not a git work tree")
+@pytest.mark.parametrize("relpath", TRACKED or ["<none>"])
+def test_no_source_file_violates_an_invariant(relpath: str) -> None:
+    """The committed tree is clean against every rule.
+
+    This is what makes the rules real: it fails in CI regardless of who wrote
+    the code or which editor they used.
+    """
+    assert violations(relpath, (ROOT / relpath).read_text()) == []
+
+
+@pytest.mark.skipif(not TRACKED, reason="not a git work tree")
+def test_the_sweep_actually_covers_the_tree() -> None:
+    """Guard against the sweep silently covering nothing.
+
+    A parametrized test over an empty list is a green test that asserts
+    nothing — the exact failure mode a hardcoded file list had. Skipped rather
+    than failed without git, so a release tarball or Docker build still runs
+    the product tests; CI always has a work tree, which is where this bites.
+    """
+    assert len(TRACKED) >= 10
+    assert "rag_pipeline/config.py" in TRACKED
+    assert "app.py" in TRACKED
+
+
+# --- the rules themselves, in-process ----------------------------------------
+
+VIOLATIONS = [
+    pytest.param(
+        "rag_pipeline/cli.py", "from rag_pipeline.ingest import ingest", id="cli-dotted"
+    ),
+    pytest.param(
+        "rag_pipeline/cli.py", "from .pipeline import RAGPipeline", id="cli-relative"
+    ),
+    pytest.param(
+        "rag_pipeline/cli.py",
+        "from rag_pipeline import ingest, pipeline",
+        id="cli-bare",
+    ),
+    pytest.param("rag_pipeline/cli.py", "from . import ingest", id="cli-dot"),
+    pytest.param("rag_pipeline/cli.py", "import rag_pipeline.pipeline", id="cli-plain"),
+    pytest.param("app.py", 'store = Chroma(collection_name="x")', id="inline-chroma"),
+    pytest.param(
+        "app.py", "e = HuggingFaceEmbeddings(model_name=m)", id="inline-embeddings"
+    ),
+    pytest.param(
+        # tests/ may open Chroma directly, but never build a real embedding model.
+        "tests/test_pipeline.py",
+        'emb = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")',
+        id="embeddings-in-tests",
+    ),
+    pytest.param("rag_pipeline/config.py", "import os  # noqa: F401", id="suppression"),
+    pytest.param("rag_pipeline/config.py", "x = y  # ty: ignore", id="ty-ignore"),
+    pytest.param("rag_pipeline/ingest.py", "rmtree(settings.persist_dir)", id="rmtree"),
+    pytest.param(
+        "rag_pipeline/pipeline.py",
+        "ChatAnthropic(model=m, temperature=0.2)",
+        id="temperature",
+    ),
+]
+
+ALLOWED = [
+    pytest.param(
+        "rag_pipeline/cli.py",
+        "from rag_pipeline.config import Settings",
+        id="cli-config-import-is-cheap",
+    ),
+    pytest.param(
+        "rag_pipeline/cli.py",
+        "from rag_pipeline import config  # pipeline notes",
+        id="comment-mentioning-pipeline",
+    ),
+    pytest.param(
+        "rag_pipeline/cli.py",
+        "def cmd_ingest(args):\n    from rag_pipeline.ingest import ingest\n",
+        id="lazy-import-inside-function",
+    ),
+    pytest.param(
+        "rag_pipeline/ingest.py",
+        "return Chroma(collection_name=n)",
+        id="ingest-is-the-factory-home",
+    ),
+    pytest.param(
+        "tests/test_ingest.py",
+        'store = Chroma(collection_name="x")',
+        id="tests-may-open-chroma",
+    ),
+    # Prose describing a rule must not trip it, or the rule cannot be documented.
+    pytest.param(
+        "app.py",
+        "# Never construct Chroma(...) inline -- use open_store().",
+        id="comment-describing-chroma-rule",
+    ),
+    pytest.param(
+        "rag_pipeline/pipeline.py",
+        '"""build_chat_model sets no temperature= by design."""',
+        id="docstring-describing-sampling-rule",
+    ),
+    pytest.param(
+        "rag_pipeline/config.py",
+        'DOC = "write # noqa and it gets rejected"',
+        id="suppression-inside-a-string",
+    ),
+    pytest.param(
+        # Column 0 inside a triple-quoted block: the `^` anchor would match this
+        # without masking, so it is the case that proves masking does work.
+        "rag_pipeline/cli.py",
+        'HELP = """\nfrom rag_pipeline.ingest import ingest\n"""',
+        id="cli-import-inside-a-docstring",
+    ),
+    pytest.param("README.md", "Never construct Chroma(...) inline.", id="not-python"),
+]
+
+
+@pytest.mark.parametrize(("relpath", "text"), VIOLATIONS)
+def test_violations_are_reported(relpath: str, text: str) -> None:
+    assert violations(relpath, text) != []
+
+
+@pytest.mark.parametrize(("relpath", "text"), ALLOWED)
+def test_legitimate_code_is_not_reported(relpath: str, text: str) -> None:
+    assert violations(relpath, text) == []
+
+
+def test_masking_is_linear_on_pathological_input() -> None:
+    """An unterminated quote plus backslash-heavy text must not blow up.
+
+    The earlier two-pass masking backtracked exponentially here: 8 such lines
+    took 6.5s and 12 never finished, which in a PreToolUse hook wedges the edit.
+    Edit fragments that open a docstring without closing it are routine.
+    """
+    fragment = "'''\n" + 'x = re.compile(r"\\d+\\w*\\s")\n' * 40
+    assert violations("rag_pipeline/ingest.py", fragment) == []
+
+
+def test_every_rule_has_a_case_in_both_directions() -> None:
+    """A rule with no test is a rule that can rot unnoticed."""
+    assert len(RULES) == 6
+    assert len({rule.name for rule in RULES}) == len(RULES)
+
+
+# --- the Settings documentation rule -----------------------------------------
+
+
+def test_every_setting_is_documented() -> None:
+    """`.env.example` and the README config table are complete.
+
+    Nothing else notices when they go stale: ruff, ty and the whole suite stay
+    green against a stale README.
+    """
+    assert settings_problems(ROOT) == []
+
+
+def test_settings_fields_matches_config_env_vars() -> None:
+    """The text-level extraction agrees with the imported dataclass.
+
+    These are two different mechanisms — ast parsing for the hook, `fields()`
+    for the tests — and they must not drift.
+    """
+    assert tuple(settings_fields((ROOT / "rag_pipeline/config.py").read_text())) == (
+        ENV_VARS
+    )
+
+
+@pytest.mark.parametrize("var", ENV_VARS)
+def test_every_env_var_actually_overrides_its_field(
+    var: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Each name in ENV_VARS is one `from_env` really reads.
+
+    ENV_VARS is derived from the dataclass fields, but `from_env` names its
+    variables as literals — so a typo there would leave a name in ENV_VARS that
+    overrides nothing, and the defaults test would clear a variable no one uses.
+    Asserting the override behaviorally is what ties the two together.
+    """
+    field = next(
+        f for f in Settings.__dataclass_fields__.values() if f.name.upper() == var
+    )
+    default = getattr(Settings, field.name)
+    # isinstance, not type(): a Path default is a PosixPath, and bool must be
+    # checked before int because bool subclasses it.
+    if isinstance(default, Path):
+        override = str(tmp_path)
+    elif isinstance(default, bool):
+        override = "1"
+    elif isinstance(default, int):
+        override = "7"
+    else:
+        override = "sentinel"
+
+    monkeypatch.setenv(var, override)
+    changed = getattr(Settings.from_env(), field.name)
+
+    assert changed != default, f"{var} did not override {field.name}"

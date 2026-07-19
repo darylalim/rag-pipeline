@@ -7,6 +7,10 @@ guards, and that an ingested chunk can be retrieved by its own text.
 
 from __future__ import annotations
 
+import dataclasses
+
+import anthropic
+import httpx
 import pytest
 from langchain_core.documents import Document
 from langchain_core.language_models import FakeListChatModel
@@ -128,3 +132,159 @@ def test_answer_injects_retrieved_context_into_prompt(
     # Retrieved chunks are stuffed into the prompt as labeled context.
     assert "[Source:" in human
     assert result.sources[0].metadata["source"] in human
+
+
+def test_collection_mismatch_is_caught_by_the_empty_collection_guard(
+    settings, fake_embeddings, monkeypatch
+):
+    """Pins *which* guard rejects a COLLECTION_NAME mismatch, and that the index
+    it rejected was not actually empty.
+
+    Chroma's `get_or_create` hands back a silently-empty collection when the
+    name doesn't match what was ingested, so without the guard every question is
+    answered "I don't know". `raises(FileNotFoundError)` alone can't tell that
+    guard apart from the `persist_dir.exists()` check that runs before it — a
+    populated persist_dir plus `match=` does. The `reset_store_cache()` puts the
+    re-open in the state a real `rag query` starts from, rather than letting
+    chromadb's per-process client cache decide the outcome.
+    """
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-fake")
+    ingest_mod.ingest(settings, embeddings=fake_embeddings)
+    ingest_mod.reset_store_cache()
+
+    mismatched = dataclasses.replace(settings, collection_name="not_the_ingested_one")
+    assert mismatched.persist_dir.exists(), (
+        "the index must exist for this to prove anything"
+    )
+
+    with pytest.raises(FileNotFoundError, match="is empty"):
+        RAGPipeline(mismatched, embeddings=fake_embeddings)
+
+    # And the correctly-named collection still retrieves: the failure above was
+    # about the name, not a genuinely empty index.
+    ingest_mod.reset_store_cache()
+    assert RAGPipeline(settings, embeddings=fake_embeddings).retrieve("apples")
+
+
+# The exception union both frontends catch (`cli.py`, `app.py`). A failure mode
+# outside it escapes as a traceback in the CLI and a Streamlit crash page.
+_FRONTEND_EXCEPTIONS = (FileNotFoundError, RuntimeError, ValueError)
+
+
+def _fail_ingest_missing_data_dir(settings, fake_embeddings, monkeypatch, tmp_path):
+    ingest_mod.ingest(
+        dataclasses.replace(settings, data_dir=tmp_path / "no-such-dir"),
+        embeddings=fake_embeddings,
+    )
+
+
+def _fail_ingest_empty_corpus(settings, fake_embeddings, monkeypatch, tmp_path):
+    empty = tmp_path / "empty-data"
+    empty.mkdir()
+    ingest_mod.ingest(
+        dataclasses.replace(settings, data_dir=empty), embeddings=fake_embeddings
+    )
+
+
+def _fail_pipeline_missing_index(settings, fake_embeddings, monkeypatch, tmp_path):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-fake")
+    RAGPipeline(
+        dataclasses.replace(settings, persist_dir=tmp_path / "no-such-index"),
+        embeddings=fake_embeddings,
+    )
+
+
+def _fail_pipeline_missing_api_key(settings, fake_embeddings, monkeypatch, tmp_path):
+    ingest_mod.ingest(settings, embeddings=fake_embeddings)
+    # Set-but-empty rather than delenv, matching how config.py's helpers treat a
+    # blank var: both must read as "no key".
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "")
+    RAGPipeline(settings, embeddings=fake_embeddings)
+
+
+def _fail_pipeline_empty_collection(settings, fake_embeddings, monkeypatch, tmp_path):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-fake")
+    settings.persist_dir.mkdir(parents=True, exist_ok=True)
+    RAGPipeline(settings, embeddings=fake_embeddings)
+
+
+def _fail_answer_on_provider_error(settings, fake_embeddings, monkeypatch, tmp_path):
+    ingest_mod.ingest(settings, embeddings=fake_embeddings)
+
+    def explode(_prompt_value):
+        # A real provider failure (bad key, rate limit, network) surfaces as an
+        # anthropic.APIError subclass; raise one offline instead of calling out.
+        raise anthropic.APIConnectionError(
+            request=httpx.Request("POST", "https://api.anthropic.com/v1/messages")
+        )
+
+    pipeline = RAGPipeline(
+        settings, embeddings=fake_embeddings, llm=RunnableLambda(explode)
+    )
+    pipeline.answer("Why do chunks overlap?")
+
+
+@pytest.mark.parametrize(
+    ("failing_call", "expected_type", "expected_message"),
+    [
+        pytest.param(
+            _fail_ingest_missing_data_dir,
+            FileNotFoundError,
+            "Data directory does not exist",
+            id="ingest-missing-data-dir",
+        ),
+        pytest.param(
+            _fail_ingest_empty_corpus,
+            ValueError,
+            "No readable documents found",
+            id="ingest-empty-corpus",
+        ),
+        pytest.param(
+            _fail_pipeline_missing_index,
+            FileNotFoundError,
+            "No index found at",
+            id="pipeline-missing-index",
+        ),
+        pytest.param(
+            _fail_pipeline_missing_api_key,
+            RuntimeError,
+            "ANTHROPIC_API_KEY is not set",
+            id="pipeline-missing-api-key",
+        ),
+        pytest.param(
+            _fail_pipeline_empty_collection,
+            FileNotFoundError,
+            "is empty",
+            id="pipeline-empty-collection",
+        ),
+        pytest.param(
+            _fail_answer_on_provider_error,
+            RuntimeError,
+            "Claude API request failed",
+            id="answer-provider-error",
+        ),
+    ],
+)
+def test_failure_modes_stay_inside_the_frontend_exception_union(
+    failing_call,
+    expected_type,
+    expected_message,
+    settings,
+    fake_embeddings,
+    monkeypatch,
+    tmp_path,
+):
+    """Every known failure path must land in `FileNotFoundError | RuntimeError |
+    ValueError`, the union `cli.py` and `app.py` catch.
+
+    Individual tests above already cover most of these one at a time; this one
+    exists to make the *union* the thing under test, so adding a fourth type
+    (or letting `anthropic.APIError` escape `answer()` untranslated, which
+    would drag the Anthropic SDK into both frontends) fails here rather than at
+    a user's terminal. `expected_type` is checked exactly, so a path can't drift
+    to a different member of the union unnoticed.
+    """
+    with pytest.raises(_FRONTEND_EXCEPTIONS, match=expected_message) as excinfo:
+        failing_call(settings, fake_embeddings, monkeypatch, tmp_path)
+
+    assert type(excinfo.value) is expected_type

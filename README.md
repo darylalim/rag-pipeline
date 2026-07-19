@@ -93,17 +93,22 @@ uv run pytest
 
 The suite runs fully offline — it injects a deterministic fake embedding model
 (no model download, no network) and a fake chat model in place of Claude, so no
-API key is needed. Most of its ~7s wall time is the transitive `torch` import;
-the tests themselves take ~2.5s. It covers configuration, the loader/splitter,
-ingest idempotency, the source helpers, the setup guards, an ingest→retrieve
-round-trip, and the generation path end-to-end (answer text plus source
-citations, and that retrieved context is injected into the prompt).
+API key is needed. An autouse fixture blocks network sockets, so a test that
+forgets to inject a fake fails instead of quietly downloading a model. Most of
+its ~6s wall time is the transitive `torch` import; the tests themselves take
+~1.5s. It covers configuration, the loader/splitter, ingest idempotency, the
+source helpers, the setup guards, an ingest→retrieve round-trip, and the
+generation path end-to-end (answer text plus source citations, and that
+retrieved context is injected into the prompt).
 
-`tests/test_hooks.py` additionally exercises the two enforcement hooks in
-`.claude/hooks/` (see CLAUDE.md) by running them as subprocesses, which is how
-Claude Code invokes them. It is ~2.2s of the test time — 61 interpreter
-startups plus a few throwaway git repos — and is the only part of the suite
-that shells out.
+Two files enforce the project's own invariants rather than its behavior.
+`tests/test_invariants.py` checks every tracked `.py` file against the rules in
+`tests/invariants.py` — no inline store/embedding construction outside the
+factories, lazy CLI imports, no lint suppressions, and that every setting is
+documented here and in `.env.example`. `tests/test_hooks.py` covers the two
+optional Claude Code hooks in `.claude/` that report the same problems earlier;
+they are a convenience for one editor, and deleting them changes nothing about
+what CI enforces.
 
 ## Linting and type checking
 
