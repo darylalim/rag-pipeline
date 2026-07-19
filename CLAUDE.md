@@ -12,6 +12,7 @@ uv run streamlit run app.py          # chat UI over the same pipeline
 uv run pytest                        # full suite (~9s warm: ~3s tests, rest torch import + startup; offline)
 uv run pytest tests/test_config.py::test_defaults   # single test
 uv run pytest -k idempotent -v                      # by keyword
+uv run pytest --cov=rag_pipeline --cov=app --cov-report=term-missing   # coverage, on demand
 uv run ruff check --fix . && uv run ruff format .   # lint, then format (order matters)
 uv run ty check                      # type check
 uv sync --locked && uv run ruff check . && uv run ruff format --check . && uv run ty check && uv run pytest   # every check CI runs

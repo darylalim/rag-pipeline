@@ -107,6 +107,18 @@ is injected into the prompt), and the CLI as a terminal program — its output,
 its deduplicated sources block, and the exit code each member of the caught
 exception union produces.
 
+Coverage is measured on demand rather than in CI, and carries no threshold — a
+number to keep green invites tests that execute code without asserting anything:
+
+```bash
+uv run pytest --cov=rag_pipeline --cov=app --cov-report=term-missing
+```
+
+It currently reports 99%, and both uncovered lines are meant to be uncovered:
+`cli.py`'s `if __name__ == "__main__"` guard, and the `HuggingFaceEmbeddings(...)`
+construction in `build_embeddings()` — the one line the offline suite exists to
+never execute.
+
 `tests/test_app.py` drives the Streamlit app itself headlessly, through the same
 fakes, so the frontend is covered by CI rather than by hand. Its main job is the
 one guarantee no lower-level test can see: that a chat turn is stored as a

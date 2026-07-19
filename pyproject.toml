@@ -41,6 +41,7 @@ packages = ["rag_pipeline"]
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
+    "pytest-cov>=7.0",
     "ruff>=0.15.22",
     "ty>=0.0.61",
 ]
