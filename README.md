@@ -135,8 +135,8 @@ formatting then tidies.
 
 ## Continuous integration
 
-`.github/workflows/ci.yml` runs on every pull request and on pushes to `main`,
-as two jobs:
+`.github/workflows/ci.yml` runs on every push — any branch — and on every pull
+request, as two jobs:
 
 | Job    | Status check name                     | Runs                                             |
 | ------ | ------------------------------------- | ------------------------------------------------ |
@@ -148,11 +148,18 @@ Both install with `uv sync --locked`, which fails if `uv.lock` has drifted from
 rather than silently skipped. The `lint` job installs only the dev group before
 running ruff, and the full environment only for `ty check`.
 
-Tests need no secrets: the suite is fully offline. All three checks are required
-by a branch ruleset before `main` will accept a merge.
+Tests need no secrets: the suite is fully offline.
 
-Feature branches only get CI once a PR is open. To run the same checks locally
-beforehand, see the commands above.
+Every branch push gets CI immediately, so a branch that has been broken for
+several commits is visible before review rather than after. A same-repo pull
+request then skips both jobs, because its own branch push already ran them on
+the identical commit; a pull request from a fork produces no push event here, so
+its jobs run for real.
+
+Nothing gates `main` — it accepts direct pushes, and CI reports on the result
+rather than blocking it. To gate merges instead, add a repository ruleset
+requiring the three status check names in the table above. To run the same
+checks locally beforehand, see the commands above.
 
 ## Project structure
 
