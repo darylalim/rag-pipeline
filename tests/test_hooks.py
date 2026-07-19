@@ -90,6 +90,13 @@ VIOLATIONS = [
     pytest.param(
         "app.py", "e = HuggingFaceEmbeddings(model_name=m)", id="inline-embeddings"
     ),
+    pytest.param(
+        # tests/ may open Chroma directly, but never build a real embedding
+        # model: that downloads ~90MB and puts the suite back on the network.
+        "tests/test_pipeline.py",
+        'emb = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")',
+        id="embeddings-in-tests-breaks-offline",
+    ),
     pytest.param("rag_pipeline/config.py", "import os  # noqa: F401", id="noqa"),
     pytest.param("rag_pipeline/config.py", "x = y  # ty: ignore", id="ty-ignore"),
     pytest.param("rag_pipeline/ingest.py", "rmtree(settings.persist_dir)", id="rmtree"),
@@ -151,6 +158,35 @@ ALLOWED = [
         'BAD = "import os  # noqa: F401"',
         id="hook-test-may-quote-banned-patterns",
     ),
+    # Prose describing a rule must not trip it. Without literal/comment masking
+    # the author cannot document the invariant being enforced.
+    pytest.param(
+        "app.py",
+        "# Never construct Chroma(...) inline -- use open_store().",
+        id="comment-describing-the-chroma-rule",
+    ),
+    pytest.param(
+        "rag_pipeline/pipeline.py",
+        '"""build_chat_model sets no temperature= by design."""',
+        id="docstring-describing-the-sampling-rule",
+    ),
+    pytest.param(
+        "rag_pipeline/ingest.py",
+        '# never rmtree the persist dir\nRULE = "no rmtree here"',
+        id="prose-describing-the-rmtree-rule",
+    ),
+    pytest.param(
+        "rag_pipeline/config.py",
+        'DOC = "write # noqa and it gets rejected"',
+        id="noqa-inside-a-string-literal",
+    ),
+    pytest.param(
+        # Column 0 inside a triple-quoted block: the `^` anchor would match this
+        # without masking, so it is the case that proves masking is doing work.
+        "rag_pipeline/cli.py",
+        'HELP = """\nfrom rag_pipeline.ingest import ingest\n"""',
+        id="cli-import-inside-a-docstring",
+    ),
 ]
 
 
@@ -187,12 +223,100 @@ def test_guard_reads_the_edit_tool_new_string_field() -> None:
             id="outside-the-repo",
         ),
         pytest.param(
-            {"tool_input": {"file_path": "app.py", "content": "   "}}, id="empty-text"
+            # Absolute, so this isolates the empty-text exit rather than also
+            # depending on how a relative path resolves.
+            {"tool_input": {"file_path": str(ROOT / "app.py"), "content": "   "}},
+            id="empty-text",
         ),
     ],
 )
 def test_guard_ignores_irrelevant_payloads(payload: dict[str, object]) -> None:
     assert run_hook(GUARD, payload).returncode == ALLOW
+
+
+def test_guard_resolves_a_relative_path_against_the_project(tmp_path: Path) -> None:
+    """A relative file_path is project-relative, not cwd-relative.
+
+    Resolving against the hook's own cwd would place it outside the project and
+    skip enforcement — a silent fail-open, which is the worst outcome for a
+    guard because the green result is indistinguishable from a real pass.
+    """
+    result = subprocess.run(
+        [sys.executable, str(GUARD)],
+        input=json.dumps(
+            {"tool_input": {"file_path": "app.py", "content": 'Chroma(name="x")'}}
+        ),
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,  # deliberately not the project directory
+        env={**os.environ, "CLAUDE_PROJECT_DIR": str(ROOT)},
+        check=False,
+    )
+    assert result.returncode == BLOCK
+
+
+@pytest.mark.parametrize("script", [GUARD, TRIAD], ids=["guard", "triad"])
+def test_hooks_report_rather_than_crash_on_bad_payloads(script: Path) -> None:
+    """Malformed stdin must not block, and must not exit silently either.
+
+    Exit 1 is Claude Code's non-blocking-error path: the edit proceeds, but the
+    first stderr line surfaces, so a payload-shape change in a future release
+    cannot disable enforcement without anyone noticing.
+    """
+    result = subprocess.run(
+        [sys.executable, str(script)],
+        input="not json",
+        capture_output=True,
+        text=True,
+        env={**os.environ, "CLAUDE_PROJECT_DIR": str(ROOT)},
+        check=False,
+    )
+    assert result.returncode == 1
+    assert "not enforcing" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
+# --- the wiring that invokes the hooks ---------------------------------------
+
+
+def test_settings_json_points_at_hooks_that_exist() -> None:
+    """The hooks can be perfect and still never run.
+
+    Nothing else covers this: every other test invokes the scripts by path, so
+    renaming one leaves the suite green while no hook fires in any session.
+    """
+    settings = json.loads((ROOT / ".claude" / "settings.json").read_text())
+    configured = settings["hooks"]
+
+    assert set(configured) == {"PreToolUse", "Stop"}
+    assert configured["PreToolUse"][0]["matcher"] == "Edit|Write"
+
+    commands = [
+        hook["command"]
+        for matchers in configured.values()
+        for matcher in matchers
+        for hook in matcher["hooks"]
+    ]
+    assert len(commands) == 2
+    for command in commands:
+        script = Path(command.replace("${CLAUDE_PROJECT_DIR}", str(ROOT)))
+        assert script.is_file(), f"{command} does not exist"
+        assert os.access(script, os.X_OK), f"{command} is not executable"
+
+
+@pytest.mark.parametrize("script", [GUARD, TRIAD], ids=["guard", "triad"])
+def test_hooks_run_under_their_shebang(script: Path) -> None:
+    """settings.json execs the scripts directly, so the shebang is the real
+    entry point — not the venv interpreter every other test uses."""
+    result = subprocess.run(
+        [str(script)],
+        input=json.dumps({"stop_hook_active": True}),
+        capture_output=True,
+        text=True,
+        env={**os.environ, "CLAUDE_PROJECT_DIR": str(ROOT)},
+        check=False,
+    )
+    assert result.returncode == ALLOW, result.stderr
 
 
 # --- settings-triad ----------------------------------------------------------
