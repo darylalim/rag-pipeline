@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
 """PreToolUse hook: reject edits that violate mechanical CLAUDE.md invariants.
 
-Only the text being written is inspected, so pre-existing code never trips it.
+Thin by design. The rules live in ``tests/invariants.py`` and are enforced for
+everyone by ``tests/test_invariants.py`` in CI; this hook exists only to give
+the same answer earlier, at write time rather than at review time. Delete it and
+nothing stops being enforced -- feedback just arrives one pytest run later.
 
-Patterns are matched against a masked copy of that text rather than the raw
-bytes, because otherwise a rule fires on the prose describing it: a comment
-reading `# never construct Chroma(...) inline` would be blocked by the very
-rule it documents. String literals are masked for every rule; comments are
-masked for the code rules but kept for the suppression rule, which exists to
-find `# noqa` in a comment and nowhere else.
+All this file does is turn a hook payload into a call to ``violations()``.
 """
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
-import re
 import sys
 from pathlib import Path
+from types import ModuleType
 
 try:
     data = json.load(sys.stdin)
@@ -26,21 +25,19 @@ except ValueError as exc:
     # means the hook is not enforcing, so say so rather than exiting silently.
     # Claude Code shows the first stderr line for a non-blocking error.
     print(
-        f"invariant-guard: unreadable hook payload, not enforcing ({exc})",
-        file=sys.stderr,
+        f"invariant-guard: unreadable payload, not enforcing ({exc})", file=sys.stderr
     )
     sys.exit(1)
 
 tool_input = data.get("tool_input") or {}
-
 raw_path = tool_input.get("file_path") or ""
 if not raw_path:
     sys.exit(0)
 
 root = Path(os.environ.get("CLAUDE_PROJECT_DIR") or data.get("cwd") or ".").resolve()
 # A relative file_path is relative to the project, not to wherever this hook
-# happens to be running; resolving it against cwd would place it outside root
-# and skip enforcement entirely.
+# happens to be running; resolving against cwd would place it outside root and
+# skip enforcement entirely.
 candidate = Path(raw_path)
 if not candidate.is_absolute():
     candidate = root / candidate
@@ -55,121 +52,33 @@ if not text.strip():
     sys.exit(0)
 
 
-def blank(match: re.Match[str]) -> str:
-    """Replace a span with just its newlines, so `^` anchors keep their lines."""
-    return "\n" * match.group(0).count("\n")
+def load_invariants(project_root: Path) -> ModuleType | None:
+    """Import tests/invariants.py by path.
+
+    By path rather than by name because a hook runs as a bare script with no
+    package context, and because the project root is only known at runtime.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "_invariants", project_root / "tests" / "invariants.py"
+    )
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
-# One alternation, longest opener first, rather than a triple-quote pass
-# followed by a single-quote pass. Every branch is unambiguous -- `[^\\]` and
-# `\\.` cannot both match the same character -- which keeps this linear. The
-# earlier two-pass form used `(?:\\.|(?!\1).)*?`, whose branches BOTH match a
-# backslash: on an unterminated quote followed by backslash-heavy text (a regex
-# literal, say) that backtracks exponentially. Measured on the old pattern, an
-# unterminated ''' plus 8 lines of `re.compile(r"\d+\w*\s")` took 6.5s, and 12
-# lines never finished -- a PreToolUse hook that hangs wedges the whole edit.
-#
-# Text may be an Edit fragment rather than a parseable module, so this stays
-# regex-based rather than tokenize/ast: an unbalanced fragment is the common
-# case, and it is exactly what a real parser rejects.
-STRING = re.compile(
-    r'"""(?:[^\\]|\\.)*?"""'
-    r"|'''(?:[^\\]|\\.)*?'''"
-    r'|"(?:[^"\\\n]|\\.)*"'
-    r"|'(?:[^'\\\n]|\\.)*'",
-    re.DOTALL,
-)
-COMMENT = re.compile(r"#[^\n]*")
+try:
+    invariants = load_invariants(root)
+except (OSError, SyntaxError) as exc:
+    print(f"invariant-guard: cannot load rules, not enforcing ({exc})", file=sys.stderr)
+    sys.exit(1)
 
-# `scan_comments` selects the corpus: the suppression rule needs comments kept,
-# since finding a suppression directive in one is its whole job; every other
-# rule needs them gone so prose describing a rule does not trip it.
-#
-# Note this comment cannot spell that directive literally -- the rule below
-# would match it, and ruff would read it as a real directive. The module
-# docstring can, because string literals are masked.
-RULES = [
-    (
-        lambda p: (
-            p.endswith(".py")
-            and not p.startswith("tests/")
-            and p != "rag_pipeline/ingest.py"
-        ),
-        re.compile(r"(?<![\w.])Chroma\s*\("),
-        False,
-        "Constructing Chroma(...) inline. A collection's identity is (persist dir, "
-        "collection name, embedding function), so indexing and querying must go "
-        "through open_store() in rag_pipeline/ingest.py.",
-    ),
-    (
-        # tests/ is NOT exempt here, unlike Chroma above. test_ingest.py opens a
-        # collection directly on purpose, but a test that builds a real embedding
-        # model would download ~90MB and put the suite back on the network.
-        lambda p: p.endswith(".py") and p != "rag_pipeline/ingest.py",
-        re.compile(r"(?<![\w.])HuggingFaceEmbeddings\s*\("),
-        False,
-        "Constructing HuggingFaceEmbeddings(...) inline. Route through "
-        "build_embeddings() in rag_pipeline/ingest.py -- vectors from different "
-        "models are incomparable, and in tests this breaks the offline guarantee "
-        "(inject DeterministicFakeEmbedding instead).",
-    ),
-    (
-        lambda p: p == "rag_pipeline/cli.py",
-        re.compile(
-            # `from rag_pipeline.ingest import ...` / `from .pipeline import ...`
-            r"^(?:from\s+(?:rag_pipeline\.|\.)(?:ingest|pipeline)\b"
-            # `from rag_pipeline import ingest, pipeline` / `from . import ingest`
-            r"|from\s+(?:rag_pipeline|\.)\s+import\s+[^\n]*\b(?:ingest|pipeline)\b"
-            # `import rag_pipeline.ingest`
-            r"|import\s+rag_pipeline\.(?:ingest|pipeline)\b)",
-            re.MULTILINE,
-        ),
-        False,
-        "Top-level import of ingest/pipeline in cli.py. These pull in "
-        "sentence-transformers/torch (~4.3s vs ~0.08s for `rag --help`). Keep the "
-        "import inside the command function.",
-    ),
-    (
-        lambda p: p.endswith(".py"),
-        re.compile(r"#\s*(?:noqa|ty:\s*ignore)"),
-        True,
-        "Adding a lint/type suppression. CLAUDE.md: fix the finding instead.",
-    ),
-    (
-        lambda p: p == "rag_pipeline/ingest.py",
-        re.compile(r"\brmtree\b"),
-        False,
-        "rmtree in ingest.py. ingest() is a scoped collection rebuild and must never "
-        "wipe the persist directory -- it may hold unrelated data.",
-    ),
-    (
-        lambda p: p == "rag_pipeline/pipeline.py",
-        re.compile(r"\b(?:temperature|top_p)\s*="),
-        False,
-        "Setting temperature/top_p. build_chat_model() deliberately sets neither -- "
-        "some models (Opus 4.8) reject sampling params outright.",
-    ),
-]
+if invariants is None:
+    print("invariant-guard: cannot load rules, not enforcing", file=sys.stderr)
+    sys.exit(1)
 
-# Select rules before masking: for a write to anything but a .py file no rule
-# can fire, and masking a large payload to reach that conclusion is pure waste.
-applicable = [
-    (pattern, scan_comments, msg)
-    for applies, pattern, scan_comments, msg in RULES
-    if applies(rel)
-]
-if not applicable:
-    sys.exit(0)
-
-with_comments = STRING.sub(blank, text)
-code_only = COMMENT.sub(blank, with_comments)
-
-hits = [
-    msg
-    for pattern, scan_comments, msg in applicable
-    if pattern.search(with_comments if scan_comments else code_only)
-]
-
+hits = invariants.violations(rel, text)
 if hits:
     print(f"Blocked edit to {rel} - CLAUDE.md invariant violation:", file=sys.stderr)
     for msg in hits:

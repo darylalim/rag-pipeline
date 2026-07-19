@@ -8,6 +8,8 @@ which is what the ingest/pipeline tests exercise.
 
 from __future__ import annotations
 
+import socket
+
 import pytest
 from langchain_core.embeddings import DeterministicFakeEmbedding
 
@@ -66,3 +68,39 @@ def _reset_chroma_client_cache():
     reset_store_cache()
     yield
     reset_store_cache()
+
+
+@pytest.fixture(autouse=True)
+def _offline_only(monkeypatch):
+    """Fail any test that opens a network socket.
+
+    The offline guarantee rests on tests injecting fakes for the embedding model
+    and the LLM. That is a convention, and a test that simply forgets to pass
+    ``embeddings=`` falls back to the real sentence-transformers path — either
+    downloading a model, or (worse, because it still passes) loading a warm
+    cache and running for minutes in CI. Blocking the socket catches every
+    spelling of that mistake, including ones no grep would find, because the
+    failure is defined by behavior rather than by the name of a class.
+
+    Deliberately NOT paired with HF_HUB_OFFLINE=1: that makes huggingface_hub
+    skip its revision check, so a cached model loads with no socket at all and
+    this fixture goes blind. The two are antagonistic, not complementary —
+    blocking the socket is strictly stronger alone. The delenv defends that
+    precondition against an ambient export.
+
+    Caveat: a warm-cache load is caught only because huggingface_hub currently
+    revision-checks over the network. If that gains a local TTL, coverage
+    quietly narrows to cold-cache runs.
+    """
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+    monkeypatch.delenv("TRANSFORMERS_OFFLINE", raising=False)
+
+    def blocked(*args, **kwargs):
+        raise RuntimeError(
+            "test opened a network socket -- the suite must run offline; "
+            "inject fake embeddings/LLM instead of the real model"
+        )
+
+    # Both are load-bearing: httpcore reaches the network via create_connection.
+    monkeypatch.setattr(socket, "socket", blocked)
+    monkeypatch.setattr(socket, "create_connection", blocked)

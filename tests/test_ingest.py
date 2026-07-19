@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
@@ -84,3 +86,37 @@ def test_ingest_is_idempotent(settings, fake_embeddings):
         persist_directory=str(settings.persist_dir),
     )
     assert len(store.get()["ids"]) == n2
+
+
+def test_every_source_is_a_relative_posix_path_that_resolves_under_data_dir(tmp_path):
+    """`source` is what citations key off and what both frontends print, so its
+    shape is a contract, not an implementation detail.
+
+    An absolute path would leak the indexing machine's layout into answers; a
+    Windows-style path would not round-trip back to the file. Stated as a
+    property over *every* returned document — rather than a list of expected
+    filenames — so a loader added later for a new suffix has to satisfy it too.
+    """
+    root = tmp_path / "data"
+    files = {
+        "top.md": "Top-level document.",
+        "deep/mid.txt": "One directory down.",
+        "deep/nested/dir/leaf.md": "Three directories down.",
+    }
+    for name, content in files.items():
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+
+    docs = ingest_mod.load_documents(root)
+
+    assert len(docs) == len(files), "expected one document per readable file"
+    for doc in docs:
+        source = doc.metadata["source"]
+        assert not Path(source).is_absolute(), f"{source!r} must be data_dir-relative"
+        assert "\\" not in source, f"{source!r} must use POSIX separators"
+        assert (root / source).is_file(), f"{source!r} must resolve back to its file"
+
+    # The subdirectory has to survive into `source`: two files named the same in
+    # different directories must stay distinguishable in a citation.
+    assert {d.metadata["source"] for d in docs} == set(files)

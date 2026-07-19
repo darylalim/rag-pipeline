@@ -9,7 +9,7 @@ index lives, which models to use, and how documents are chunked.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -83,3 +83,11 @@ class Settings:
             chunk_overlap=_env_int("CHUNK_OVERLAP", cls.chunk_overlap),
             retrieval_k=_env_int("RETRIEVAL_K", cls.retrieval_k),
         )
+
+
+# Every field's environment variable, derived rather than restated. Tests clear
+# these before asserting on defaults, and a hand-kept list would drift silently:
+# this module calls load_dotenv() at import time, so a name missing from that
+# list is answered by the developer's own .env and its default stops being
+# tested. Deriving costs one line and makes the drift inexpressible.
+ENV_VARS = tuple(field.name.upper() for field in fields(Settings))

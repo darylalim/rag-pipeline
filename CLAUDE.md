@@ -9,7 +9,7 @@ uv sync                              # install deps (creates .venv)
 uv run rag ingest                    # rebuild the Chroma index from data/
 uv run rag query "your question"     # ask from the terminal
 uv run streamlit run app.py          # chat UI over the same pipeline
-uv run pytest                        # full suite (~7s wall: ~4s torch import, ~2.5s tests; offline)
+uv run pytest                        # full suite (~6s wall: ~4s torch import, ~1.5s tests; offline)
 uv run pytest tests/test_config.py::test_defaults   # single test
 uv run pytest -k idempotent -v                      # by keyword
 uv run ruff check --fix . && uv run ruff format .   # lint, then format (order matters)
@@ -66,22 +66,23 @@ Both frontends — `rag_pipeline/cli.py` and `app.py` — construct it the same 
 which is what keeps them agreeing on index location, models, and chunking.
 
 All tunables live here — never inline a literal at a call site. Adding one is a
-**four-file change**:
+**three-file change**:
 
 1. the field plus its `_env_*` line in `config.py`,
 2. a commented default in `.env.example`,
-3. a row in the README config table,
-4. the variable name in the `delenv` tuple in
-   `tests/test_config.py::test_from_env_uses_defaults_when_unset`.
+3. a row in the README config table.
 
-Leaving any of the latter three stale is a bug. The fourth is the one that hides:
-because `config.py` loads `.env` at import time (see Gotchas), a variable missing
-from that tuple is resolved from *the developer's own environment* rather than
-its default, so the test keeps passing while silently no longer covering that
-default. Nothing else in the repo catches this — `ruff`, `ty`, and the full
-suite are all green with a stale `.env.example`, README, or tuple.
+Leaving either of the latter two stale is a bug, and nothing else in the repo
+catches it — `ruff`, `ty` and the full suite are all green against a stale
+README. `test_every_setting_is_documented` is what catches it; the
+`settings-triad` hook reports the same thing sooner.
 
-The `settings-triad` Stop hook (see below) enforces all four sites.
+There is no fourth site. `config.ENV_VARS` derives every variable name from the
+dataclass fields, and `tests/test_config.py` clears *that* rather than a
+hand-kept list. This matters because `config.py` loads `.env` at import time
+(see Gotchas): a name missing from a hand-kept list would be answered by the
+developer's own `.env`, so its default would silently stop being tested. Derived,
+that drift is not merely detected — it is inexpressible.
 
 ### Why the store factories live in `ingest.py`
 
@@ -128,53 +129,60 @@ model — that import is the ~4s in `uv run pytest`.) Any new code path touching
 embedding model or the LLM should thread these through rather than constructing
 them unconditionally.
 
+Injection is a convention, so `conftest.py` backs it with an autouse fixture that
+blocks `socket.socket`/`create_connection`. A test that simply forgets
+`embeddings=` names no banned symbol and no grep would find it — but it opens a
+socket, and that fails. Do not pair it with `HF_HUB_OFFLINE=1`: that makes
+`huggingface_hub` skip its revision check, so a cached model loads with no socket
+at all and the fixture goes blind. The two are antagonistic, not complementary.
+
 ## Gotchas
 
 - `config.py` calls `load_dotenv(override=False)` at **import time**. A real
   environment variable wins over `.env`, but a developer's local `.env` will leak
   into test runs — config tests must `monkeypatch.setenv`/`delenv` explicitly.
-  This is why the `delenv` tuple is the fourth site of the four-file Settings
-  change above: a variable omitted from it is quietly sourced from the
-  developer's environment, and its default stops being tested.
+  This is why `test_config.py` clears `config.ENV_VARS` rather than a
+  hand-written list — see the Settings rule above.
 - `cli.py` imports `ingest`/`pipeline` lazily inside the command functions. This
   is load-bearing: importing them pulls in sentence-transformers/torch, measured
   at ~4.3s versus ~0.08s for `rag --help` today. Keep those imports local.
 
-## Enforcement hooks
+## Enforcing the invariants
 
-Two hooks in `.claude/` mechanize the invariants above, so they fail loudly
-rather than rotting. Both are committed, so they apply to everyone.
+The mechanically checkable rules above live in `tests/invariants.py` as data,
+and `tests/test_invariants.py` enforces them across every tracked `.py` file.
+**That test is the enforcement** — it runs in CI, for every contributor and
+every PR from a fork, whoever wrote the code and whatever editor they used.
 
-| Hook | Event | Enforces |
-| ---- | ----- | -------- |
-| `.claude/hooks/invariant-guard.py` | `PreToolUse` on `Edit`\|`Write` | no inline `Chroma(`/`HuggingFaceEmbeddings(` outside the factories; no top-level `ingest`/`pipeline` import in `cli.py`; no `# noqa`/`# ty: ignore`; no `rmtree` in `ingest.py`; no `temperature=`/`top_p=` in `pipeline.py` |
-| `.claude/hooks/settings-triad.py` | `Stop` | all four sites of a Settings change are present |
+The two hooks in `.claude/` load the same module and answer the same questions
+at write time instead of at review time. They are a latency optimization, not a
+second source of truth: delete `.claude/` and nothing stops being enforced.
 
-Two design points worth preserving if you edit them:
+| Layer | Covers | When |
+| ----- | ------ | ---- |
+| `tests/test_invariants.py` | the whole tree, everyone | CI and `uv run pytest` |
+| `.claude/hooks/invariant-guard.py` (`PreToolUse` on `Edit`\|`Write`) | the text about to be written | during a Claude session |
+| `.claude/hooks/settings-triad.py` (`Stop`) | Settings documented at all three sites | end of a Claude turn |
 
-- `invariant-guard` inspects **only the text being written**, never the file on
-  disk, so it cannot fire on pre-existing code. It exempts `.claude/` — its own
-  error messages quote the banned patterns, so without that guard it would make
-  itself uneditable. `tests/` and `ingest.py` are exempt from the factory rule
-  (`test_ingest.py` opens a `Chroma` collection directly on purpose).
-- `settings-triad` runs on `Stop`, not `PostToolUse`. When `config.py` is
-  written the other three sites legitimately do not have their entry yet, so a
-  per-edit check would fire on every *correct* change. It honors
-  `stop_hook_active` so it nudges once rather than looping.
-- `settings-triad` only runs when the working tree has touched one of the four
-  sites, so a turn about something else is never blocked by drift it did not
-  cause. Within that scope it validates *all* settings, not just the changed
-  one. The tradeoff: drift that is already committed goes unreported until
-  someone next touches one of the four files. If git cannot answer, the check
-  runs unconditionally — the failure direction is "enforce anyway".
+Adding a rule means adding a `Rule` to `RULES` plus a case in each direction in
+`test_invariants.py`. Two properties are load-bearing and easy to break:
 
-Both hooks exit 1, not 2, on an unparseable payload: a shape change in a future
-Claude Code release must not wedge every turn, but it must not disable
-enforcement silently either, so they print one line saying they are not
-enforcing. Treat that line as a bug report about the hook.
+- Rules match a **masked** copy of the text: string literals are blanked for
+  every rule, comments too for all but the suppression rule. Without that, a
+  comment describing a rule is blocked by the rule it describes.
+- The masking alternation must stay **linear**. An earlier form let two branches
+  both match a backslash, and an unterminated quote — the normal case in an Edit
+  fragment — took 6.5s at 8 lines and never finished at 12. A hook that hangs
+  wedges the edit.
 
-These scripts are linted by CI like any other file — `ruff check .` does not
-exclude dot-directories, so a `# noqa`-free, formatted hook is not optional.
+Not every invariant belongs there. The exception union, the empty-collection
+guard, and `source` metadata on loaders are enforced by ordinary tests in
+`test_pipeline.py` and `test_ingest.py`, which assert what the code *does*
+rather than how it is spelled — a better layer whenever it is available.
+
+Design rationale for the hooks themselves (Stop vs PostToolUse, exit 1 vs 2,
+the working-tree gate) lives in each hook's module docstring. Both are linted by
+CI like any other file: `ruff check .` does not exclude dot-directories.
 
 ## Conventions
 

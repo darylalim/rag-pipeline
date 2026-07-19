@@ -1,55 +1,71 @@
 #!/usr/bin/env python3
-"""Stop hook: enforce the four-file Settings rule from CLAUDE.md.
+"""Stop hook: check that a new Settings field is documented before the turn ends.
 
-Runs at the end of a turn rather than on each edit: when ``config.py`` is
-written, the other files legitimately do not have their entry yet, so a
-PostToolUse check would fire on every correct change. Stop is the first moment
-"the change is finished" is true.
+Thin by design, like its sibling. The rule lives in ``tests/invariants.py`` and
+is enforced for everyone by ``tests/test_invariants.py``; this hook only makes
+the feedback arrive while config.py is still on screen instead of at the next
+pytest run.
 
-The fourth site is the subtle one. ``config.py`` calls ``load_dotenv()`` at
-import time, so a variable missing from the delenv tuple in
-``test_from_env_uses_defaults_when_unset`` is resolved from the developer's
-own environment instead of its default — the test keeps passing while quietly
-no longer testing that default.
+Stop rather than PostToolUse: when config.py is written, `.env.example` and the
+README legitimately do not have their entry yet, so a per-edit check would fire
+on every *correct* change. Stop is the first moment "the change is finished" is
+true.
 
 Scope: problems are reported only when the working tree has touched one of the
-four sites. Validation itself is cheap enough to run unconditionally and covers
-all declared settings rather than just the changed one — it catches drift the
-turn did not cause — but gating the *report* on the tree means a turn about
-something else is never blocked by pre-existing drift. The
-tradeoff is that drift already committed goes unreported until someone next
-touches one of the four files. If git cannot answer (no repo, not installed)
-the check runs unconditionally, so the failure direction is "enforce anyway".
+sites. Validation is cheap enough to run unconditionally, but gating the report
+means a turn about something else is never blocked by drift it did not cause.
+The tradeoff is that already-committed drift goes unreported until someone next
+touches one of those files -- the CI test is what catches that case. If git
+cannot answer, the report is not suppressed: the failure direction is "enforce".
 """
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
-import re
 import subprocess
 import sys
 from pathlib import Path
+from types import ModuleType
 
-# Relative to the project root; the four sites a Settings change must update.
-SITES = (
-    "rag_pipeline/config.py",
-    ".env.example",
-    "README.md",
-    "tests/test_config.py",
-)
+try:
+    data = json.load(sys.stdin)
+except ValueError as exc:
+    # Exit 1, not 2: unparseable input must not wedge the turn, but it means the
+    # hook is not enforcing, so report rather than exit silently.
+    print(f"settings-triad: unreadable payload, not enforcing ({exc})", file=sys.stderr)
+    sys.exit(1)
+
+if data.get("stop_hook_active"):
+    sys.exit(0)  # already nudged once; let the turn end
+
+root = Path(os.environ.get("CLAUDE_PROJECT_DIR") or data.get("cwd") or ".")
 
 
-def sites_touched(project: Path) -> bool | None:
-    """Has the working tree modified any of the four sites?
+def load_invariants(project_root: Path) -> ModuleType | None:
+    """Import tests/invariants.py by path (no package context in a hook)."""
+    spec = importlib.util.spec_from_file_location(
+        "_invariants", project_root / "tests" / "invariants.py"
+    )
+    if spec is None or spec.loader is None:
+        return None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
-    None when git cannot answer, which callers treat as "check anyway" rather
-    than as "nothing changed" — an unavailable git must not silently disable
-    enforcement.
+
+def sites_touched(project: Path, sites: tuple[str, ...]) -> bool | None:
+    """Has the working tree modified config.py or any documentation site?
+
+    None when git cannot answer, which the caller treats as "report anyway"
+    rather than "nothing changed" -- an unavailable git must not silently
+    disable enforcement.
     """
+    paths = ["rag_pipeline/config.py", *sites]
     try:
         result = subprocess.run(
-            ["git", "-C", str(project), "status", "--porcelain", "--", *SITES],
+            ["git", "-C", str(project), "status", "--porcelain", "--", *paths],
             capture_output=True,
             text=True,
             timeout=5,
@@ -63,84 +79,24 @@ def sites_touched(project: Path) -> bool | None:
 
 
 try:
-    data = json.load(sys.stdin)
-except ValueError as exc:
-    # Exit 1, not 2: an unparseable payload must not wedge the turn, but it
-    # means the hook is not enforcing, so report rather than exit silently.
-    print(
-        f"settings-triad: unreadable hook payload, not enforcing ({exc})",
-        file=sys.stderr,
-    )
+    invariants = load_invariants(root)
+except (OSError, SyntaxError) as exc:
+    print(f"settings-triad: cannot load rules, not enforcing ({exc})", file=sys.stderr)
     sys.exit(1)
 
-if data.get("stop_hook_active"):
-    sys.exit(0)  # already nudged once; let the turn end
+if invariants is None:
+    print("settings-triad: cannot load rules, not enforcing", file=sys.stderr)
+    sys.exit(1)
 
-root = Path(os.environ.get("CLAUDE_PROJECT_DIR") or data.get("cwd") or ".")
-config = root / "rag_pipeline" / "config.py"
-env_example = root / ".env.example"
-readme = root / "README.md"
-test_config = root / "tests" / "test_config.py"
-
-if not config.is_file():
-    sys.exit(0)
-
-# `_env_\w+` (not an explicit path|int|str list) so a future `_env_bool` helper
-# is covered the day it is added rather than silently escaping the check.
-declared = re.findall(r'_env_\w+\(\s*"([A-Z0-9_]+)"', config.read_text())
-if not declared:
-    sys.exit(0)
-
-env_text = env_example.read_text() if env_example.is_file() else ""
-readme_text = readme.read_text() if readme.is_file() else ""
-test_text = test_config.read_text() if test_config.is_file() else ""
-
-# Anchor on the delenv call rather than the test's name, so renaming the test
-# does not silently disable the check. Empty means the loop is gone or was
-# restructured -- reported once below rather than once per variable.
-delenv_tuple = "".join(
-    re.findall(
-        r"for\s+\w+\s+in\s+\((.*?)\):\s*\n\s*monkeypatch\.delenv",
-        test_text,
-        re.DOTALL,
-    )
-)
-
-problems = []
-for name in dict.fromkeys(declared):
-    missing = []
-    # A commented default line, e.g. "# RETRIEVAL_K=4".
-    if not re.search(rf"^#\s*{name}=", env_text, re.MULTILINE):
-        missing.append(f".env.example (add a commented default: `# {name}=<default>`)")
-    # A row in the README config table, e.g. "| `RETRIEVAL_K` | `4` | ... |".
-    if not re.search(rf"^\|\s*`{name}`\s*\|", readme_text, re.MULTILINE):
-        missing.append(f"README.md config table (add a row for `{name}`)")
-    # The delenv tuple in tests/test_config.py. Without it, config.py's
-    # import-time load_dotenv() lets the developer's own .env supply the value
-    # and the defaults test silently stops covering this variable.
-    if delenv_tuple and f'"{name}"' not in delenv_tuple:
-        missing.append(
-            "tests/test_config.py (add it to the delenv tuple in "
-            "test_from_env_uses_defaults_when_unset)"
-        )
-    if missing:
-        problems.append(f"  {name}: missing from " + "; ".join(missing))
-
-if not delenv_tuple and test_text:
-    problems.append(
-        "  tests/test_config.py: could not find the `for var in (...)` / "
-        "monkeypatch.delenv loop, so the defaults test could not be checked. "
-        "Restore it or update this hook."
-    )
+problems = invariants.settings_problems(root)
 
 # The git call is the expensive part of this hook (~11.6ms, versus ~0.07ms to
-# read and scan all four files), so consult it only once there is something to
+# read and scan the files), so consult it only once there is something to
 # report. On a consistent tree -- the steady state -- git is never forked.
-if problems and sites_touched(root) is not False:
+if problems and sites_touched(root, invariants.SETTINGS_SITES) is not False:
     print(
-        "Settings sites incomplete (CLAUDE.md: adding a Settings field is a "
-        "four-file change - config.py + .env.example + README config table + "
-        "the delenv tuple in tests/test_config.py).\n" + "\n".join(problems),
+        "Settings sites incomplete (CLAUDE.md: adding a Settings field means "
+        "config.py + .env.example + the README config table).\n" + "\n".join(problems),
         file=sys.stderr,
     )
     sys.exit(2)

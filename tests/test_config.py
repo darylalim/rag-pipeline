@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from rag_pipeline.config import Settings
+from rag_pipeline.config import ENV_VARS, Settings
 
 
 def test_defaults():
@@ -34,17 +34,10 @@ def test_from_env_overrides(monkeypatch, tmp_path):
 
 
 def test_from_env_uses_defaults_when_unset(monkeypatch):
-    for var in (
-        "CHAT_MODEL",
-        "RETRIEVAL_K",
-        "CHUNK_SIZE",
-        "CHUNK_OVERLAP",
-        "COLLECTION_NAME",
-        "DATA_DIR",
-        "PERSIST_DIR",
-        "EMBEDDING_MODEL",
-        "MAX_TOKENS",
-    ):
+    # ENV_VARS, not a hand-kept list: config.py loads .env at import time, so a
+    # name missing here would be answered by the developer's own .env and this
+    # test would keep passing while no longer covering that default.
+    for var in ENV_VARS:
         monkeypatch.delenv(var, raising=False)
 
     s = Settings.from_env()
