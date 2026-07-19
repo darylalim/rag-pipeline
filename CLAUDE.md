@@ -66,9 +66,22 @@ Both frontends — `rag_pipeline/cli.py` and `app.py` — construct it the same 
 which is what keeps them agreeing on index location, models, and chunking.
 
 All tunables live here — never inline a literal at a call site. Adding one is a
-**three-file change**: the field plus its `_env_*` line in `config.py`, a
-commented default in `.env.example`, and a row in the README config table.
-Leaving either of the latter two stale is a bug.
+**four-file change**:
+
+1. the field plus its `_env_*` line in `config.py`,
+2. a commented default in `.env.example`,
+3. a row in the README config table,
+4. the variable name in the `delenv` tuple in
+   `tests/test_config.py::test_from_env_uses_defaults_when_unset`.
+
+Leaving any of the latter three stale is a bug. The fourth is the one that hides:
+because `config.py` loads `.env` at import time (see Gotchas), a variable missing
+from that tuple is resolved from *the developer's own environment* rather than
+its default, so the test keeps passing while silently no longer covering that
+default. Nothing else in the repo catches this — `ruff`, `ty`, and the full
+suite are all green with a stale `.env.example`, README, or tuple.
+
+The `settings-triad` Stop hook (see below) enforces all four sites.
 
 ### Why the store factories live in `ingest.py`
 
@@ -120,9 +133,37 @@ them unconditionally.
 - `config.py` calls `load_dotenv(override=False)` at **import time**. A real
   environment variable wins over `.env`, but a developer's local `.env` will leak
   into test runs — config tests must `monkeypatch.setenv`/`delenv` explicitly.
+  This is why the `delenv` tuple is the fourth site of the four-file Settings
+  change above: a variable omitted from it is quietly sourced from the
+  developer's environment, and its default stops being tested.
 - `cli.py` imports `ingest`/`pipeline` lazily inside the command functions. This
   is load-bearing: importing them pulls in sentence-transformers/torch, measured
   at ~4.3s versus ~0.08s for `rag --help` today. Keep those imports local.
+
+## Enforcement hooks
+
+Two hooks in `.claude/` mechanize the invariants above, so they fail loudly
+rather than rotting. Both are committed, so they apply to everyone.
+
+| Hook | Event | Enforces |
+| ---- | ----- | -------- |
+| `.claude/hooks/invariant-guard.py` | `PreToolUse` on `Edit`\|`Write` | no inline `Chroma(`/`HuggingFaceEmbeddings(` outside the factories; no top-level `ingest`/`pipeline` import in `cli.py`; no `# noqa`/`# ty: ignore`; no `rmtree` in `ingest.py`; no `temperature=`/`top_p=` in `pipeline.py` |
+| `.claude/hooks/settings-triad.py` | `Stop` | all four sites of a Settings change are present |
+
+Two design points worth preserving if you edit them:
+
+- `invariant-guard` inspects **only the text being written**, never the file on
+  disk, so it cannot fire on pre-existing code. It exempts `.claude/` — its own
+  error messages quote the banned patterns, so without that guard it would make
+  itself uneditable. `tests/` and `ingest.py` are exempt from the factory rule
+  (`test_ingest.py` opens a `Chroma` collection directly on purpose).
+- `settings-triad` runs on `Stop`, not `PostToolUse`. When `config.py` is
+  written the other three sites legitimately do not have their entry yet, so a
+  per-edit check would fire on every *correct* change. It honors
+  `stop_hook_active` so it nudges once rather than looping.
+
+These scripts are linted by CI like any other file — `ruff check .` does not
+exclude dot-directories, so a `# noqa`-free, formatted hook is not optional.
 
 ## Conventions
 
