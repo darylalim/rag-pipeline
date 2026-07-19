@@ -5,9 +5,9 @@ name: CI
 # before review.
 #
 # `pull_request` is still required, not decorative: a PR from a fork produces no
-# push event in this repo, so without it none of the required status checks would
-# ever report and the PR could never merge. The `if:` on each job below is what
-# stops a same-repo PR running everything twice.
+# push event in this repo, so without it a fork's changes would arrive for review
+# with no CI signal at all. The `if:` on each job below is what stops a same-repo
+# PR running everything twice.
 on:
   push:
   pull_request:
@@ -23,27 +23,31 @@ concurrency:
   group: ci-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
-# The rendered `name:` of each job below is its status check name, and the
-# "main: require CI" ruleset requires these three by exact string:
+# The rendered `name:` of each job below is what appears as a status check:
 #
 #     ruff + ty · pytest (py3.11) · pytest (py3.13)
 #
-# Renaming a job (or changing the matrix values) without updating the ruleset
-# silently stops the gate matching — it still reads as configured while
-# enforcing nothing. Update both together:
+# Nothing requires them at present — `main` carries no ruleset and takes direct
+# pushes, so CI reports on a commit rather than gating it. Confirm with:
 #     gh api repos/darylalim/rag-pipeline/rulesets
+#
+# If a gate is added back it matches these by exact string, so renaming a job or
+# changing a matrix value has to happen in the same change as the rule. A rule
+# matching no check still reads as configured while enforcing nothing, which is
+# the failure worth remembering: a protection that appears active and is not.
 #
 # Both jobs carry the same `if:`. A same-repo PR branch already got a full run
 # from its own push event on the identical SHA, so the pull_request run skips
-# instead of repeating it; GitHub reports a skipped required check as passing,
-# so the ruleset is still satisfied. A fork PR has no push event here, so the
-# condition is true and the checks run for real. Comparing `full_name` never
-# reaches a shell -- it is an expression, not interpolation into `run:`.
+# instead of repeating it — and a skipped check reports as passing, so this
+# stays compatible with a required-checks gate if one returns. A fork PR has no
+# push event here, so the condition is true and the checks run for real.
+# Comparing `full_name` never reaches a shell -- it is an expression, not
+# interpolation into `run:`.
 jobs:
   # Lint and type checks are interpreter-independent, so they run once on a
   # single version rather than across the test matrix.
   lint:
-    name: ruff + ty  # ← required status check
+    name: ruff + ty  # ← status check name
     if: >-
       github.event_name == 'push'
       || github.event.pull_request.head.repo.full_name != github.repository
@@ -84,7 +88,7 @@ jobs:
         run: uv run ty check
 
   test:
-    name: pytest (py${{ matrix.python-version }})  # ← required status check
+    name: pytest (py${{ matrix.python-version }})  # ← status check name
     if: >-
       github.event_name == 'push'
       || github.event.pull_request.head.repo.full_name != github.repository
