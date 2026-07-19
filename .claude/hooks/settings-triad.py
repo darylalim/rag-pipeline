@@ -11,6 +11,14 @@ import time, so a variable missing from the delenv tuple in
 ``test_from_env_uses_defaults_when_unset`` is resolved from the developer's
 own environment instead of its default — the test keeps passing while quietly
 no longer testing that default.
+
+Scope: the check runs only when the working tree has touched one of the four
+sites. It validates all declared settings rather than just the changed one —
+cheap, and it catches drift the turn did not cause — but gating on the tree
+means a turn about something else is never blocked by pre-existing drift. The
+tradeoff is that drift already committed goes unreported until someone next
+touches one of the four files. If git cannot answer (no repo, not installed)
+the check runs unconditionally, so the failure direction is "enforce anyway".
 """
 
 from __future__ import annotations
@@ -18,8 +26,40 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
+
+# Relative to the project root; the four sites a Settings change must update.
+SITES = (
+    "rag_pipeline/config.py",
+    ".env.example",
+    "README.md",
+    "tests/test_config.py",
+)
+
+
+def sites_touched(project: Path) -> bool | None:
+    """Has the working tree modified any of the four sites?
+
+    None when git cannot answer, which callers treat as "check anyway" rather
+    than as "nothing changed" — an unavailable git must not silently disable
+    enforcement.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(project), "status", "--porcelain", "--", *SITES],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    return bool(result.stdout.strip())
+
 
 try:
     data = json.load(sys.stdin)
@@ -42,6 +82,11 @@ readme = root / "README.md"
 test_config = root / "tests" / "test_config.py"
 
 if not config.is_file():
+    sys.exit(0)
+
+# Nothing related changed this turn: do not block work on an unrelated topic,
+# and skip four file reads on every Stop event.
+if sites_touched(root) is False:
     sys.exit(0)
 
 # `_env_\w+` (not an explicit path|int|str list) so a future `_env_bool` helper
