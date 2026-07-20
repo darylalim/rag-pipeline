@@ -1,33 +1,35 @@
 # rag-pipeline
 
 A small, readable **Retrieval-Augmented Generation** pipeline built with
-[LangChain](https://docs.langchain.com). Documents are embedded **locally** with
-a `sentence-transformers` model (no embedding API key needed) and answers are
-generated with **Claude**. It ships with a reusable core library, a CLI, and a
-Streamlit chat app — all sharing the same code.
+[LangChain](https://docs.langchain.com). Documents are embedded with **Voyage
+AI** and answers are generated with **Claude**. It ships with a reusable core
+library, a CLI, and a Streamlit chat app — all sharing the same code.
 
 ```
 Ingest (once):   data/ ──load──▶ split ──embed──▶ store (Chroma, on disk)
 Query (per Q):   question ──embed──▶ search ──▶ [top-k chunks + question] ──▶ Claude ──▶ grounded answer + sources
 ```
 
-The only network call at query time is generation; embedding and retrieval run
-entirely on your machine.
+At query time the vector search runs locally against the on-disk index; the two
+network calls are embedding the question (Voyage AI) and generation (Claude).
 
 ## Prerequisites
 
 - [uv](https://docs.astral.sh/uv/) and Python 3.11+
-- An **Anthropic API key** — needed only for the query/generation step. Ingest
-  runs fully locally.
+- An **Anthropic API key** (generation) and a **Voyage AI API key** (embedding).
+  Both ingest and query embed text, so both steps need the Voyage key.
 
 ## Setup
 
 ```bash
 uv sync                      # create the venv and install dependencies
-cp .env.example .env         # then add your ANTHROPIC_API_KEY
+cp .env.example .env         # then add your ANTHROPIC_API_KEY and VOYAGE_API_KEY
 ```
 
-The first ingest downloads the embedding model (`all-MiniLM-L6-v2`, ~90 MB) once.
+Embedding calls the Voyage AI API — there is no local embedding model. The
+`voyageai` SDK does fetch a small tokenizer from the Hugging Face Hub on first
+use (for client-side token counting), cached under `~/.cache/huggingface`; the
+*"unauthenticated requests to the HF Hub"* notice it prints is harmless.
 
 ## Usage
 
@@ -38,7 +40,7 @@ uv run rag ingest
 ```
 
 Loads every `.md`/`.txt`/`.pdf` in `data/`, splits them into overlapping chunks,
-embeds them locally, and persists a Chroma index to `chroma_db/`. Re-run this
+embeds them with Voyage AI, and persists a Chroma index to `chroma_db/`. Re-run this
 whenever the documents change — it clears this collection's existing vectors and
 re-adds fresh chunks, so no duplicates, and nothing else in `chroma_db/` is
 touched.
@@ -95,15 +97,16 @@ is not a boundary this is trying to hold.
 
 ## Configuration
 
-Everything is set in `.env` (see `.env.example`). Only `ANTHROPIC_API_KEY` is
-required; the rest have sensible defaults:
+Everything is set in `.env` (see `.env.example`). `ANTHROPIC_API_KEY` and
+`VOYAGE_API_KEY` are required; the rest have sensible defaults:
 
 | Variable          | Default                                    | Purpose                                  |
 | ----------------- | ------------------------------------------ | ---------------------------------------- |
-| `ANTHROPIC_API_KEY` | —                                        | Claude key (query step only)             |
+| `ANTHROPIC_API_KEY` | —                                        | Claude key (generation)                  |
+| `VOYAGE_API_KEY`  | —                                          | Voyage AI key (embedding; ingest + query) |
 | `CHAT_MODEL`      | `claude-haiku-4-5`                         | Generation model (e.g. `claude-opus-4-8` for higher-quality answers) |
 | `MAX_TOKENS`      | `1024`                                     | Maximum length of a generated answer     |
-| `EMBEDDING_MODEL` | `sentence-transformers/all-MiniLM-L6-v2`   | Local embedding model                    |
+| `EMBEDDING_MODEL` | `voyage-4-lite`                            | Voyage AI embedding model                |
 | `RETRIEVAL_K`     | `4`                                        | Chunks retrieved per question            |
 | `CHUNK_SIZE`      | `1000`                                     | Characters per chunk                     |
 | `CHUNK_OVERLAP`   | `200`                                      | Overlap between adjacent chunks          |
@@ -123,9 +126,9 @@ uv run pytest
 The suite runs fully offline — it injects a deterministic fake embedding model
 (no model download, no network) and a fake chat model in place of Claude, so no
 API key is needed. An autouse fixture blocks network sockets, so a test that
-forgets to inject a fake fails instead of quietly downloading a model. Most of
-its ~9s warm wall time is process startup and the transitive `torch` import; the
-tests themselves take ~3s. It covers configuration, the loader/splitter
+forgets to inject a fake fails instead of quietly calling the Voyage API. Most of
+its ~6s warm wall time is process startup and importing the chromadb/langchain
+stack; the tests themselves take ~3s. It covers configuration, the loader/splitter
 (including PDF extraction and the files it must skip), ingest idempotency, the
 source helpers, upload handling (that a saved file comes back out of the loader,
 that a name cannot escape `data_dir`, and that a same-named file is replaced
@@ -143,7 +146,7 @@ uv run pytest --cov=rag_pipeline --cov=app --cov-report=term-missing
 ```
 
 It currently reports 99%, and both uncovered lines are meant to be uncovered:
-`cli.py`'s `if __name__ == "__main__"` guard, and the `HuggingFaceEmbeddings(...)`
+`cli.py`'s `if __name__ == "__main__"` guard, and the `VoyageAIEmbeddings(...)`
 construction in `build_embeddings()` — the one line the offline suite exists to
 never execute.
 
@@ -171,8 +174,8 @@ declared in `tests/invariants.py`:
 | Rule                  | Forbids                                                        | Why |
 | --------------------- | -------------------------------------------------------------- | --- |
 | `chroma-factory`      | constructing `Chroma(...)` outside `ingest.py` — `tests/` exempt   | a collection's identity is (persist dir, name, embedding function); ingest and query must open it the same way |
-| `embeddings-factory`  | constructing `HuggingFaceEmbeddings(...)` outside `ingest.py`, `tests/` included | the same model must embed documents and questions; in tests, inject a fake instead |
-| `lazy-cli-imports`    | top-level `ingest`/`pipeline` imports in `cli.py`                | they pull in torch (~4.3s versus ~0.08s for `rag --help`) |
+| `embeddings-factory`  | constructing an embedding model (`VoyageAIEmbeddings(...)`) outside `ingest.py`, `tests/` included | the same model must embed documents and questions; in tests, inject a fake instead |
+| `lazy-cli-imports`    | top-level `ingest`/`pipeline` imports in `cli.py`                | they pull in the chromadb/langchain stack (~0.9s of imports versus ~0.02s without) |
 | `no-suppressions`     | lint/type suppression comments                                   | fix the finding instead |
 | `no-rmtree`           | `rmtree` in `ingest.py`                                          | ingest is a scoped collection rebuild; the persist dir may hold unrelated data |
 | `no-sampling-params`  | setting `temperature`/`top_p` in `pipeline.py`                   | grounding comes from retrieved context, and some models reject sampling params outright |
@@ -243,9 +246,9 @@ data/                 sample documents (swap in your own)
 
 ## How it works
 
-- **Local embeddings** (`langchain-huggingface`) keep ingest free and offline;
-  the *same* model must embed both documents and questions, so a single factory
-  (`build_embeddings`) is shared by ingest and query.
+- **Voyage AI embeddings** (`langchain-voyageai`) embed documents at ingest and
+  questions at query; the *same* model must embed both for their vectors to
+  compare, so a single factory (`build_embeddings`) is shared by ingest and query.
 - **Persistent Chroma** writes vectors to disk once at ingest, so querying just
   reloads the index instead of re-embedding.
 - **Claude generation** (`langchain-anthropic`) is prompted to answer only from

@@ -98,12 +98,15 @@ RULES = [
         # which names no banned symbol at all). This rule is authoring-time
         # feedback for the deliberate spelling.
         applies=lambda p: p.endswith(".py") and p != "rag_pipeline/ingest.py",
-        pattern=re.compile(r"(?<![\w.])HuggingFaceEmbeddings\s*\("),
+        pattern=re.compile(
+            r"(?<![\w.])(?:VoyageAIEmbeddings|HuggingFaceEmbeddings)\s*\("
+        ),
         scan_comments=False,
         message=(
-            "Constructing HuggingFaceEmbeddings(...) inline. Route through "
-            "build_embeddings() in rag_pipeline/ingest.py; in tests, inject "
-            "DeterministicFakeEmbedding instead."
+            "Constructing an embedding model (VoyageAIEmbeddings/"
+            "HuggingFaceEmbeddings) inline. Route through build_embeddings() in "
+            "rag_pipeline/ingest.py; in tests, inject DeterministicFakeEmbedding "
+            "instead."
         ),
     ),
     Rule(
@@ -120,9 +123,9 @@ RULES = [
         ),
         scan_comments=False,
         message=(
-            "Top-level import of ingest/pipeline in cli.py. These pull in "
-            "sentence-transformers/torch (~4.3s vs ~0.08s for `rag --help`). "
-            "Keep the import inside the command function."
+            "Top-level import of ingest/pipeline in cli.py. These pull in the "
+            "chromadb/langchain stack (~0.9s of imports vs ~0.02s to import cli "
+            "alone). Keep the import inside the command function."
         ),
     ),
     Rule(

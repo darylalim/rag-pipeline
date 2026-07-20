@@ -62,8 +62,9 @@ jobs:
           python-version: "3.13"
 
       # ruff is a standalone binary and needs none of the project's dependencies,
-      # so install just the dev group first — seconds, versus minutes for the ML
-      # stack. A ruff failure then costs nothing further.
+      # so install just the dev group first — seconds, versus longer for the full
+      # project (chromadb, langchain, streamlit). A ruff failure then costs
+      # nothing further.
       #
       # --locked installs from uv.lock *and* asserts the lock is up to date with
       # pyproject.toml. --frozen would skip that check, so a dependency added by
@@ -72,7 +73,7 @@ jobs:
         run: uv sync --locked --only-group dev
 
       # --no-sync is load-bearing: a plain `uv run` re-syncs the full project
-      # first, which would install torch and undo the step above.
+      # first, which would install the full dependency set and undo the step above.
       - name: Lint
         run: uv run --no-sync ruff check .
 

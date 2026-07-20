@@ -8,7 +8,7 @@ from rag_pipeline.config import ENV_VARS, Settings
 def test_defaults():
     s = Settings()
     assert s.chat_model == "claude-haiku-4-5"
-    assert "MiniLM" in s.embedding_model
+    assert s.embedding_model == "voyage-4-lite"
     assert s.chunk_size == 1000
     assert s.chunk_overlap == 200
     assert s.retrieval_k == 4
@@ -57,4 +57,4 @@ def test_from_env_empty_string_falls_back_to_default(monkeypatch):
 
     assert s.chat_model == "claude-haiku-4-5"
     assert s.collection_name == "rag_docs"
-    assert "MiniLM" in s.embedding_model
+    assert s.embedding_model == "voyage-4-lite"

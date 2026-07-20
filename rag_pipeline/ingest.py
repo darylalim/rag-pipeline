@@ -7,6 +7,7 @@ Chroma index from disk.
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path, PurePosixPath
 
@@ -14,8 +15,8 @@ from chromadb.api.shared_system_client import SharedSystemClient
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_voyageai import VoyageAIEmbeddings
 
 from rag_pipeline.config import Settings
 
@@ -23,14 +24,26 @@ from rag_pipeline.config import Settings
 SUPPORTED_SUFFIXES = {".md", ".txt", ".pdf"}
 
 
-def build_embeddings(settings: Settings) -> HuggingFaceEmbeddings:
+def build_embeddings(settings: Settings) -> Embeddings:
     """Construct the embedding model.
 
     Defined here (not in the pipeline) because it is the one component that
     *must* be identical for indexing and querying — vectors from different
     models are not comparable. Both stages import this single factory.
+
+    Voyage embeds queries and documents asymmetrically; the wrapper handles
+    that itself (input_type="document" from embed_documents at ingest,
+    "query" from embed_query at retrieval), so neither stage passes it here.
     """
-    return HuggingFaceEmbeddings(model_name=settings.embedding_model)
+    # Fast-fail with a message in the union both frontends catch, before the
+    # first API call — mirroring RAGPipeline's ANTHROPIC_API_KEY guard. Unlike
+    # the old on-device model, embedding now needs a key at ingest as well.
+    if not os.getenv("VOYAGE_API_KEY"):
+        raise RuntimeError(
+            "VOYAGE_API_KEY is not set. Embedding uses Voyage AI; set the key "
+            "in your environment or a .env file (see .env.example)."
+        )
+    return VoyageAIEmbeddings(model=settings.embedding_model)
 
 
 def open_store(settings: Settings, embeddings: Embeddings | None = None) -> Chroma:

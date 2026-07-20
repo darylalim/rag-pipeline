@@ -329,3 +329,17 @@ def test_every_source_is_a_relative_posix_path_that_resolves_under_data_dir(tmp_
     # The subdirectory has to survive into `source`: two files named the same in
     # different directories must stay distinguishable in a citation.
     assert {d.metadata["source"] for d in docs} == set(files)
+
+
+def test_build_embeddings_requires_voyage_key(settings, monkeypatch):
+    """A missing key surfaces as the caught RuntimeError, not a Voyage SDK error.
+
+    build_embeddings guards on VOYAGE_API_KEY *before* constructing the client,
+    so the failure lands in the FileNotFoundError | RuntimeError | ValueError
+    union both frontends catch, and no socket is opened reaching it (which the
+    autouse offline fixture would otherwise flag).
+    """
+    monkeypatch.delenv("VOYAGE_API_KEY", raising=False)
+
+    with pytest.raises(RuntimeError, match="VOYAGE_API_KEY"):
+        ingest_mod.build_embeddings(settings)

@@ -98,11 +98,10 @@ VIOLATIONS = [
     pytest.param("rag_pipeline/cli.py", "from . import ingest", id="cli-dot"),
     pytest.param("rag_pipeline/cli.py", "import rag_pipeline.pipeline", id="cli-plain"),
     pytest.param("app.py", 'store = Chroma(collection_name="x")', id="inline-chroma"),
-    pytest.param(
-        "app.py", "e = HuggingFaceEmbeddings(model_name=m)", id="inline-embeddings"
-    ),
+    pytest.param("app.py", "e = VoyageAIEmbeddings(model=m)", id="inline-embeddings"),
     pytest.param(
         # tests/ may open Chroma directly, but never build a real embedding model.
+        # The rule catches the legacy HuggingFace spelling here too.
         "tests/test_pipeline.py",
         'emb = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")',
         id="embeddings-in-tests",

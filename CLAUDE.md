@@ -9,7 +9,7 @@ uv sync                              # install deps (creates .venv)
 uv run rag ingest                    # rebuild the Chroma index from data/
 uv run rag query "your question"     # ask from the terminal
 uv run streamlit run app.py          # chat UI over the same pipeline
-uv run pytest                        # full suite (~9s warm: ~3s tests, rest torch import + startup; offline)
+uv run pytest                        # full suite (~6s warm: ~3s tests, rest imports + startup; offline)
 uv run pytest tests/test_config.py::test_defaults   # single test
 uv run pytest -k idempotent -v                      # by keyword
 uv run pytest --cov=rag_pipeline --cov=app --cov-report=term-missing   # coverage, on demand
@@ -32,10 +32,10 @@ UV_PROJECT_ENVIRONMENT=.venv311 uv run -p 3.11 pytest
 ```
 
 Plain `uv run -p 3.11` would recreate `.venv` itself at 3.11, and the next
-ordinary `uv run` would rebuild it at 3.13 — two full torch reinstalls.
+ordinary `uv run` would rebuild it at 3.13 — two full environment reinstalls.
 
 More generally: probe uv/tool behaviour in a throwaway project elsewhere, never
-here. This venv is 135 packages and multi-GB, and several uv commands rebuild it
+here. This venv is ~125 packages and ~670 MB, and several uv commands rebuild it
 without asking.
 
 Add dependencies with `uv add` / `uv add --dev` rather than hand-editing
@@ -92,7 +92,7 @@ that drift is not merely detected — it is inexpressible.
 embedding models are not comparable, and a Chroma collection's identity is
 (persist dir, collection name, embedding function). Indexing and querying must
 therefore go through one factory each. **Never construct `Chroma(...)` or
-`HuggingFaceEmbeddings(...)` inline** — route through these factories.
+`VoyageAIEmbeddings(...)` inline** — route through these factories.
 
 ### chromadb's per-process client cache
 
@@ -127,25 +127,24 @@ is idempotent: same input → same chunk count, no duplicate append.
 `ingest()`, `open_store()`, and `RAGPipeline.__init__` all accept optional
 `embeddings` / `llm`. **Production always passes `None`**; the parameters exist
 so tests can inject `DeterministicFakeEmbedding` and `FakeListChatModel`. This is
-why the suite needs no model download, no network, and no API key. (torch is
-still imported transitively via `langchain_huggingface`; it just never runs a
-model — that import is the ~4s in `uv run pytest`.) Any new code path touching an
-embedding model or the LLM should thread these through rather than constructing
-them unconditionally.
+why the suite needs no network and no API key: the real `build_embeddings()`
+makes a Voyage AI HTTP call and the real LLM calls Claude, but neither runs under
+test. Any new code path touching an embedding model or the LLM should thread
+these through rather than constructing them unconditionally.
 
 Injection is a convention, so `conftest.py` backs it with an autouse fixture that
 blocks `socket.socket`/`create_connection`. A test that simply forgets
-`embeddings=` names no banned symbol and no grep would find it — but it opens a
-socket, and that fails. Do not pair it with `HF_HUB_OFFLINE=1`: that makes
-`huggingface_hub` skip its revision check, so a cached model loads with no socket
-at all and the fixture goes blind. The two are antagonistic, not complementary.
+`embeddings=` names no banned symbol and no grep would find it — but the real
+Voyage AI path opens a socket to embed, and that fails. The block is the whole
+guarantee: with no local model to fall back to, a forgotten fake cannot succeed
+quietly.
 
 `app.py` takes no such parameters — it is a script, not a function — so
 `test_app.py` reaches the same seam through the factories instead, patching
 `ingest.build_embeddings` and `pipeline.build_chat_model` on their modules. That
 works only because both are looked up as module globals at call time, which is a
 second reason the never-construct-inline rule above is load-bearing: inline a
-`HuggingFaceEmbeddings(...)` anywhere and the frontend stops being testable
+`VoyageAIEmbeddings(...)` anywhere and the frontend stops being testable
 offline, not just inconsistent. `st.cache_resource` is cleared per test, since
 its key deliberately ignores `_settings` and would otherwise serve one test's
 pipeline to the next.
@@ -158,8 +157,8 @@ pipeline to the next.
   This is why `test_config.py` clears `config.ENV_VARS` rather than a
   hand-written list — see the Settings rule above.
 - `cli.py` imports `ingest`/`pipeline` lazily inside the command functions. This
-  is load-bearing: importing them pulls in sentence-transformers/torch, measured
-  at ~4.3s versus ~0.08s for `rag --help` today. Keep those imports local.
+  is load-bearing: importing them pulls in the chromadb/langchain stack, measured
+  at ~0.9s versus ~0.02s to import `cli` alone today. Keep those imports local.
 
 ## Enforcing the invariants
 

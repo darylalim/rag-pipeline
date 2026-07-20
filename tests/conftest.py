@@ -1,9 +1,9 @@
 """Shared pytest fixtures.
 
-Tests use a deterministic fake embedding model instead of the real
-sentence-transformers one, so the suite runs fast and fully offline (no torch,
-no model download). The fake still round-trips text->vector->store->retrieve,
-which is what the ingest/pipeline tests exercise.
+Tests use a deterministic fake embedding model instead of the real Voyage AI
+one, so the suite runs fast and fully offline (no API calls, no network). The
+fake still round-trips text->vector->store->retrieve, which is what the
+ingest/pipeline tests exercise.
 """
 
 from __future__ import annotations
@@ -40,7 +40,7 @@ def partial_answer() -> str:
 
 @pytest.fixture
 def fake_embeddings() -> DeterministicFakeEmbedding:
-    """Deterministic, torch-free embeddings.
+    """Deterministic, offline embeddings.
 
     Same text -> same vector, so querying with a chunk's exact text retrieves
     that chunk. Good enough to test the store/retrieve wiring without the real
@@ -156,24 +156,11 @@ def _offline_only(monkeypatch):
 
     The offline guarantee rests on tests injecting fakes for the embedding model
     and the LLM. That is a convention, and a test that simply forgets to pass
-    ``embeddings=`` falls back to the real sentence-transformers path — either
-    downloading a model, or (worse, because it still passes) loading a warm
-    cache and running for minutes in CI. Blocking the socket catches every
-    spelling of that mistake, including ones no grep would find, because the
-    failure is defined by behavior rather than by the name of a class.
-
-    Deliberately NOT paired with HF_HUB_OFFLINE=1: that makes huggingface_hub
-    skip its revision check, so a cached model loads with no socket at all and
-    this fixture goes blind. The two are antagonistic, not complementary —
-    blocking the socket is strictly stronger alone. The delenv defends that
-    precondition against an ambient export.
-
-    Caveat: a warm-cache load is caught only because huggingface_hub currently
-    revision-checks over the network. If that gains a local TTL, coverage
-    quietly narrows to cold-cache runs.
+    ``embeddings=`` falls back to the real Voyage AI path, which makes an HTTP
+    request to embed. Blocking the socket catches every spelling of that
+    mistake, including ones no grep would find, because the failure is defined
+    by behavior rather than by the name of a class.
     """
-    monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
-    monkeypatch.delenv("TRANSFORMERS_OFFLINE", raising=False)
 
     def blocked(*args, **kwargs):
         raise RuntimeError(

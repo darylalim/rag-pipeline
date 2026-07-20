@@ -14,7 +14,7 @@ chroma_db/
 .coverage
 htmlcov/
 
-# HuggingFace model cache (optional; large)
+# Local tool/tokenizer caches
 .cache/
 
 # OS

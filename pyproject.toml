@@ -1,7 +1,7 @@
 [project]
 name = "rag-pipeline"
 version = "0.1.0"
-description = "A local-embeddings RAG pipeline built with LangChain and Claude"
+description = "A RAG pipeline built with LangChain, Voyage AI embeddings, and Claude"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -9,7 +9,6 @@ requires-python = ">=3.11"
 dependencies = [
     "langchain-core>=0.3",
     "langchain-text-splitters>=0.3",
-    "langchain-huggingface>=0.1",
     "langchain-chroma>=0.2",
     "langchain-anthropic>=0.3",
     # Imported directly by pipeline.py, which catches anthropic.APIError to
@@ -18,10 +17,10 @@ dependencies = [
     # import we must depend on ourselves, or a repin upstream breaks `rag query`
     # with nothing in CI predicting it.
     "anthropic>=0.117.0",
-    "sentence-transformers>=3.0",
-    # Pulled in by sentence-transformers; declared here so the PyTorch CPU
-    # wheel index (see [tool.uv.sources] below) applies to it.
-    "torch>=2.0",
+    # Voyage AI embeddings, used by build_embeddings() at both ingest and query.
+    # The voyageai SDK it wraps is a thin HTTP client (no torch), so there is no
+    # local model to download and nothing platform-specific to pin.
+    "langchain-voyageai>=0.1.4",
     "chromadb>=0.5",
     "streamlit>=1.59",
     "python-dotenv>=1.0",
@@ -61,17 +60,3 @@ ignore = ["E501"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["rag_pipeline"]
-
-# On Linux/Windows the default PyPI torch wheel bundles CUDA (multi-GB). Pull
-# torch from PyTorch's CPU-only index there instead — much smaller, so CI
-# installs are fast. macOS wheels on PyPI are already CPU/MPS, so darwin is
-# left on the default index.
-[[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
-explicit = true
-
-[tool.uv.sources]
-torch = [
-    { index = "pytorch-cpu", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
-]

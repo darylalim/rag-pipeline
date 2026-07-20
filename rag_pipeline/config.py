@@ -52,9 +52,10 @@ class Settings:
     persist_dir: Path = _ROOT / "chroma_db"
     collection_name: str = "rag_docs"
 
-    # Local sentence-transformers model. Runs on-device, no API key needed.
-    # all-MiniLM-L6-v2 -> 384-dim vectors; small, fast, and solid for retrieval.
-    embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+    # Voyage AI embedding model, called over the API at both ingest and query.
+    # voyage-4-lite -> 1024-dim vectors; the cost/latency-optimized tier, and
+    # the same model must embed documents and questions for vectors to compare.
+    embedding_model: str = "voyage-4-lite"
 
     # Generation model. Haiku 4.5 is a fast, low-cost default for demos;
     # override via CHAT_MODEL (e.g. claude-opus-4-8) for higher-quality answers.
