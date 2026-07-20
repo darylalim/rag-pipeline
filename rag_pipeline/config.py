@@ -41,6 +41,18 @@ def _env_str(name: str, default: str) -> str:
     return value if value else default
 
 
+def require_env_key(name: str, message: str) -> None:
+    """Raise ``RuntimeError`` if an API-key variable is unset or set-but-empty.
+
+    Shared by the two provider guards — ``VOYAGE_API_KEY`` before embedding and
+    ``ANTHROPIC_API_KEY`` before generation — so they agree on the set-but-empty
+    treatment (matching the ``_env_*`` helpers) and both land in the exception
+    union the frontends catch. The caller supplies the remediation message.
+    """
+    if not os.getenv(name):
+        raise RuntimeError(message)
+
+
 @dataclass(frozen=True)
 class Settings:
     """Immutable bundle of pipeline configuration."""

@@ -52,7 +52,7 @@ def cmd_query(settings: Settings, question: str) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="rag",
-        description="A local-embeddings RAG pipeline built with LangChain and Claude.",
+        description="A RAG pipeline built with LangChain, Voyage AI embeddings, and Claude.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 

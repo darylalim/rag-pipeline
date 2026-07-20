@@ -88,9 +88,12 @@ def _add_documents(settings: Settings, uploads: list[UploadedFile]) -> None:
         try:
             with st.spinner(f"Indexing {len(saved)} file(s)..."):
                 n_chunks = ingest(settings)
-        except (OSError, ValueError) as exc:
+        except (OSError, RuntimeError, ValueError) as exc:
             # The files are on disk regardless, so this reports a failed *index*
-            # rather than a failed upload — `rag ingest` retries it.
+            # rather than a failed upload — `rag ingest` retries it. RuntimeError
+            # covers a missing VOYAGE_API_KEY and any Voyage/index error now that
+            # embedding is an API call; without it those escape and crash the
+            # sidebar mid-upload.
             st.error(f"Indexing failed: {exc}", icon=":material/error:")
         else:
             st.success(
@@ -259,12 +262,17 @@ if question := st.chat_input(
     # *something* under the question rather than leaving it dangling.
     reply = _error_reply("Interrupted before an answer was generated.")
     with st.chat_message("assistant"):
+        # Names the step in flight, so a failure is labelled for the phase it hit
+        # rather than always blamed on generation: embedding is an API call now,
+        # so retrieval can raise a provider error before generation ever starts.
+        phase = "Retrieval"
         try:
             # stream_answer() has finished retrieving when it returns but has
             # not started generating, so the spinner covers exactly the step
             # with nothing to show.
             with st.spinner("Retrieving context..."):
                 docs, chunks = pipeline.stream_answer(question)
+            phase = "Generation"
             answer_text = st.write_stream(chunks)
             # write_stream already rendered this; it is re-read only to store
             # it, and joined because the declared return is list[Any] | str —
@@ -281,7 +289,7 @@ if question := st.chat_input(
             # the stored text free of presentation, so the replay above can
             # route it back through st.error rather than rendering a failure as
             # if it were an answer.
-            error_msg = f"Generation failed: {exc}"
+            error_msg = f"{phase} failed: {exc}"
             st.error(error_msg, icon=":material/error:")
             reply = _error_reply(error_msg)
         finally:

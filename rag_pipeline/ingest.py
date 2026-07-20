@@ -7,10 +7,13 @@ Chroma index from disk.
 
 from __future__ import annotations
 
-import os
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 
+import chromadb.errors
+import voyageai
 from chromadb.api.shared_system_client import SharedSystemClient
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
@@ -18,7 +21,7 @@ from langchain_core.embeddings import Embeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_voyageai import VoyageAIEmbeddings
 
-from rag_pipeline.config import Settings
+from rag_pipeline.config import Settings, require_env_key
 
 # File extensions we know how to read into text.
 SUPPORTED_SUFFIXES = {".md", ".txt", ".pdf"}
@@ -35,14 +38,14 @@ def build_embeddings(settings: Settings) -> Embeddings:
     that itself (input_type="document" from embed_documents at ingest,
     "query" from embed_query at retrieval), so neither stage passes it here.
     """
-    # Fast-fail with a message in the union both frontends catch, before the
-    # first API call — mirroring RAGPipeline's ANTHROPIC_API_KEY guard. Unlike
-    # the old on-device model, embedding now needs a key at ingest as well.
-    if not os.getenv("VOYAGE_API_KEY"):
-        raise RuntimeError(
-            "VOYAGE_API_KEY is not set. Embedding uses Voyage AI; set the key "
-            "in your environment or a .env file (see .env.example)."
-        )
+    # Fast-fail before the first API call — mirroring RAGPipeline's
+    # ANTHROPIC_API_KEY guard. Unlike the old on-device model, embedding now
+    # needs a key at ingest as well as query.
+    require_env_key(
+        "VOYAGE_API_KEY",
+        "VOYAGE_API_KEY is not set. Embedding uses Voyage AI; set the key in "
+        "your environment or a .env file (see .env.example).",
+    )
     return VoyageAIEmbeddings(model=settings.embedding_model)
 
 
@@ -52,13 +55,43 @@ def open_store(settings: Settings, embeddings: Embeddings | None = None) -> Chro
     The store's identity (collection name, persist dir, embedding function) must
     match between indexing and querying, so both stages open it through this one
     factory. ``embeddings`` is injectable for tests; production leaves it None
-    and builds the local model.
+    and builds the embedding model.
     """
     return Chroma(
         collection_name=settings.collection_name,
         embedding_function=embeddings or build_embeddings(settings),
         persist_directory=str(settings.persist_dir),
     )
+
+
+@contextmanager
+def embedding_errors_as_runtime() -> Iterator[None]:
+    """Translate embedding-time failures into the RuntimeError the frontends catch.
+
+    Embedding is a Voyage AI API call and the store is chromadb; neither's
+    exception type is in the ``FileNotFoundError | RuntimeError | ValueError``
+    union both frontends handle, and neither belongs in a frontend. This is the
+    embedding half's parallel to ``_generate()``'s ``anthropic.APIError``
+    translation, wrapping both embed sites: ``ingest()`` here and
+    ``RAGPipeline.retrieve()`` in pipeline.py.
+    """
+    try:
+        yield
+    except voyageai.error.VoyageError as exc:
+        raise RuntimeError(f"Voyage embedding request failed: {exc}") from exc
+    except chromadb.errors.ChromaError as exc:
+        # Translate any store-layer failure into the caught union. Add the
+        # "rebuild your index" hint only for a dimension mismatch, keyed off the
+        # message rather than the exception type: chromadb raises the same type
+        # for unrelated validation (e.g. a bad COLLECTION_NAME) that the hint
+        # would misdiagnose.
+        hint = (
+            " The index was likely built with a different EMBEDDING_MODEL; delete "
+            "the persist directory (or change COLLECTION_NAME), then run `rag ingest`."
+            if "dimension" in str(exc).lower()
+            else ""
+        )
+        raise RuntimeError(f"{exc}.{hint}") from exc
 
 
 def reset_store_cache() -> None:
@@ -212,8 +245,9 @@ def ingest(settings: Settings, embeddings: Embeddings | None = None) -> int:
     # add the fresh chunks. Scoped to the collection, so re-ingest never touches
     # other files in the persist directory. `include=[]` fetches only the ids,
     # not every chunk's text and metadata.
-    existing_ids = store.get(include=[])["ids"]
-    if existing_ids:
-        store.delete(ids=existing_ids)
-    store.add_documents(chunks)
+    with embedding_errors_as_runtime():
+        existing_ids = store.get(include=[])["ids"]
+        if existing_ids:
+            store.delete(ids=existing_ids)
+        store.add_documents(chunks)
     return len(chunks)

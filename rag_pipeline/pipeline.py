@@ -7,7 +7,6 @@ single pipeline and reuse it across queries.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import TypedDict
@@ -21,8 +20,8 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import Runnable
 
-from rag_pipeline.config import Settings
-from rag_pipeline.ingest import open_store
+from rag_pipeline.config import Settings, require_env_key
+from rag_pipeline.ingest import embedding_errors_as_runtime, open_store
 
 # Grounding prompt: the model must answer from the retrieved context only, and
 # admit when the context does not contain the answer. This is what turns a
@@ -129,11 +128,11 @@ class RAGPipeline:
         # Fast-fail on a missing key *before* loading the embedding model — but
         # only when we're going to build the real Claude client (an injected
         # `llm`, as in tests, needs no key).
-        if llm is None and not os.getenv("ANTHROPIC_API_KEY"):
-            raise RuntimeError(
+        if llm is None:
+            require_env_key(
+                "ANTHROPIC_API_KEY",
                 "ANTHROPIC_API_KEY is not set. Generation uses Claude; set the "
-                "key in your environment or a .env file (see .env.example). "
-                "Embedding/ingest runs locally and needs no key."
+                "key in your environment or a .env file (see .env.example).",
             )
 
         self.settings = settings
@@ -141,7 +140,7 @@ class RAGPipeline:
         # Reload the existing store via the shared factory, so the same
         # embedding model that indexed the documents also embeds queries.
         # `embeddings` and `llm` are injectable for tests; production leaves
-        # both as None and gets local embeddings + ChatAnthropic.
+        # both as None and gets the embedding model + ChatAnthropic.
         vectorstore = open_store(settings, embeddings)
         # `persist_dir.exists()` alone is too weak: an empty directory or a
         # COLLECTION_NAME that doesn't match what was ingested yields a
@@ -162,8 +161,15 @@ class RAGPipeline:
         self._chain = _PROMPT | (llm or build_chat_model(settings)) | StrOutputParser()
 
     def retrieve(self, question: str) -> list[Document]:
-        """Return the chunks most relevant to the question."""
-        return self._retriever.invoke(question)
+        """Return the chunks most relevant to the question.
+
+        Wrapped so an embedding failure — a Voyage provider error, or a
+        query-time dimension mismatch against a stale index — surfaces as the
+        RuntimeError both frontends catch rather than a raw voyageai/chromadb
+        exception.
+        """
+        with embedding_errors_as_runtime():
+            return self._retriever.invoke(question)
 
     def _generate(self, question: str, docs: list[Document]) -> Iterator[str]:
         """Yield the grounded answer in pieces, as the model produces them.

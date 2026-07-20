@@ -14,7 +14,9 @@ import dataclasses
 import anthropic
 import httpx
 import pytest
+import voyageai
 from langchain_core.documents import Document
+from langchain_core.embeddings import DeterministicFakeEmbedding, Embeddings
 from langchain_core.language_models import FakeListChatModel
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableLambda
@@ -332,6 +334,24 @@ def _exploding_llm() -> RunnableLambda:
     return RunnableLambda(explode)
 
 
+def _exploding_embeddings() -> Embeddings:
+    """Embeddings that fail the way Voyage's API does — the embedding-side analog
+    of `_exploding_llm()`.
+
+    A real failure (bad key, rate limit, network) surfaces as a voyageai.error
+    subclass; raise one offline instead of calling out.
+    """
+
+    class _Exploding(Embeddings):
+        def embed_documents(self, texts: list[str]) -> list[list[float]]:
+            raise voyageai.error.RateLimitError("rate limited")
+
+        def embed_query(self, text: str) -> list[float]:
+            raise voyageai.error.RateLimitError("rate limited")
+
+    return _Exploding()
+
+
 def _fail_answer_on_provider_error(settings, fake_embeddings, monkeypatch, tmp_path):
     pipeline = _ingested_pipeline(settings, fake_embeddings, _exploding_llm())
     pipeline.answer("Why do chunks overlap?")
@@ -359,6 +379,39 @@ def _fail_stream_answer_on_empty_response(
     )
     _docs, chunks = pipeline.stream_answer("Why do chunks overlap?")
     list(chunks)
+
+
+def _fail_build_embeddings_missing_voyage_key(
+    settings, fake_embeddings, monkeypatch, tmp_path
+):
+    # Guards before the client is built, so no socket is opened reaching it.
+    monkeypatch.delenv("VOYAGE_API_KEY", raising=False)
+    ingest_mod.build_embeddings(settings)
+
+
+def _fail_ingest_on_voyage_error(settings, fake_embeddings, monkeypatch, tmp_path):
+    ingest_mod.ingest(settings, embeddings=_exploding_embeddings())
+
+
+def _fail_ingest_dimension_change(settings, fake_embeddings, monkeypatch, tmp_path):
+    # A collection keeps its dimensionality after its ids are deleted, so a
+    # re-ingest with a different-sized model — as an EMBEDDING_MODEL change would
+    # give — hits chromadb's dimension check on add.
+    ingest_mod.ingest(settings, embeddings=DeterministicFakeEmbedding(size=8))
+    ingest_mod.reset_store_cache()
+    ingest_mod.ingest(settings, embeddings=DeterministicFakeEmbedding(size=16))
+
+
+def _fail_retrieve_on_voyage_error(settings, fake_embeddings, monkeypatch, tmp_path):
+    # Embedding is a network call at query time too, so a provider error while
+    # embedding the question translates the same way as at ingest.
+    ingest_mod.ingest(settings, embeddings=fake_embeddings)
+    pipeline = RAGPipeline(
+        settings,
+        embeddings=_exploding_embeddings(),
+        llm=FakeListChatModel(responses=["unused"]),
+    )
+    pipeline.retrieve("apples")
 
 
 @pytest.mark.parametrize(
@@ -411,6 +464,30 @@ def _fail_stream_answer_on_empty_response(
             RuntimeError,
             "empty answer",
             id="stream-answer-empty-response",
+        ),
+        pytest.param(
+            _fail_build_embeddings_missing_voyage_key,
+            RuntimeError,
+            "VOYAGE_API_KEY is not set",
+            id="build-embeddings-missing-voyage-key",
+        ),
+        pytest.param(
+            _fail_ingest_on_voyage_error,
+            RuntimeError,
+            "Voyage embedding request failed",
+            id="ingest-voyage-provider-error",
+        ),
+        pytest.param(
+            _fail_ingest_dimension_change,
+            RuntimeError,
+            "EMBEDDING_MODEL",
+            id="ingest-dimension-mismatch",
+        ),
+        pytest.param(
+            _fail_retrieve_on_voyage_error,
+            RuntimeError,
+            "Voyage embedding request failed",
+            id="retrieve-voyage-provider-error",
         ),
     ],
 )

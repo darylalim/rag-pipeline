@@ -334,16 +334,29 @@ def test_one_unsaveable_file_does_not_discard_the_rest_of_the_batch(app, wired_e
     assert any("fine.md" in s.value for s in at.sidebar.success)
 
 
-def test_a_failed_rebuild_is_reported_as_an_indexing_failure(app, monkeypatch):
-    """The files are on disk either way, so this is not a failed *upload*.
+@pytest.mark.parametrize(
+    "exc",
+    [
+        pytest.param(
+            ValueError("No readable documents found in data"), id="value-error"
+        ),
+        pytest.param(RuntimeError("VOYAGE_API_KEY is not set."), id="runtime-error"),
+    ],
+)
+def test_a_failed_rebuild_is_reported_not_raised(app, monkeypatch, exc):
+    """A failed index rebuild is reported, not raised: the files are on disk
+    either way, so this is a failed *index*, not a failed upload — the user
+    should re-run `rag ingest`, not re-upload.
 
-    Reported rather than raised because the run continues past it — the
-    distinction matters to a user deciding whether to re-upload (they should
-    not) or to re-run `rag ingest` (they should).
+    Parametrized over the exception because _add_documents must catch the whole
+    frontend union. ValueError is the empty-corpus case; RuntimeError is the one
+    embedding-as-an-API-call newly introduced (missing VOYAGE_API_KEY, or a
+    translated Voyage/index error), which the historical (OSError, ValueError)
+    catch would have let escape straight through the sidebar.
     """
 
     def failing_ingest(_settings, embeddings=None):
-        raise ValueError("No readable documents found in data")
+        raise exc
 
     monkeypatch.setattr(ingest_mod, "ingest", failing_ingest)
 
