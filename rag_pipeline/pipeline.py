@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 from collections.abc import Iterator
 from dataclasses import dataclass
+from typing import TypedDict
 
 import anthropic
 from langchain_anthropic import ChatAnthropic
@@ -52,38 +53,52 @@ class Answer:
     sources: list[Document]
 
 
+class Excerpt(TypedDict):
+    """One retrieved passage, as a frontend stores and replays it.
+
+    A TypedDict rather than a dataclass because the chat history that holds
+    these is itself plain dicts, and because it must survive a round trip
+    through Streamlit's session state; the annotation is what keeps the two key
+    names checked rather than spelled from memory at each use.
+    """
+
+    source: str
+    text: str
+
+
+def _source_of(doc: Document) -> str:
+    """The citation label for one chunk.
+
+    One spelling of the fallback, because three functions below put this string
+    in front of a reader -- in the prompt, in a citation line, and in the panel
+    that is supposed to prove the first two agree. Copies of it would be exactly
+    the drift they exist to prevent.
+    """
+    return doc.metadata.get("source", "unknown")
+
+
 def format_docs(docs: list[Document]) -> str:
     """Render retrieved chunks into a single context string, labeled by source."""
     return "\n\n".join(
-        f"[Source: {doc.metadata.get('source', 'unknown')}]\n{doc.page_content}"
-        for doc in docs
+        f"[Source: {_source_of(doc)}]\n{doc.page_content}" for doc in docs
     )
 
 
 def unique_sources(docs: list[Document]) -> list[str]:
     """Distinct source files across the retrieved chunks, in retrieval order."""
     # dict.fromkeys preserves insertion order while dropping duplicates.
-    return list(dict.fromkeys(doc.metadata.get("source", "unknown") for doc in docs))
+    return list(dict.fromkeys(_source_of(doc) for doc in docs))
 
 
-def source_excerpts(docs: list[Document]) -> list[dict[str, str]]:
+def source_excerpts(docs: list[Document]) -> list[Excerpt]:
     """The retrieved passages in a form a frontend can store and replay.
-
-    Beside :func:`unique_sources` and :func:`format_docs` because all three
-    derive their label from the same ``source`` key, and a displayed label that
-    drifts from the prompt label turns a citation panel into a transcript of a
-    prompt that was never sent. Plain dicts rather than Documents because a chat
-    history outlives the objects that filled it.
 
     Retrieval order is preserved and repeated sources are not collapsed:
     ``format_docs`` joins in list order, so this order *is* the order the model
     read them in, and two chunks from one file are two pieces of evidence rather
     than one repeated citation.
     """
-    return [
-        {"source": doc.metadata.get("source", "unknown"), "text": doc.page_content}
-        for doc in docs
-    ]
+    return [Excerpt(source=_source_of(doc), text=doc.page_content) for doc in docs]
 
 
 def build_chat_model(settings: Settings) -> BaseChatModel:

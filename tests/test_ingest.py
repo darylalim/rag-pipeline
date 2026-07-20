@@ -8,7 +8,8 @@ from pathlib import Path
 import pytest
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
-from pypdf import PdfReader, PdfWriter
+from pypdf import PdfWriter
+from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
 from rag_pipeline import ingest as ingest_mod
 from rag_pipeline.config import Settings
@@ -20,50 +21,30 @@ def minimal_pdf(pages: list[str]) -> bytes:
     Generated rather than committed as a fixture: a binary blob in the tree is
     unreviewable, and the thing under test is text extraction, which needs a
     genuine content stream -- an annotation or a blank page would not exercise
-    it. Assembled by hand because pypdf writes PDFs but cannot draw text into
-    one, then cloned through PdfWriter so the result carries a proper xref
-    instead of making every reader reconstruct it.
+    it. `add_blank_page` gives the page; the content stream and the font
+    resource are attached directly, because pypdf writes PDFs but has no API
+    for drawing text into one, and `extract_text` returns nothing without a font
+    to resolve `/F1` against.
     """
-    objects, kids = [], []
-    number = 3
-    for text in pages:
-        stream = f"BT /F1 12 Tf 20 100 Td ({text}) Tj ET".encode()
-        objects.append(
-            (
-                number,
-                b"<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 200]/Contents "
-                + str(number + 1).encode()
-                + b" 0 R/Resources<</Font<</F1 99 0 R>>>>>>",
-            )
-        )
-        objects.append(
-            (
-                number + 1,
-                b"<</Length "
-                + str(len(stream)).encode()
-                + b">>stream\n"
-                + stream
-                + b"\nendstream",
-            )
-        )
-        kids.append(f"{number} 0 R")
-        number += 2
-
-    body = b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
-    body += (
-        b"2 0 obj<</Type/Pages/Kids["
-        + " ".join(kids).encode()
-        + b"]/Count "
-        + str(len(pages)).encode()
-        + b">>endobj\n"
+    writer = PdfWriter()
+    font = DictionaryObject(
+        {
+            NameObject("/Type"): NameObject("/Font"),
+            NameObject("/Subtype"): NameObject("/Type1"),
+            NameObject("/BaseFont"): NameObject("/Helvetica"),
+        }
     )
-    for num, content in objects:
-        body += str(num).encode() + b" 0 obj" + content + b"endobj\n"
-    body += b"99 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj\n"
-    body += b"trailer<</Root 1 0 R/Size 100>>\nstartxref\n0\n%%EOF\n"
+    for text in pages:
+        page = writer.add_blank_page(width=200, height=200)
+        contents = DecodedStreamObject()
+        contents.set_data(f"BT /F1 12 Tf 20 100 Td ({text}) Tj ET".encode())
+        page[NameObject("/Contents")] = contents
+        page[NameObject("/Resources")] = DictionaryObject(
+            {NameObject("/Font"): DictionaryObject({NameObject("/F1"): font})}
+        )
 
     out = io.BytesIO()
-    PdfWriter(clone_from=PdfReader(io.BytesIO(body))).write(out)
+    writer.write(out)
     return out.getvalue()
 
 

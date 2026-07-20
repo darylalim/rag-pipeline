@@ -13,7 +13,7 @@ import streamlit as st
 
 from rag_pipeline.config import Settings
 from rag_pipeline.ingest import index_version, reset_store_cache
-from rag_pipeline.pipeline import RAGPipeline, source_excerpts
+from rag_pipeline.pipeline import Excerpt, RAGPipeline, source_excerpts
 
 st.set_page_config(
     page_title="RAG Pipeline", page_icon=":material/search:", layout="centered"
@@ -100,7 +100,7 @@ def _error_reply(text: str) -> dict:
     return {"role": "assistant", "content": text, "sources": [], "error": True}
 
 
-def _render_sources(excerpts: list[dict[str, str]]) -> None:
+def _render_sources(excerpts: list[Excerpt]) -> None:
     """Show the passages, not only the names of the files they came from.
 
     A filename is not checkable evidence: it tells a reader which document to go

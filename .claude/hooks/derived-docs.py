@@ -35,6 +35,7 @@ import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType
+from typing import NamedTuple
 
 try:
     data = json.load(sys.stdin)
@@ -84,40 +85,53 @@ def paths_touched(project: Path, paths: tuple[str, ...]) -> bool | None:
     return bool(result.stdout.strip())
 
 
+class Check(NamedTuple):
+    """One derived-documentation rule: what is wrong, when it is this turn's
+    business, and how to say so."""
+
+    problems: list[str]
+    # The paths whose modification makes `problems` this turn's fault. Per
+    # check, not shared: a turn that edited invariants.py must not be blocked by
+    # a stale settings triad it never touched, which is the whole point of the
+    # gate.
+    paths: tuple[str, ...]
+    header: str
+
+
+# Inside the try with the import: the hook reads four attributes off a module it
+# loaded by path, and its contract is to report and exit 1 rather than wedge the
+# turn -- an AttributeError from a renamed helper would otherwise be a traceback.
 try:
     invariants = load_invariants(root)
-except (OSError, SyntaxError) as exc:
+    if invariants is None:
+        raise AttributeError("tests/invariants.py did not load")
+    checks = (
+        Check(
+            invariants.settings_problems(root),
+            ("rag_pipeline/config.py", *invariants.SETTINGS_SITES),
+            "Settings sites incomplete (CLAUDE.md: adding a Settings field means "
+            "config.py + .env.example + the README config table).",
+        ),
+        Check(
+            invariants.rules_problems(root),
+            ("tests/invariants.py", *invariants.RULES_SITES),
+            "Invariant rules undocumented (CLAUDE.md: adding a rule means a Rule "
+            "in RULES + a row in the README rule table).",
+        ),
+    )
+except (OSError, SyntaxError, AttributeError) as exc:
     print(f"derived-docs: cannot load rules, not enforcing ({exc})", file=sys.stderr)
     sys.exit(1)
 
-if invariants is None:
-    print("derived-docs: cannot load rules, not enforcing", file=sys.stderr)
-    sys.exit(1)
-
-# Each check pairs its problems with the paths whose modification makes those
-# problems this turn's business, and with how to explain them.
-checks = (
-    (
-        invariants.settings_problems(root),
-        ("rag_pipeline/config.py", *invariants.SETTINGS_SITES),
-        "Settings sites incomplete (CLAUDE.md: adding a Settings field means "
-        "config.py + .env.example + the README config table).",
-    ),
-    (
-        invariants.rules_problems(root),
-        ("tests/invariants.py", invariants.RULES_SITE),
-        "Invariant rules undocumented (CLAUDE.md: adding a rule means a Rule in "
-        "RULES + a row in the README rule table).",
-    ),
-)
-
-# The git call is the expensive part of this hook (~11.6ms, versus ~0.07ms to
-# read and scan the files), so consult it only once there is something to
-# report. On a consistent tree -- the steady state -- git is never forked.
+# The git call is the expensive part of this hook (~11.6ms, versus ~0.6ms to
+# read and scan the files for both checks), so consult it only once there is
+# something to report. On a consistent tree -- the steady state -- git is never
+# forked. A turn where both checks have something to say forks it twice, which
+# is the rare path and not worth parsing porcelain output to avoid.
 reports = [
-    header + "\n" + "\n".join(problems)
-    for problems, paths, header in checks
-    if problems and paths_touched(root, paths) is not False
+    check.header + "\n" + "\n".join(check.problems)
+    for check in checks
+    if check.problems and paths_touched(root, check.paths) is not False
 ]
 
 if reports:

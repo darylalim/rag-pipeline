@@ -173,10 +173,26 @@ def violations(relpath: str, text: str) -> list[str]:
     ]
 
 
+# --- documented-in-the-README, the shape both rules below share ---------------
+
+
+def has_table_row(readme_text: str, name: str) -> bool:
+    """Is `name` the first cell of a row in some README table?
+
+    The one thing the two documentation rules below genuinely share, so it is
+    defined once. Both would otherwise carry their own copy of what counts as a
+    documented row, and a change to the table style would be applied to one --
+    leaving the other quietly matching nothing, which reads as success.
+    """
+    return bool(re.search(rf"^\|\s*`{name}`\s*\|", readme_text, re.MULTILINE))
+
+
 # --- the rule documentation rule ---------------------------------------------
 
-# Where a rule must be documented, beyond RULES itself.
-RULES_SITE = "README.md"
+# Where a rule must be documented, beyond RULES itself. A tuple like
+# SETTINGS_SITES below, so a second site is an appended string rather than a
+# type change here and at every caller.
+RULES_SITES = ("README.md",)
 
 
 def rules_problems(root: Path) -> list[str]:
@@ -192,16 +208,16 @@ def rules_problems(root: Path) -> list[str]:
     drift inexpressible rather than merely detectable — the same trade
     ``config.ENV_VARS`` makes for environment variables.
     """
-    readme = root / RULES_SITE
+    (site,) = RULES_SITES
+    readme = root / site
     if not readme.is_file():
         return []
 
     readme_text = readme.read_text(errors="ignore")
     return [
-        f"  {rule.name}: missing from {RULES_SITE} (add a row for `{rule.name}`)"
+        f"  {rule.name}: missing from {site} (add a row for `{rule.name}`)"
         for rule in RULES
-        # A row in the README rule table, e.g. "| `no-rmtree` | ... |".
-        if not re.search(rf"^\|\s*`{rule.name}`\s*\|", readme_text, re.MULTILINE)
+        if not has_table_row(readme_text, rule.name)
     ]
 
 
@@ -256,8 +272,7 @@ def settings_problems(root: Path) -> list[str]:
         # A commented default line, e.g. "# RETRIEVAL_K=4".
         if not re.search(rf"^#\s*{name}=", env_text, re.MULTILINE):
             missing.append(f".env.example (add `# {name}=<default>`)")
-        # A row in the README config table, e.g. "| `RETRIEVAL_K` | `4` | ... |".
-        if not re.search(rf"^\|\s*`{name}`\s*\|", readme_text, re.MULTILINE):
+        if not has_table_row(readme_text, name):
             missing.append(f"README.md config table (add a row for `{name}`)")
         if missing:
             problems.append(f"  {name}: missing from " + "; ".join(missing))

@@ -12,9 +12,30 @@ import socket
 
 import pytest
 from langchain_core.embeddings import DeterministicFakeEmbedding
+from langchain_core.language_models import FakeListChatModel
 
-from rag_pipeline.config import Settings
+from rag_pipeline import ingest as ingest_mod
+from rag_pipeline import pipeline as pipeline_mod
+from rag_pipeline.config import ENV_VARS, Settings
 from rag_pipeline.ingest import reset_store_cache
+
+# Exposed as fixtures below rather than imported: `tests/` has no __init__.py,
+# so `from tests.conftest import ...` would load this file a second time under a
+# different module name. Fixtures are how pytest shares these.
+_CANNED_ANSWER = "Chunks overlap to preserve context across boundaries. (a.md)"
+_PARTIAL_ANSWER = "a partial ans"
+
+
+@pytest.fixture
+def canned_answer() -> str:
+    """What the faked chat model answers with, for tests that assert on it."""
+    return _CANNED_ANSWER
+
+
+@pytest.fixture
+def partial_answer() -> str:
+    """What `fail_mid_stream` emits before raising."""
+    return _PARTIAL_ANSWER
 
 
 @pytest.fixture
@@ -63,6 +84,60 @@ def settings(tmp_path, sample_data_dir) -> Settings:
         chunk_overlap=40,
         retrieval_k=2,
     )
+
+
+@pytest.fixture
+def wired_env(settings, fake_embeddings, monkeypatch) -> Settings:
+    """A frontend's view of the world: fixture settings in the environment, fakes
+    behind both factories.
+
+    Neither frontend takes injected models — `app.py` is a script and `cli.py`
+    builds its own `Settings.from_env()` — so the environment is how a fixture's
+    temp index reaches them, and the two factories are where they reach a model.
+    That is the same seam for both, which is why this is one fixture rather than
+    a copy in each frontend's test file.
+
+    Derived from ENV_VARS rather than spelled out: a hand-kept list would
+    silently stop covering a new setting, and config.py's import-time
+    load_dotenv() means the developer's own .env would answer whichever name was
+    missed. The API key is set because RAGPipeline fast-fails without one
+    whenever it builds the model itself; the factory is patched below, so nothing
+    ever authenticates with it.
+    """
+    for var in ENV_VARS:
+        monkeypatch.setenv(var, str(getattr(settings, var.lower())))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-fake")
+
+    monkeypatch.setattr(ingest_mod, "build_embeddings", lambda _s: fake_embeddings)
+    monkeypatch.setattr(
+        pipeline_mod,
+        "build_chat_model",
+        lambda _s: FakeListChatModel(responses=[_CANNED_ANSWER]),
+    )
+    return settings
+
+
+@pytest.fixture
+def fail_mid_stream(monkeypatch):
+    """Make generation emit, then fail — as a real one would.
+
+    Patched at `_generate` rather than `stream_answer` so real retrieval still
+    runs and the frontend still receives real sources. Failing partway rather
+    than at the call is the honest shape: generation is lazy, so a provider
+    error lands while the frontend is already rendering.
+
+    Here rather than in one frontend's test file because both frontends have to
+    survive it, and a dependency on a private method is worth declaring once.
+    """
+
+    def arrange(exc: BaseException) -> None:
+        def generate(_self, _question, _docs):
+            yield _PARTIAL_ANSWER
+            raise exc
+
+        monkeypatch.setattr(pipeline_mod.RAGPipeline, "_generate", generate)
+
+    return arrange
 
 
 @pytest.fixture(autouse=True)

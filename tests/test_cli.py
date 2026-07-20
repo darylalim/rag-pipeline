@@ -21,51 +21,24 @@ suite's offline guarantee.
 from __future__ import annotations
 
 import pytest
-from langchain_core.language_models import FakeListChatModel
 
 from rag_pipeline import cli
 from rag_pipeline import ingest as ingest_mod
 from rag_pipeline import pipeline as pipeline_mod
-from rag_pipeline.config import ENV_VARS, Settings
-
-CANNED = "Chunks overlap to preserve context across boundaries. (a.md)"
 
 
 @pytest.fixture
-def cli_env(settings, fake_embeddings, monkeypatch):
-    """Point `Settings.from_env()` at the fixture index and patch both factories.
-
-    Derived from ENV_VARS rather than spelled out, for the reason `test_app.py`
-    gives: config.py loads `.env` at import time, so a setting missed by a
-    hand-kept list would be answered by the developer's own file.
-    """
-    for var in ENV_VARS:
-        monkeypatch.setenv(var, str(getattr(settings, var.lower())))
-    # RAGPipeline fast-fails on a missing key before it loads anything. The
-    # factory is patched below, so nothing ever authenticates with this value.
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-fake")
-
-    monkeypatch.setattr(ingest_mod, "build_embeddings", lambda _s: fake_embeddings)
-    monkeypatch.setattr(
-        pipeline_mod,
-        "build_chat_model",
-        lambda _s: FakeListChatModel(responses=[CANNED]),
-    )
-    return settings
-
-
-@pytest.fixture
-def indexed(cli_env, fake_embeddings):
-    """A `cli_env` whose index already exists, as `rag query` requires."""
-    ingest_mod.ingest(cli_env, embeddings=fake_embeddings)
+def indexed(wired_env, fake_embeddings):
+    """A `wired_env` whose index already exists, as `rag query` requires."""
+    ingest_mod.ingest(wired_env, embeddings=fake_embeddings)
     ingest_mod.reset_store_cache()
-    return cli_env
+    return wired_env
 
 
 # --- the happy paths ---------------------------------------------------------
 
 
-def test_ingest_reports_where_it_wrote_and_how_much(cli_env, capsys):
+def test_ingest_reports_where_it_wrote_and_how_much(wired_env, capsys):
     assert cli.main(["ingest"]) == 0
 
     out = capsys.readouterr().out
@@ -73,21 +46,23 @@ def test_ingest_reports_where_it_wrote_and_how_much(cli_env, capsys):
     assert "chunks" in out
     # The path is the actionable half: an ingest that silently wrote somewhere
     # else is the failure a user cannot otherwise see.
-    assert str(cli_env.persist_dir) in out
+    assert str(wired_env.persist_dir) in out
 
 
-def test_query_prints_the_answer_then_its_sources(indexed, capsys):
+def test_query_prints_the_answer_then_its_sources(indexed, capsys, canned_answer):
     assert cli.main(["query", "why overlap chunks?"]) == 0
 
     out = capsys.readouterr().out
-    assert CANNED in out
+    assert canned_answer in out
     # Sources come after the answer, so a reader meets the claim before its
     # provenance and a pipe can split on the header.
-    assert out.index("Sources:") > out.index(CANNED)
+    assert out.index("Sources:") > out.index(canned_answer)
     assert "- a.md" in out
 
 
-def test_the_sources_block_lists_each_file_once(tmp_path, cli_env, capsys, monkeypatch):
+def test_the_sources_block_lists_each_file_once(
+    tmp_path, wired_env, capsys, monkeypatch
+):
     """Two chunks from one file must cite it once, not twice.
 
     `retrieval_k` counts chunks while the block lists files, so any corpus whose
@@ -112,7 +87,7 @@ def test_the_sources_block_lists_each_file_once(tmp_path, cli_env, capsys, monke
 # --- the exception union, as exit codes --------------------------------------
 
 
-def test_a_missing_index_is_an_error_not_a_traceback(cli_env, capsys):
+def test_a_missing_index_is_an_error_not_a_traceback(wired_env, capsys):
     """FileNotFoundError: the query ran before any ingest."""
     assert cli.main(["query", "anything"]) == 1
 
@@ -138,7 +113,7 @@ def test_a_missing_api_key_is_an_error_not_a_traceback(indexed, capsys, monkeypa
 
 
 def test_a_malformed_numeric_setting_is_an_error_not_a_traceback(
-    cli_env, capsys, monkeypatch
+    wired_env, capsys, monkeypatch
 ):
     """ValueError: raised by int() inside `from_env`, before any command runs.
 
@@ -156,7 +131,7 @@ def test_a_malformed_numeric_setting_is_an_error_not_a_traceback(
 
 
 def test_a_failure_partway_through_the_stream_terminates_the_line(
-    indexed, capsys, monkeypatch
+    indexed, capsys, fail_mid_stream, partial_answer
 ):
     """The partial answer must not share a line with the error.
 
@@ -164,51 +139,48 @@ def test_a_failure_partway_through_the_stream_terminates_the_line(
     `cmd_query` prints the closing newline from a `finally` for exactly that
     case. Without it main()'s "Error: ..." collides with the partial answer.
     """
-
-    def failing(self, question, docs):
-        yield "partial answer"
-        raise RuntimeError("Claude API request failed: boom")
-
-    monkeypatch.setattr(pipeline_mod.RAGPipeline, "_generate", failing)
+    fail_mid_stream(RuntimeError("Claude API request failed: boom"))
 
     assert cli.main(["query", "anything"]) == 1
 
     captured = capsys.readouterr()
     assert captured.out.endswith("\n")
-    assert "partial answer" in captured.out
+    assert partial_answer in captured.out
     assert captured.err.startswith("Error: ")
 
 
 # --- argparse itself ---------------------------------------------------------
 
 
-def test_a_bare_invocation_exits_with_usage() -> None:
-    """`required=True` on the subparser, so this never reaches a command.
+@pytest.mark.parametrize(
+    "argv", [[], ["query"]], ids=["no-subcommand", "query-without-a-question"]
+)
+def test_an_incomplete_invocation_exits_with_usage(argv: list[str]) -> None:
+    """Neither reaches a command: the subparser and `question` are both required.
 
     SystemExit(2) rather than a return value: argparse exits during parsing, so
     this is the one failure main()'s handler never sees.
     """
     with pytest.raises(SystemExit) as exc:
-        cli.main([])
+        cli.main(argv)
     assert exc.value.code == 2
 
 
-def test_query_requires_its_question() -> None:
-    with pytest.raises(SystemExit) as exc:
-        cli.main(["query"])
-    assert exc.value.code == 2
-
-
-def test_settings_come_from_the_environment_not_a_literal(cli_env, monkeypatch, capsys):
+def test_settings_come_from_the_environment_not_a_literal(
+    wired_env, monkeypatch, capsys
+):
     """The CLI must honour an override, or `.env` silently means nothing here.
 
     Asserted through `rag ingest`'s own output rather than by reading Settings,
     so it covers the wiring from environment to command and not just `from_env`.
     """
-    elsewhere = cli_env.persist_dir.parent / "moved"
+    elsewhere = wired_env.persist_dir.parent / "moved"
     monkeypatch.setenv("PERSIST_DIR", str(elsewhere))
 
     assert cli.main(["ingest"]) == 0
 
-    assert str(Settings.from_env().persist_dir) in capsys.readouterr().out
+    # Compared against the path this test chose, not against a second
+    # `from_env()` call -- that would derive both sides from one source and pass
+    # even if the command ignored the environment entirely.
+    assert str(elsewhere) in capsys.readouterr().out
     assert elsewhere.exists()

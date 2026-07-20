@@ -27,36 +27,18 @@ from streamlit.testing.v1 import AppTest
 
 from rag_pipeline import ingest as ingest_mod
 from rag_pipeline import pipeline as pipeline_mod
-from rag_pipeline.config import ENV_VARS
 
 APP = Path(__file__).resolve().parent.parent / "app.py"
 
-CANNED = "Chunks overlap to preserve context across boundaries. (rag_concepts.md)"
-
 
 @pytest.fixture
-def app(settings, fake_embeddings, monkeypatch) -> AppTest:
-    """An `AppTest` over `app.py`, wired to fakes and a freshly ingested index."""
-    ingest_mod.ingest(settings, embeddings=fake_embeddings)
+def app(wired_env, fake_embeddings) -> AppTest:
+    """An `AppTest` over `app.py`, wired to fakes and a freshly ingested index.
 
-    # app.py builds its own Settings.from_env(), so the environment is how the
-    # fixture's temp index gets through to it. Derived from ENV_VARS rather than
-    # spelled out: a hand-kept list would silently stop covering a new setting,
-    # and config.py's import-time load_dotenv() means the developer's own .env
-    # would answer whichever name was missed.
-    for var in ENV_VARS:
-        monkeypatch.setenv(var, str(getattr(settings, var.lower())))
-    # RAGPipeline fast-fails on a missing key whenever it builds the model
-    # itself, which it does here. The factory is patched below, so nothing ever
-    # authenticates with this value.
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-fake")
-
-    monkeypatch.setattr(ingest_mod, "build_embeddings", lambda _s: fake_embeddings)
-    monkeypatch.setattr(
-        pipeline_mod,
-        "build_chat_model",
-        lambda _s: FakeListChatModel(responses=[CANNED]),
-    )
+    `wired_env` supplies everything both frontends need; what is left here is
+    what only a Streamlit script does.
+    """
+    ingest_mod.ingest(wired_env, embeddings=fake_embeddings)
 
     # load_pipeline is cached across script runs and its key ignores _settings,
     # so a previous test's pipeline would otherwise answer this one.
@@ -64,27 +46,11 @@ def app(settings, fake_embeddings, monkeypatch) -> AppTest:
     return AppTest.from_file(str(APP), default_timeout=60)
 
 
-def _fail_mid_stream(monkeypatch, exc: BaseException) -> None:
-    """Make generation emit, then fail — as a real one would.
-
-    Patched at `_generate` rather than `stream_answer` so real retrieval still
-    runs and the frontend still receives real sources. Failing partway rather
-    than at the call is the honest shape: generation is lazy, so a provider
-    error lands while the frontend is already rendering.
-    """
-
-    def generate(_self, _question, _docs):
-        yield "a partial ans"
-        raise exc
-
-    monkeypatch.setattr(pipeline_mod.RAGPipeline, "_generate", generate)
-
-
 def _roles(at: AppTest) -> list[str]:
     return [m["role"] for m in at.session_state["messages"]]
 
 
-def test_app_answers_a_question_with_sources(app):
+def test_app_answers_a_question_with_sources(app, canned_answer):
     at = app.run()
     assert not at.exception, [e.value for e in at.exception]
 
@@ -94,7 +60,7 @@ def test_app_answers_a_question_with_sources(app):
     user, assistant = at.session_state["messages"]
     assert user == {"role": "user", "content": "Why do chunks overlap?"}
     # A str, not write_stream's list form: replay feeds this to st.markdown.
-    assert assistant["content"] == CANNED
+    assert assistant["content"] == canned_answer
     assert assistant["sources"], "answer stored without the docs that grounded it"
     assert "error" not in assistant
 
@@ -145,11 +111,9 @@ def test_user_turn_is_echoed_unparsed(app):
     assert "what about `snake_case` and # headings?" in [t.value for t in at.text]
 
 
-def test_failed_generation_is_recorded_as_an_error_turn(app, monkeypatch):
+def test_failed_generation_is_recorded_as_an_error_turn(app, fail_mid_stream):
     """A failure must replay as an error, not as an ordinary answer."""
-    _fail_mid_stream(
-        monkeypatch, RuntimeError("Claude API request failed: rate limited")
-    )
+    fail_mid_stream(RuntimeError("Claude API request failed: rate limited"))
     at = app.run()
     at.chat_input[0].set_value("Why do chunks overlap?").run()
     assert not at.exception, [e.value for e in at.exception]
@@ -164,7 +128,7 @@ def test_failed_generation_is_recorded_as_an_error_turn(app, monkeypatch):
     assert not any("rate limited" in m.value for m in at.markdown)
 
 
-def test_an_interrupted_run_still_pairs_the_turn(app, monkeypatch):
+def test_an_interrupted_run_still_pairs_the_turn(app, fail_mid_stream):
     """The regression test for a question left permanently unanswered.
 
     Streamlit's toolbar Stop raises `StopException`, which derives from
@@ -174,7 +138,7 @@ def test_an_interrupted_run_still_pairs_the_turn(app, monkeypatch):
     together, session_state keeps a question with nothing under it, on every
     later rerun, with no code path that ever fills it in.
     """
-    _fail_mid_stream(monkeypatch, StopException("user pressed stop"))
+    fail_mid_stream(StopException("user pressed stop"))
     at = app.run()
     at.chat_input[0].set_value("Why do chunks overlap?").run()
 
@@ -186,7 +150,7 @@ def test_an_interrupted_run_still_pairs_the_turn(app, monkeypatch):
     assert "Interrupted" in reply["content"]
 
 
-def test_every_turn_stays_paired_across_mixed_outcomes(app, monkeypatch):
+def test_every_turn_stays_paired_across_mixed_outcomes(app, fail_mid_stream):
     """Success, failure and interruption in one history, still strictly paired.
 
     Pins the invariant itself rather than one path: whatever happens to a turn,
@@ -195,10 +159,10 @@ def test_every_turn_stays_paired_across_mixed_outcomes(app, monkeypatch):
     at = app.run()
     at.chat_input[0].set_value("first").run()
 
-    _fail_mid_stream(monkeypatch, RuntimeError("Claude API request failed: boom"))
+    fail_mid_stream(RuntimeError("Claude API request failed: boom"))
     at.chat_input[0].set_value("second").run()
 
-    _fail_mid_stream(monkeypatch, StopException("stop"))
+    fail_mid_stream(StopException("stop"))
     at.chat_input[0].set_value("third").run()
 
     assert _roles(at) == ["user", "assistant"] * 3
