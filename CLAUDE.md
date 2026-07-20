@@ -212,8 +212,15 @@ CI like any other file: `ruff check .` does not exclude dot-directories.
 ## Conventions
 
 - New failure modes must fit `FileNotFoundError | RuntimeError | ValueError` —
-  the union both frontends catch (`cli.py:77`, `app.py:65`; see the comment at
-  `app.py:66-67` for the precise per-type mapping). Don't add a fourth type.
+  the union both frontends catch. `cli.py` catches it in one place (`main()`);
+  `app.py` splits it across two, because the sidebar has to render in between:
+  `ValueError` from `Settings.from_env()` stops the script above the sidebar,
+  and `FileNotFoundError | RuntimeError` from the pipeline load is caught below
+  it, so the uploader stays reachable when there is no index. Grep
+  `except (FileNotFoundError` rather than trusting a line number. Don't add a
+  fourth type — `_add_documents()` catching `OSError` is not one: it is the
+  filesystem's own error on a write, and `FileNotFoundError` is already a
+  subclass of it.
 - Generation-level failures are raised in `_generate()` and nowhere else — the
   `anthropic.APIError` → `RuntimeError` translation that keeps the SDK out of
   both frontends, and the empty-response guard that stops a frontend presenting

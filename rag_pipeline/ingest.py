@@ -8,7 +8,7 @@ Chroma index from disk.
 from __future__ import annotations
 
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from chromadb.api.shared_system_client import SharedSystemClient
 from langchain_chroma import Chroma
@@ -77,6 +77,50 @@ def _read_pdf(path: Path) -> str:
 
     reader = PdfReader(str(path))
     return "\n".join(page.extract_text() or "" for page in reader.pages)
+
+
+def save_upload(data_dir: Path, filename: str, data: bytes) -> str:
+    """Write one uploaded file into ``data_dir``; return the name it landed under.
+
+    Here rather than in the frontend that calls it because the name it produces
+    has to satisfy ``load_documents``' contract — a supported suffix, and a
+    relative POSIX path that resolves back under ``data_dir``. ``index_version``
+    sits in this module for the same reason: serving one frontend is not the
+    same as belonging to it.
+
+    The name is reduced to its final component, and *that* is what keeps an
+    upload from writing outside ``data_dir`` — a browser supplies this string,
+    so ``../../.ssh/authorized_keys`` arrives as an ordinary value rather than
+    an attack the caller has to notice. Backslashes are folded first, because a
+    POSIX server does not read a Windows separator as one and would otherwise
+    keep ``C:\\Users\\evil.md`` as a single filename. Flattening also discards
+    any directory the uploader meant to keep, which is the safe direction to be
+    wrong in and is recoverable by writing to ``data_dir`` directly.
+
+    Bytes are written through unchanged rather than decoded and re-encoded: a
+    ``.pdf`` is binary, and a mis-encoded ``.txt`` should meet the same warn-and
+    -skip path in ``load_documents`` that one copied in by hand does.
+
+    Raises ``ValueError`` for a name this pipeline cannot index, which is inside
+    the union both frontends already catch.
+    """
+    path = PurePosixPath(filename.replace("\\", "/"))
+    name = path.name
+    # An empty name (``..``, ``/``, ``""``) has an empty suffix, so this one
+    # check rejects it too — there is no name to write it under either way.
+    # `.suffix` reads the final component, so it is the same on the whole path
+    # as on ``name`` — one object, not two.
+    if path.suffix.lower() not in SUPPORTED_SUFFIXES:
+        raise ValueError(
+            f"Cannot index {filename!r}: expected one of "
+            f"{', '.join(sorted(SUPPORTED_SUFFIXES))}."
+        )
+
+    # Created here so an upload can bootstrap an empty checkout, rather than
+    # failing on the one path where the app has nothing else to offer.
+    data_dir.mkdir(parents=True, exist_ok=True)
+    (data_dir / name).write_bytes(data)
+    return name
 
 
 def load_documents(data_dir: Path) -> list[Document]:

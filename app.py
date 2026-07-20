@@ -10,9 +10,16 @@ once per session rather than on every rerun.
 from __future__ import annotations
 
 import streamlit as st
+from streamlit.runtime.uploaded_file_manager import UploadedFile
 
 from rag_pipeline.config import Settings
-from rag_pipeline.ingest import index_version, reset_store_cache
+from rag_pipeline.ingest import (
+    SUPPORTED_SUFFIXES,
+    index_version,
+    ingest,
+    reset_store_cache,
+    save_upload,
+)
 from rag_pipeline.pipeline import Excerpt, RAGPipeline, source_excerpts
 
 st.set_page_config(
@@ -51,44 +58,138 @@ def load_pipeline(_settings: Settings, version: float) -> RAGPipeline:
     return RAGPipeline(_settings)
 
 
+def _add_documents(settings: Settings, uploads: list[UploadedFile]) -> None:
+    """Save uploaded files into ``data_dir``, then rebuild the index from it.
+
+    Each file is saved on its own so one rejected name does not discard the
+    rest, and the rebuild covers whatever landed rather than only a clean batch:
+    a file already written *is* a document in ``data_dir``, so omitting it here
+    would hide it until some later, unrelated ingest happened to pick it up.
+
+    Deliberately no ``st.rerun()``. The submit already triggered this run and
+    this executes above the pipeline load, so falling through re-reads
+    ``index_version()`` — which the rebuild just changed — and the cached
+    pipeline is rebuilt against the new index on this same run.
+    """
+    saved, rejected = [], []
+    for upload in uploads:
+        try:
+            saved.append(save_upload(settings.data_dir, upload.name, upload.getvalue()))
+        except (OSError, ValueError) as exc:
+            # Per file rather than per batch because OSError genuinely varies
+            # within one: a name past the filesystem's length limit fails while
+            # its neighbours write fine. ValueError (an unsupported suffix) is
+            # belt-and-braces — Streamlit re-checks the extension server-side, so
+            # `type=` above already blocks it — but save_upload is a public
+            # function and this frontend should not be the thing assuming it.
+            rejected.append(str(exc))
+
+    if saved:
+        try:
+            with st.spinner(f"Indexing {len(saved)} file(s)..."):
+                n_chunks = ingest(settings)
+        except (OSError, ValueError) as exc:
+            # The files are on disk regardless, so this reports a failed *index*
+            # rather than a failed upload — `rag ingest` retries it.
+            st.error(f"Indexing failed: {exc}", icon=":material/error:")
+        else:
+            st.success(
+                f"Indexed {n_chunks} chunks. Added: {', '.join(saved)}",
+                icon=":material/check:",
+            )
+    for message in rejected:
+        st.warning(message, icon=":material/error:")
+
+
 st.title(":material/search: RAG Pipeline")
 st.caption(
     "Ask questions about the indexed documents. Answers are grounded in "
     "retrieved context, and each one shows the passages it was generated from."
 )
 
-# Build the pipeline, turning setup errors (no index yet, missing API key) into
-# a clear on-screen message instead of a stack trace.
+# Settings are resolved on their own, ahead of the index, because the sidebar
+# below needs them and has to render even when the index does not load — an app
+# that cannot answer anything is exactly when a user reaches for the uploader
+# that fixes it. A malformed numeric env var (CHUNK_SIZE=abc) is the one setup
+# failure nothing can proceed past, so it alone stops the script here.
 try:
     cfg = Settings.from_env()
-    pipeline = load_pipeline(cfg, index_version(cfg))
-except (FileNotFoundError, RuntimeError, ValueError) as exc:
-    # FileNotFoundError: no/empty index. RuntimeError: missing API key.
-    # ValueError: a malformed numeric env var (e.g. CHUNK_SIZE=abc).
-    # One callout, not an error stacked on an info: "Then reload this page" is a
-    # continuation of the error, meaningless on its own.
-    st.error(f"{exc}\n\nThen reload this page.", icon=":material/error:")
+except ValueError as exc:
+    st.error(f"{exc}\n\nFix it, then reload this page.", icon=":material/error:")
     st.stop()
 
-settings = pipeline.settings
 with st.sidebar:
     st.header("Configuration")
     st.markdown(
         f"""
-- **Chat model:** `{settings.chat_model}`
-- **Embeddings:** `{settings.embedding_model}`
-- **Retrieved chunks (k):** `{settings.retrieval_k}`
-- **Data dir:** `{settings.data_dir.name}/`
+- **Chat model:** `{cfg.chat_model}`
+- **Embeddings:** `{cfg.embedding_model}`
+- **Retrieved chunks (k):** `{cfg.retrieval_k}`
+- **Data dir:** `{cfg.data_dir.name}/`
 """
     )
+
+    # `st.file_uploader` re-reports its files on every rerun, so re-indexing on
+    # sight would rebuild the whole corpus once per chat message. What confines
+    # the work to one run is `submitted` below, not the form: a submit button is
+    # a *trigger*, reset to False after the run it was clicked on, whereas the
+    # uploader keeps its batch attached (no clear_on_submit) and stays truthy
+    # afterwards. Measured, not assumed — a form leaves `uploads` truthy on
+    # every subsequent rerun, so a bare `st.button` would gate this identically.
+    #
+    # The form earns its place on selection, not on gating: it batches a
+    # multi-file drop into a single submit instead of a rerun per file.
+    #
+    # `type` is derived from SUPPORTED_SUFFIXES rather than restated, so a loader
+    # added for a new suffix is offered here without a second edit. It only
+    # filters the browser's file picker, which Streamlit documents as
+    # best-effort — though it also re-checks the extension server-side, so
+    # save_upload's own suffix check is the third layer rather than the second.
+    with st.form("add-documents", border=False):
+        uploads = st.file_uploader(
+            "Add documents",
+            type=sorted(SUPPORTED_SUFFIXES),
+            accept_multiple_files=True,
+            key="uploads",
+            help=(
+                "Files are saved into the data directory and the index is "
+                "rebuilt. A file with an existing name replaces it."
+            ),
+        )
+        submitted = st.form_submit_button(
+            "Add to index", icon=":material/upload:", key="add-documents-submit"
+        )
+    if submitted and uploads:
+        _add_documents(cfg, uploads)
+    elif submitted:
+        st.warning("Choose at least one file first.", icon=":material/error:")
+
     st.caption(
-        "Edit documents in `data/` and re-run `rag ingest` — the app reloads "
-        "the new index automatically."
+        "Or edit `data/` directly and run `rag ingest` — the app reloads the "
+        "new index either way."
     )
     # No st.rerun() needed: the click already triggered this run, and the sidebar
     # executes above the replay loop, so falling through renders the cleared UI.
-    if st.button("Clear conversation", icon=":material/delete:"):
+    # Keyed because a second sidebar button now exists and index order is not a
+    # stable way to name either of them.
+    if st.button("Clear conversation", icon=":material/delete:", key="clear-chat"):
         st.session_state.messages = []
+
+# Build the pipeline, turning setup errors (no index yet, missing API key) into
+# a clear on-screen message instead of a stack trace. Below the sidebar so that
+# an upload made on this run is already indexed: index_version() is read here,
+# after the rebuild bumped it, so the cached pipeline misses and reloads.
+try:
+    pipeline = load_pipeline(cfg, index_version(cfg))
+except (FileNotFoundError, RuntimeError) as exc:
+    # FileNotFoundError: no/empty index. RuntimeError: missing API key.
+    # One callout, not an error stacked on an info: "Then reload this page" is a
+    # continuation of the error, meaningless on its own. Left generic because it
+    # covers both cases and each exception already names its own remedy; the
+    # sidebar has rendered above this guard, so the uploader that resolves the
+    # missing-index case is on screen to speak for itself.
+    st.error(f"{exc}\n\nThen reload this page.", icon=":material/error:")
+    st.stop()
 
 
 def _error_reply(text: str) -> dict:

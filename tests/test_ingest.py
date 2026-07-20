@@ -137,6 +137,115 @@ def test_load_documents_skips_a_corrupt_pdf_without_aborting(tmp_path, capsys):
     assert "broken.pdf" in capsys.readouterr().err
 
 
+# --- accepting an uploaded file ----------------------------------------------
+
+
+def test_save_upload_lands_a_file_the_loader_then_reads(tmp_path):
+    """The contract that matters: what is saved must come back out of the loader.
+
+    Asserted through `load_documents` rather than against the path, because
+    `save_upload` exists to produce input for it — a file written somewhere the
+    loader does not look would satisfy every other assertion here.
+    """
+    root = tmp_path / "data"
+
+    name = ingest_mod.save_upload(root, "guide.md", b"# Guide\n\nUploaded content.\n")
+
+    assert name == "guide.md"
+    docs = ingest_mod.load_documents(root)
+    assert [d.metadata["source"] for d in docs] == ["guide.md"]
+    assert "Uploaded content." in docs[0].page_content
+
+
+def test_save_upload_creates_a_missing_data_dir(tmp_path):
+    """Bootstrapping an empty checkout is the case the uploader is most needed in."""
+    root = tmp_path / "nowhere" / "data"
+
+    ingest_mod.save_upload(root, "first.md", b"first document")
+
+    assert (root / "first.md").is_file()
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "../escape.md",
+        "../../../../etc/escape.md",
+        "/absolute/escape.md",
+        "sub/dir/escape.md",
+        "..\\..\\windows\\escape.md",
+        "C:\\Users\\evil\\escape.md",
+    ],
+)
+def test_save_upload_cannot_write_outside_data_dir(tmp_path, filename):
+    """A filename arrives from a browser, so it is input, not a fact.
+
+    Every case here must land flat inside `data_dir` rather than anywhere the
+    name asked for. The Windows spellings are listed because a POSIX server does
+    not treat a backslash as a separator: without folding them first, the whole
+    string stays one filename and the traversal is preserved verbatim.
+    """
+    root = tmp_path / "data"
+    root.mkdir()
+
+    name = ingest_mod.save_upload(root, filename, b"payload")
+
+    assert name == "escape.md", f"{filename!r} kept a directory component"
+    written = [p for p in tmp_path.rglob("*") if p.is_file()]
+    assert written == [root / "escape.md"], "a file was written outside data_dir"
+
+
+@pytest.mark.parametrize(
+    "filename", ["notes.rst", "archive.zip", "noextension", "..", ""]
+)
+def test_save_upload_rejects_what_the_loader_would_skip(tmp_path, filename):
+    """Rejected at the door rather than written and silently ignored.
+
+    `load_documents` skips an unsupported suffix, so saving one would leave a
+    file in `data_dir` that never reaches an answer and never explains why.
+    ValueError specifically: it is inside the union both frontends catch.
+    """
+    root = tmp_path / "data"
+    root.mkdir()
+
+    with pytest.raises(ValueError, match="Cannot index"):
+        ingest_mod.save_upload(root, filename, b"payload")
+
+    assert not list(root.iterdir()), "a rejected upload must leave nothing behind"
+
+
+def test_save_upload_replaces_a_file_of_the_same_name(tmp_path):
+    """Re-uploading a corrected document must update it, not duplicate it.
+
+    The alternative — uniquifying the name — would leave the stale copy indexed
+    and retrievable, so a question could still be answered from the version the
+    user just replaced.
+    """
+    root = tmp_path / "data"
+    root.mkdir()
+    ingest_mod.save_upload(root, "doc.md", b"first version")
+
+    ingest_mod.save_upload(root, "doc.md", b"second version")
+
+    assert (root / "doc.md").read_bytes() == b"second version"
+    assert len(list(root.iterdir())) == 1
+
+
+def test_save_upload_writes_bytes_unchanged(tmp_path):
+    """A PDF is binary, so the bytes must survive verbatim.
+
+    Round-tripped through the real PDF loader rather than compared as bytes: an
+    encode/decode step inserted here would corrupt the stream in a way only
+    extraction notices.
+    """
+    root = tmp_path / "data"
+
+    ingest_mod.save_upload(root, "manual.pdf", minimal_pdf(["Uploaded page text"]))
+
+    docs = ingest_mod.load_documents(root)
+    assert "Uploaded page text" in docs[0].page_content
+
+
 def test_ingest_preserves_unrelated_files_in_persist_dir(settings, fake_embeddings):
     settings.persist_dir.mkdir(parents=True, exist_ok=True)
     sentinel = settings.persist_dir / "KEEP_ME.txt"

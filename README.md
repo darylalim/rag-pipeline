@@ -63,11 +63,35 @@ with a sidebar showing the active configuration and a per-answer Sources panel
 holding the retrieved passages themselves — so a claim can be checked against
 the text it was generated from, not just against a filename.
 
+The sidebar also takes uploads, so the whole loop — add a document, index it,
+ask about it — can happen in the browser. See below.
+
 ## Add your own documents
 
-Drop `.md`, `.txt`, or `.pdf` files into `data/` (the three sample files are just
-a starter corpus — delete them if you like), then re-run `uv run rag ingest`.
-That's it; the CLI and app immediately answer against the new content.
+Two routes, same result:
+
+- **From the app** — drag `.md`/`.txt`/`.pdf` files onto **Add documents** in the
+  sidebar and click **Add to index**. They are written into `data/` and the index
+  is rebuilt on the spot; the answer to your next question already includes them,
+  with no reload and no terminal. This also works before any index exists, which
+  is how a fresh checkout can be brought up entirely from the browser. A file
+  whose name already exists in `data/` replaces it, so re-uploading a corrected
+  document updates it rather than leaving both versions retrievable.
+- **From the filesystem** — drop files into `data/` (the three sample files are
+  just a starter corpus — delete them if you like), then re-run
+  `uv run rag ingest`.
+
+Either way the CLI and the app immediately answer against the new content: they
+read the same index, and the app reloads it when its `chroma.sqlite3` mtime
+changes.
+
+Uploaded filenames are treated as untrusted input. Streamlit validates the
+extension server-side but not the path, so `save_upload()` reduces a name to its
+final component before writing: an upload cannot choose its own directory, and
+`../../.ssh/authorized_keys` lands as `authorized_keys` in `data/` or is rejected
+for its suffix. It does write through a symlink already sitting in `data/`, as
+any program would — putting one there needs the access it would grant, so that
+is not a boundary this is trying to hold.
 
 ## Configuration
 
@@ -103,11 +127,13 @@ forgets to inject a fake fails instead of quietly downloading a model. Most of
 its ~9s warm wall time is process startup and the transitive `torch` import; the
 tests themselves take ~3s. It covers configuration, the loader/splitter
 (including PDF extraction and the files it must skip), ingest idempotency, the
-source helpers, the setup guards, an ingest→retrieve round-trip, the generation
-path end-to-end (answer text plus source citations, and that retrieved context
-is injected into the prompt), and the CLI as a terminal program — its output,
-its deduplicated sources block, and the exit code each member of the caught
-exception union produces.
+source helpers, upload handling (that a saved file comes back out of the loader,
+that a name cannot escape `data_dir`, and that a same-named file is replaced
+rather than duplicated), the setup guards, an ingest→retrieve round-trip, the
+generation path end-to-end (answer text plus source citations, and that retrieved
+context is injected into the prompt), and the CLI as a terminal program — its
+output, its deduplicated sources block, and the exit code each member of the
+caught exception union produces.
 
 Coverage is measured on demand rather than in CI, and carries no threshold — a
 number to keep green invites tests that execute code without asserting anything:
@@ -127,6 +153,16 @@ one guarantee no lower-level test can see: that a chat turn is stored as a
 user/assistant *pair* whatever happens to it — success, a failed generation, or
 the run being torn down mid-answer — so a question can never be left in the
 history with nothing under it.
+
+The upload path is tested there for the same reason: what it must get right is
+only observable at the frontend. That an uploaded file becomes *answerable* on
+the same run; that the uploader is reachable when no index exists, which is the
+state it is most needed in; that a browser-supplied name cannot escape `data_dir`
+through the widget that delivers it; and that a later rerun does not silently
+re-index. That last one is counted rather than displayed: `st.file_uploader`
+re-reports its files on every rerun, so re-indexing on sight would rebuild the
+whole corpus once per chat message — correct output at absurd cost, and
+invisible in any assertion about what the app renders.
 
 Two files enforce the project's own invariants rather than its behavior.
 `tests/test_invariants.py` checks every tracked `.py` file against the rules
