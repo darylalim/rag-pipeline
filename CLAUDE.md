@@ -184,6 +184,14 @@ Adding a rule means adding a `Rule` to `RULES`, a case in each direction in
 because the README's prose had already fallen two rules behind `RULES` with the
 whole suite green. Two properties are load-bearing and easy to break:
 
+- `tests/invariants.py` must stay **standard-library only**. The hooks exec on
+  `#!/usr/bin/env python3` — the system interpreter, not the venv — so an import
+  from `rag_pipeline` pulls in `dotenv` and crashes the hook rather than checking
+  anything. It is why `settings_defaults` reads config.py's AST instead of
+  `Settings`. `uv run pytest` cannot catch a violation: under uv those imports
+  resolve. Check with
+  `/usr/bin/env python3 -c "import ast; ast.parse(open('tests/invariants.py').read())"`
+  and a hook run.
 - Rules match a **masked** copy of the text: string literals are blanked for
   every rule, comments too for all but the suppression rule. Without that, a
   comment describing a rule is blocked by the rule it describes.

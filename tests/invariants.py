@@ -11,6 +11,13 @@ Two callers, two shapes of input. :func:`violations` takes a whole file when the
 test sweeps the tree, and an Edit fragment when a hook checks what is about to
 be written; the rules are the same either way.
 
+**This module must stay standard-library only.** The hooks exec on
+``#!/usr/bin/env python3`` -- the *system* interpreter, not the project venv --
+so importing anything from ``rag_pipeline`` would pull in ``dotenv`` and friends
+and crash the hook instead of checking anything. This is why field defaults are
+read out of config.py's AST rather than off ``Settings``. Nothing in the suite
+catches a violation: pytest runs under uv, where those imports resolve fine.
+
 Not everything in CLAUDE.md belongs here. These are the rules expressible as a
 property of source *text*. Behavioral invariants — the exception union, the
 empty-collection guard, ``source`` metadata on loaders — are enforced by
@@ -176,15 +183,24 @@ def violations(relpath: str, text: str) -> list[str]:
 # --- documented-in-the-README, the shape both rules below share ---------------
 
 
-def has_table_row(readme_text: str, name: str) -> bool:
-    """Is `name` the first cell of a row in some README table?
+def has_table_row(readme_text: str, name: str, default: str | None = None) -> bool:
+    """Is `name` the first cell of a README table row, optionally stating `default`?
 
     The one thing the two documentation rules below genuinely share, so it is
     defined once. Both would otherwise carry their own copy of what counts as a
     documented row, and a change to the table style would be applied to one --
     leaving the other quietly matching nothing, which reads as success.
+
+    The backticks around `default` are required rather than tolerated: without
+    them `1000 chars` and a bare `1024` both pass as near-misses, and a cell that
+    is nearly right is the one a reader trusts.
+
+    Not anchored to a particular table, so setting names, rule names and the CI
+    job names share one namespace across the file. No collision is possible with
+    the current names, and anchoring costs more regex than the risk earns.
     """
-    return bool(re.search(rf"^\|\s*`{name}`\s*\|", readme_text, re.MULTILINE))
+    cell = rf"\s*`{re.escape(default)}`\s*\|" if default is not None else ""
+    return bool(re.search(rf"^\|\s*`{name}`\s*\|{cell}", readme_text, re.MULTILINE))
 
 
 # --- the rule documentation rule ---------------------------------------------
@@ -248,6 +264,56 @@ def settings_fields(config_source: str) -> list[str]:
     ]
 
 
+def _render_default(node: ast.expr) -> str | None:
+    """How a field's default should be spelled in the docs, or None if unknowable.
+
+    Read from the AST rather than from `Settings` itself, because this module is
+    imported by a hook that runs on the *system* interpreter -- where
+    rag_pipeline's dependencies, `dotenv` among them, are not installed.
+    Importing config.py there would crash the hook rather than check anything.
+
+    Reading the class default is also the only correct reading: `from_env()`
+    would answer to the developer's own `.env`, which is the drift
+    `config.ENV_VARS` exists to make inexpressible.
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, str | int):
+        return str(node.value)
+    # `_ROOT / "data"` is an absolute path at runtime but documented as `./data`,
+    # since an absolute one would be this machine's layout rather than a default.
+    if (
+        isinstance(node, ast.BinOp)
+        and isinstance(node.op, ast.Div)
+        and isinstance(node.left, ast.Name)
+        and node.left.id == "_ROOT"
+        and isinstance(node.right, ast.Constant)
+        and isinstance(node.right.value, str)
+    ):
+        return f"./{node.right.value}"
+    return None
+
+
+def settings_defaults(config_source: str) -> dict[str, str | None]:
+    """Each Settings field's documented default, keyed by environment variable.
+
+    A field whose default does not render (a call, a computed expression) maps
+    to None, and its value simply goes unchecked -- an unrenderable default is
+    one no documentation could state literally either.
+    """
+    try:
+        module = ast.parse(config_source)
+    except SyntaxError:
+        return {}
+    return {
+        stmt.target.id.upper(): _render_default(stmt.value)
+        for node in module.body
+        if isinstance(node, ast.ClassDef) and node.name == "Settings"
+        for stmt in node.body
+        if isinstance(stmt, ast.AnnAssign)
+        and isinstance(stmt.target, ast.Name)
+        and stmt.value is not None
+    }
+
+
 def settings_problems(root: Path) -> list[str]:
     """Report any Settings field missing from `.env.example` or the README table.
 
@@ -259,21 +325,28 @@ def settings_problems(root: Path) -> list[str]:
     if not config.is_file():
         return []
 
-    declared = settings_fields(config.read_text())
+    config_source = config.read_text()
+    declared = settings_fields(config_source)
     if not declared:
         return []
+    defaults = settings_defaults(config_source)
 
     env_text = (root / ".env.example").read_text(errors="ignore")
     readme_text = (root / "README.md").read_text(errors="ignore")
 
     problems = []
     for name in dict.fromkeys(declared):
+        default = defaults.get(name)
+        shown = f"`{default}`" if default is not None else "<default>"
         missing = []
-        # A commented default line, e.g. "# RETRIEVAL_K=4".
-        if not re.search(rf"^#\s*{name}=", env_text, re.MULTILINE):
-            missing.append(f".env.example (add `# {name}=<default>`)")
-        if not has_table_row(readme_text, name):
-            missing.append(f"README.md config table (add a row for `{name}`)")
+        # A commented default line, e.g. "# RETRIEVAL_K=4", stating the value the
+        # code actually declares -- a name alone would let `CHAT_MODEL=gpt-4` pass.
+        # The trailing group allows the explanatory comments some lines carry.
+        value = rf"{re.escape(default)}\s*(?:#|$)" if default is not None else ""
+        if not re.search(rf"^#\s*{name}={value}", env_text, re.MULTILINE):
+            missing.append(f".env.example (needs `# {name}={default or '<default>'}`)")
+        if not has_table_row(readme_text, name, default):
+            missing.append(f"README.md config table (needs a `{name}` row, {shown})")
         if missing:
             problems.append(f"  {name}: missing from " + "; ".join(missing))
     return problems

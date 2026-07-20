@@ -134,8 +134,8 @@ declared in `tests/invariants.py`:
 
 | Rule                  | Forbids                                                        | Why |
 | --------------------- | -------------------------------------------------------------- | --- |
-| `chroma-factory`      | constructing `Chroma(...)` outside `ingest.py`                   | a collection's identity is (persist dir, name, embedding function); ingest and query must open it the same way |
-| `embeddings-factory`  | constructing `HuggingFaceEmbeddings(...)` outside `ingest.py`    | the same model must embed documents and questions; in tests, inject a fake instead |
+| `chroma-factory`      | constructing `Chroma(...)` outside `ingest.py` — `tests/` exempt   | a collection's identity is (persist dir, name, embedding function); ingest and query must open it the same way |
+| `embeddings-factory`  | constructing `HuggingFaceEmbeddings(...)` outside `ingest.py`, `tests/` included | the same model must embed documents and questions; in tests, inject a fake instead |
 | `lazy-cli-imports`    | top-level `ingest`/`pipeline` imports in `cli.py`                | they pull in torch (~4.3s versus ~0.08s for `rag --help`) |
 | `no-suppressions`     | lint/type suppression comments                                   | fix the finding instead |
 | `no-rmtree`           | `rmtree` in `ingest.py`                                          | ingest is a scoped collection rebuild; the persist dir may hold unrelated data |

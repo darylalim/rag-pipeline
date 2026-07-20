@@ -20,6 +20,7 @@ from rag_pipeline.config import ENV_VARS, Settings
 from tests.invariants import (
     RULES,
     rules_problems,
+    settings_defaults,
     settings_fields,
     settings_problems,
     violations,
@@ -227,6 +228,57 @@ def test_every_setting_is_documented() -> None:
     green against a stale README.
     """
     assert settings_problems(ROOT) == []
+
+
+def test_documented_defaults_match_the_declared_ones() -> None:
+    """Every default in `Settings` renders, so none goes silently unchecked.
+
+    `settings_problems` skips a field whose default it cannot render, which is
+    right — an unrenderable default is one no document could state literally —
+    but it also means a rendering bug would quietly stop checking values while
+    still reporting the row as present.
+    """
+    declared = settings_defaults((ROOT / "rag_pipeline/config.py").read_text())
+
+    assert set(declared) == set(ENV_VARS)
+    assert all(value is not None for value in declared.values()), (
+        f"unrenderable defaults go unchecked: "
+        f"{[k for k, v in declared.items() if v is None]}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("site", "wrong"),
+    [
+        pytest.param("README.md", "| `RETRIEVAL_K` | `9` | Chunks |", id="readme"),
+        pytest.param(".env.example", "# RETRIEVAL_K=9\n", id="env-example"),
+    ],
+)
+def test_a_documented_default_that_lies_is_reported(
+    tmp_path: Path, site: str, wrong: str
+) -> None:
+    """A row naming the right variable with the wrong value must not pass.
+
+    The row-exists check would: it reads only the leading cell. A default is the
+    one thing in these tables a reader acts on directly, and it is derivable, so
+    it is checkable — unlike the prose beside it.
+    """
+    (tmp_path / "rag_pipeline").mkdir()
+    (tmp_path / "rag_pipeline" / "config.py").write_text(
+        "from dataclasses import dataclass\n\n\n"
+        "@dataclass(frozen=True)\n"
+        "class Settings:\n"
+        "    retrieval_k: int = 4\n"
+    )
+    sites = {
+        "README.md": "| `RETRIEVAL_K` | `4` | Chunks |",
+        ".env.example": "# RETRIEVAL_K=4\n",
+    }
+    sites[site] = wrong
+    for filename, text in sites.items():
+        (tmp_path / filename).write_text(text)
+
+    assert any("RETRIEVAL_K" in problem for problem in settings_problems(tmp_path))
 
 
 def test_settings_fields_matches_config_env_vars() -> None:
