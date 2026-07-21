@@ -17,8 +17,9 @@ Voyage AI), then generation (Claude).
 ## Prerequisites
 
 - [uv](https://docs.astral.sh/uv/) and Python 3.11+
-- An **Anthropic API key** (generation) and a **Voyage AI API key** (embedding).
-  Both ingest and query embed text, so both steps need the Voyage key.
+- An **Anthropic API key** (generation) and a **Voyage AI API key** (embedding
+  and reranking). Both ingest and query embed text, and query reranks on top of
+  that, so both steps need the Voyage key.
 
 ## Setup
 
@@ -40,8 +41,14 @@ use (for client-side token counting), cached under `~/.cache/huggingface`; the
 uv run rag ingest
 ```
 
-Loads every `.md`/`.txt`/`.pdf` in `data/`, splits them into overlapping chunks,
-embeds them with Voyage AI, and persists a Chroma index to `chroma_db/`.
+Loads the `.md`/`.txt`/`.pdf` files under `data/` — recursively, matching the
+extension case-insensitively — splits them into overlapping chunks, embeds them
+with Voyage AI, and persists a Chroma index to `chroma_db/`.
+
+A file it cannot use is skipped rather than aborting the run: an unreadable one
+(bad encoding, corrupt PDF, permissions) warns on stderr, and one that yields no
+text is dropped silently. The silent case is the one to know about — it includes
+a scanned, image-only PDF, whose text extraction returns empty without failing.
 
 Re-run it whenever the documents change. It is incremental: each document is
 fingerprinted, and only new, edited, or removed ones are re-embedded, so adding
@@ -114,7 +121,7 @@ Everything is set in `.env` (see `.env.example`). `ANTHROPIC_API_KEY` and
 | Variable          | Default                                    | Purpose                                  |
 | ----------------- | ------------------------------------------ | ---------------------------------------- |
 | `ANTHROPIC_API_KEY` | —                                        | Claude key (generation)                  |
-| `VOYAGE_API_KEY`  | —                                          | Voyage AI key (embedding; ingest + query) |
+| `VOYAGE_API_KEY`  | —                                          | Voyage AI key — embedding (ingest + query) and reranking (query) |
 | `CHAT_MODEL`      | `claude-haiku-4-5`                         | Generation model (e.g. `claude-opus-4-8` for higher-quality answers) |
 | `MAX_TOKENS`      | `1024`                                     | Maximum length of a generated answer     |
 | `EMBEDDING_MODEL` | `voyage-4-lite`                            | Voyage AI embedding model                |
