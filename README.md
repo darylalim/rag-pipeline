@@ -179,19 +179,22 @@ declared in `tests/invariants.py`:
 | --------------------- | -------------------------------------------------------------- | --- |
 | `chroma-factory`      | constructing `Chroma(...)` outside `ingest.py` — `tests/` exempt   | a collection's identity is (persist dir, name, embedding function); ingest and query must open it the same way |
 | `embeddings-factory`  | constructing an embedding model (`VoyageAIEmbeddings(...)`) outside `ingest.py`, `tests/` included | the same model must embed documents and questions; in tests, inject a fake instead |
-| `lazy-cli-imports`    | top-level `ingest`/`pipeline` imports in `cli.py`                | they pull in the chromadb/langchain stack (~0.9s of imports versus ~0.02s without) |
 | `no-suppressions`     | lint/type suppression comments                                   | fix the finding instead |
-| `no-rmtree`           | `rmtree` in `ingest.py`                                          | ingest is a scoped collection rebuild; the persist dir may hold unrelated data |
-| `no-sampling-params`  | setting `temperature`/`top_p` in `pipeline.py`                   | grounding comes from retrieved context, and some models reject sampling params outright |
+
+Those are the rules about how source is *written*. An invariant that can be
+observed instead is asserted where the behavior is, because that catches every
+route to the mistake rather than the spellings someone enumerated:
+
+| Invariant | Enforced by |
+| --------- | ----------- |
+| `cli.py` imports stay cheap | `test_importing_cli_does_not_load_the_heavy_stack` — imports the module in a subprocess, asserts chromadb/langchain never loaded |
+| `build_chat_model` sets no sampling params | `test_build_chat_model_sets_no_sampling_params` — reads them back off the constructed model |
+| ingest never wipes the persist dir | `test_ingest_preserves_unrelated_files_in_persist_dir` — a neighbouring file survives a rebuild |
 
 Plus the settings triad: every `Settings` field must be documented here and in
-`.env.example`. This table is itself checked — `test_every_rule_is_documented`
+`.env.example`. The rule table is itself checked — `test_every_rule_is_documented`
 fails if a rule is added without a row, the same way `test_every_setting_is_documented`
 guards the config table above.
-
-`tests/test_hooks.py` covers the two optional Claude Code hooks in `.claude/`
-that report the same problems earlier; they are a convenience for one editor,
-and deleting them changes nothing about what CI enforces.
 
 ## Linting and type checking
 

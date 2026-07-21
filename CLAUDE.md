@@ -75,8 +75,7 @@ All tunables live here — never inline a literal at a call site. Adding one is 
 
 Leaving either of the latter two stale is a bug, and nothing else in the repo
 catches it — `ruff`, `ty` and the full suite are all green against a stale
-README. `test_every_setting_is_documented` is what catches it; the
-`derived-docs` hook reports the same thing sooner.
+README. `test_every_setting_is_documented` is what catches it.
 
 There is no fourth site. `config.ENV_VARS` derives every variable name from the
 dataclass fields, and `tests/test_config.py` clears *that* rather than a
@@ -174,20 +173,11 @@ pipeline to the next.
 
 ## Enforcing the invariants
 
-The mechanically checkable rules above live in `tests/invariants.py` as data,
-and `tests/test_invariants.py` enforces them across every tracked `.py` file.
+The text-level rules live in `tests/invariants.py` as data, and
+`tests/test_invariants.py` enforces them across every tracked `.py` file.
 **That test is the enforcement** — it runs in CI, for every contributor and
 every PR from a fork, whoever wrote the code and whatever editor they used.
-
-The two hooks in `.claude/` load the same module and answer the same questions
-at write time instead of at review time. They are a latency optimization, not a
-second source of truth: delete `.claude/` and nothing stops being enforced.
-
-| Layer | Covers | When |
-| ----- | ------ | ---- |
-| `tests/test_invariants.py` | the whole tree, everyone | CI and `uv run pytest` |
-| `.claude/hooks/invariant-guard.py` (`PreToolUse` on `Edit`\|`Write`) | the text about to be written | during a Claude session |
-| `.claude/hooks/derived-docs.py` (`Stop`) | Settings documented at all three sites; every rule documented in the README rule table | end of a Claude turn |
+There is no second layer, and nothing here depends on which editor you use.
 
 Adding a rule means adding a `Rule` to `RULES`, a case in each direction in
 `test_invariants.py`, and a row in the README rule table —
@@ -195,30 +185,30 @@ Adding a rule means adding a `Rule` to `RULES`, a case in each direction in
 because the README's prose had already fallen two rules behind `RULES` with the
 whole suite green. Two properties are load-bearing and easy to break:
 
-- `tests/invariants.py` must stay **standard-library only**. The hooks exec on
-  `#!/usr/bin/env python3` — the system interpreter, not the venv — so an import
-  from `rag_pipeline` pulls in `dotenv` and crashes the hook rather than checking
-  anything. It is why `settings_defaults` reads config.py's AST instead of
-  `Settings`. `uv run pytest` cannot catch a violation: under uv those imports
-  resolve. Check with
-  `/usr/bin/env python3 -c "import ast; ast.parse(open('tests/invariants.py').read())"`
-  and a hook run.
 - Rules match a **masked** copy of the text: string literals are blanked for
   every rule, comments too for all but the suppression rule. Without that, a
   comment describing a rule is blocked by the rule it describes.
 - The masking alternation must stay **linear**. An earlier form let two branches
-  both match a backslash, and an unterminated quote — the normal case in an Edit
-  fragment — took 6.5s at 8 lines and never finished at 12. A hook that hangs
-  wedges the edit.
+  both match a backslash, and an unterminated quote took 6.5s at 8 lines and
+  never finished at 12 — the sweep hanging rather than failing.
+  `test_masking_is_linear_on_pathological_input` is the guard.
 
-Not every invariant belongs there. The exception union, the empty-collection
-guard, and `source` metadata on loaders are enforced by ordinary tests in
-`test_pipeline.py` and `test_ingest.py`, which assert what the code *does*
-rather than how it is spelled — a better layer whenever it is available.
+**Prefer a behavioral test to a rule.** A rule matches spellings; a test
+observes the property, so it covers routes nobody thought to enumerate. Reach
+for `RULES` only when there is nothing to observe — which is the case exactly
+when the point is that some call never happens (`chroma-factory`,
+`embeddings-factory`, `no-suppressions`). Everything else is asserted where the
+behavior is:
 
-Design rationale for the hooks themselves (Stop vs PostToolUse, exit 1 vs 2,
-the working-tree gate) lives in each hook's module docstring. Both are linted by
-CI like any other file: `ruff check .` does not exclude dot-directories.
+| Invariant | Enforced by |
+| --------- | ----------- |
+| the exception union, the empty-collection guard, `source` metadata on loaders | `test_pipeline.py`, `test_ingest.py` |
+| `cli.py`'s imports stay cheap | `test_importing_cli_does_not_load_the_heavy_stack` — subprocess-imports the module, asserts chromadb/langchain are absent from `sys.modules` |
+| `build_chat_model` sets no sampling params | `test_build_chat_model_sets_no_sampling_params` — reads them back off the constructed model |
+| `ingest()` never wipes the persist dir | `test_ingest_preserves_unrelated_files_in_persist_dir` — a neighbouring file survives a rebuild |
+
+The last three replaced text rules (`lazy-cli-imports`, `no-sampling-params`,
+`no-rmtree`) and are each strictly stronger than the regex they retired.
 
 ## Conventions
 

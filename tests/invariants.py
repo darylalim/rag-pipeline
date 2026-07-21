@@ -1,28 +1,29 @@
-"""The mechanically checkable invariants from CLAUDE.md.
+"""The invariants from CLAUDE.md that are properties of source *text*.
 
-Owned here rather than in ``.claude/hooks/`` because the test suite is the
-primary enforcement layer: it runs in CI, for every contributor and every PR
-from a fork, not only inside a Claude Code session. The hooks in ``.claude/``
-import this module to give the same answers earlier — at write time rather than
-at review time — which makes them a latency optimization over the tests, not a
-separate source of truth. Delete the hooks and the invariants still hold.
+``test_invariants.py`` sweeps every tracked ``.py`` file against :data:`RULES`,
+so a violation fails in CI for every contributor and every PR from a fork,
+whoever wrote the code and whatever editor they used. That sweep is the whole
+enforcement; there is no second layer.
 
-Two callers, two shapes of input. :func:`violations` takes a whole file when the
-test sweeps the tree, and an Edit fragment when a hook checks what is about to
-be written; the rules are the same either way.
+A rule belongs here only when nothing better is available. An invariant that can
+be *observed* belongs in an ordinary test instead, because asserting what the
+code does catches every route to the mistake rather than the spellings someone
+thought to enumerate. Enforced that way, and deliberately not in ``RULES``:
 
-**This module must stay standard-library only.** The hooks exec on
-``#!/usr/bin/env python3`` -- the *system* interpreter, not the project venv --
-so importing anything from ``rag_pipeline`` would pull in ``dotenv`` and friends
-and crash the hook instead of checking anything. This is why field defaults are
-read out of config.py's AST rather than off ``Settings``. Nothing in the suite
-catches a violation: pytest runs under uv, where those imports resolve fine.
+- the exception union, the empty-collection guard, and ``source`` metadata on
+  loaders (``test_pipeline.py``, ``test_ingest.py``)
+- ingest never wiping the persist directory --
+  ``test_ingest_preserves_unrelated_files_in_persist_dir`` notices a neighbouring
+  file being deleted by any means, not only a literal ``rmtree``
+- cli.py's lazy imports -- ``test_importing_cli_does_not_load_the_heavy_stack``
+  imports the module in a subprocess and asserts chromadb/langchain never
+  loaded, covering routes no list of import spellings would reach
+- ``build_chat_model`` setting no sampling params --
+  ``test_build_chat_model_sets_no_sampling_params`` reads them back off the
+  constructed model
 
-Not everything in CLAUDE.md belongs here. These are the rules expressible as a
-property of source *text*. Behavioral invariants — the exception union, the
-empty-collection guard, ``source`` metadata on loaders — are enforced by
-ordinary tests in ``test_pipeline.py`` and ``test_ingest.py``, which is a better
-layer for them: they assert what the code does rather than how it is spelled.
+What remains is the residue: rules about how source is *written*, where there is
+nothing to observe precisely because the point is that a call never happens.
 """
 
 from __future__ import annotations
@@ -49,14 +50,14 @@ class Rule(NamedTuple):
 
 # One alternation, longest opener first. Every branch is unambiguous -- `[^\\]`
 # cannot match what `\\.` matches -- which keeps this linear. An earlier
-# two-pass form used `(?:\\.|(?!\1).)*?`, whose branches BOTH match a backslash:
-# on an unterminated quote followed by backslash-heavy text that backtracks
-# exponentially, and an unterminated quote is the *normal* case in an Edit
-# fragment. Measured on the old pattern, an unterminated ''' plus 8 lines of
-# `re.compile(r"\d+\w*\s")` took 6.5s and 12 lines never finished.
+# two-pass form used `(?:\\.|(?!\1).)*?`, whose branches BOTH match a backslash
+# and so backtrack exponentially on an unterminated quote followed by
+# backslash-heavy text. Measured on the old pattern, an unterminated ''' plus 8
+# lines of `re.compile(r"\d+\w*\s")` took 6.5s and 12 lines never finished.
 #
-# Regex rather than tokenize/ast for the same reason: a fragment is usually not
-# a parseable module, so a real parser rejects the common case.
+# Regex rather than tokenize/ast because `violations` is specified over
+# fragments as well as whole files -- every rule case below is a fragment, and
+# most are not parseable modules, which a real parser would reject outright.
 STRING = re.compile(
     r'"""(?:[^\\]|\\.)*?"""'
     r"|'''(?:[^\\]|\\.)*?'''"
@@ -110,25 +111,6 @@ RULES = [
         ),
     ),
     Rule(
-        name="lazy-cli-imports",
-        applies=lambda p: p == "rag_pipeline/cli.py",
-        pattern=re.compile(
-            # `from rag_pipeline.ingest import ...` / `from .pipeline import ...`
-            r"^(?:from\s+(?:rag_pipeline\.|\.)(?:ingest|pipeline)\b"
-            # `from rag_pipeline import ingest, pipeline` / `from . import ingest`
-            r"|from\s+(?:rag_pipeline|\.)\s+import\s+[^\n]*\b(?:ingest|pipeline)\b"
-            # `import rag_pipeline.ingest`
-            r"|import\s+rag_pipeline\.(?:ingest|pipeline)\b)",
-            re.MULTILINE,
-        ),
-        scan_comments=False,
-        message=(
-            "Top-level import of ingest/pipeline in cli.py. These pull in the "
-            "chromadb/langchain stack (~0.9s of imports vs ~0.02s to import cli "
-            "alone). Keep the import inside the command function."
-        ),
-    ),
-    Rule(
         name="no-suppressions",
         applies=lambda p: p.endswith(".py"),
         # Spelled indirectly so this module does not match itself; the docstring
@@ -137,26 +119,6 @@ RULES = [
         scan_comments=True,
         message="Adding a lint/type suppression. CLAUDE.md: fix the finding instead.",
     ),
-    Rule(
-        name="no-rmtree",
-        applies=lambda p: p == "rag_pipeline/ingest.py",
-        pattern=re.compile(r"\brmtree\b"),
-        scan_comments=False,
-        message=(
-            "rmtree in ingest.py. ingest() is a scoped collection rebuild and must "
-            "never wipe the persist directory -- it may hold unrelated data."
-        ),
-    ),
-    Rule(
-        name="no-sampling-params",
-        applies=lambda p: p == "rag_pipeline/pipeline.py",
-        pattern=re.compile(r"\b(?:temperature|top_p)\s*="),
-        scan_comments=False,
-        message=(
-            "Setting temperature/top_p. build_chat_model() deliberately sets "
-            "neither -- some models (Opus 4.8) reject sampling params outright."
-        ),
-    ),
 ]
 
 
@@ -164,8 +126,8 @@ def violations(relpath: str, text: str) -> list[str]:
     """Messages for every invariant `text` breaks, as content of `relpath`.
 
     `relpath` is POSIX-style and relative to the project root. `text` may be a
-    whole file or an Edit fragment; only the text given is inspected, so a hook
-    never fires on code that was already on disk.
+    whole file, as the tree sweep passes it, or a fragment, as every rule case
+    in `test_invariants.py` does; only the text given is inspected.
     """
     applicable = [rule for rule in RULES if rule.applies(relpath)]
     if not applicable:
@@ -270,14 +232,14 @@ def settings_fields(config_source: str) -> list[str]:
 def _render_default(node: ast.expr) -> str | None:
     """How a field's default should be spelled in the docs, or None if unknowable.
 
-    Read from the AST rather than from `Settings` itself, because this module is
-    imported by a hook that runs on the *system* interpreter -- where
-    rag_pipeline's dependencies, `dotenv` among them, are not installed.
-    Importing config.py there would crash the hook rather than check anything.
+    Read from the AST rather than off `Settings`, because what the docs state is
+    the default's *source spelling*: `_ROOT / "data"` is documented as `./data`,
+    while the imported attribute is an absolute path built from this machine's
+    layout. The AST is the only place the documentable form survives.
 
-    Reading the class default is also the only correct reading: `from_env()`
-    would answer to the developer's own `.env`, which is the drift
-    `config.ENV_VARS` exists to make inexpressible.
+    Reading the class default rather than `from_env()` matters for a second
+    reason: `from_env()` would answer to the developer's own `.env`, which is the
+    drift `config.ENV_VARS` exists to make inexpressible.
     """
     if isinstance(node, ast.Constant) and isinstance(node.value, str | int):
         return str(node.value)

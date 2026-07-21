@@ -1,12 +1,13 @@
 """Enforce the CLAUDE.md invariants across the tree, in CI, for everyone.
 
-This is the primary enforcement layer. The hooks in `.claude/` answer the same
-questions earlier, but only inside a Claude Code session — a human editing in
-vim, or a PR from a fork, is covered by these tests and nothing else.
+This is the enforcement layer — there is no other. A human editing in vim, and a
+PR from a fork, are covered by these tests and nothing else.
 
-Rules are exercised in-process here rather than through the hooks, so a rule
-case costs microseconds instead of an interpreter startup. `test_hooks.py`
-covers the thin wiring that carries them.
+The rules that live in `invariants.py` are only the ones about how source is
+*written*. Their behavioral counterparts are asserted where the behavior is:
+`test_cli.py` proves cli.py's imports stay cheap, `test_pipeline.py` proves
+`build_chat_model` sets no sampling params, and `test_ingest.py` proves ingest
+leaves unrelated files in the persist dir alone.
 """
 
 from __future__ import annotations
@@ -84,19 +85,6 @@ def test_the_sweep_actually_covers_the_tree() -> None:
 # --- the rules themselves, in-process ----------------------------------------
 
 VIOLATIONS = [
-    pytest.param(
-        "rag_pipeline/cli.py", "from rag_pipeline.ingest import ingest", id="cli-dotted"
-    ),
-    pytest.param(
-        "rag_pipeline/cli.py", "from .pipeline import RAGPipeline", id="cli-relative"
-    ),
-    pytest.param(
-        "rag_pipeline/cli.py",
-        "from rag_pipeline import ingest, pipeline",
-        id="cli-bare",
-    ),
-    pytest.param("rag_pipeline/cli.py", "from . import ingest", id="cli-dot"),
-    pytest.param("rag_pipeline/cli.py", "import rag_pipeline.pipeline", id="cli-plain"),
     pytest.param("app.py", 'store = Chroma(collection_name="x")', id="inline-chroma"),
     pytest.param("app.py", "e = VoyageAIEmbeddings(model=m)", id="inline-embeddings"),
     pytest.param(
@@ -108,30 +96,9 @@ VIOLATIONS = [
     ),
     pytest.param("rag_pipeline/config.py", "import os  # noqa: F401", id="suppression"),
     pytest.param("rag_pipeline/config.py", "x = y  # ty: ignore", id="ty-ignore"),
-    pytest.param("rag_pipeline/ingest.py", "rmtree(settings.persist_dir)", id="rmtree"),
-    pytest.param(
-        "rag_pipeline/pipeline.py",
-        "ChatAnthropic(model=m, temperature=0.2)",
-        id="temperature",
-    ),
 ]
 
 ALLOWED = [
-    pytest.param(
-        "rag_pipeline/cli.py",
-        "from rag_pipeline.config import Settings",
-        id="cli-config-import-is-cheap",
-    ),
-    pytest.param(
-        "rag_pipeline/cli.py",
-        "from rag_pipeline import config  # pipeline notes",
-        id="comment-mentioning-pipeline",
-    ),
-    pytest.param(
-        "rag_pipeline/cli.py",
-        "def cmd_ingest(args):\n    from rag_pipeline.ingest import ingest\n",
-        id="lazy-import-inside-function",
-    ),
     pytest.param(
         "rag_pipeline/ingest.py",
         "return Chroma(collection_name=n)",
@@ -149,21 +116,17 @@ ALLOWED = [
         id="comment-describing-chroma-rule",
     ),
     pytest.param(
-        "rag_pipeline/pipeline.py",
-        '"""build_chat_model sets no temperature= by design."""',
-        id="docstring-describing-sampling-rule",
-    ),
-    pytest.param(
         "rag_pipeline/config.py",
         'DOC = "write # noqa and it gets rejected"',
         id="suppression-inside-a-string",
     ),
     pytest.param(
-        # Column 0 inside a triple-quoted block: the `^` anchor would match this
-        # without masking, so it is the case that proves masking does work.
-        "rag_pipeline/cli.py",
-        'HELP = """\nfrom rag_pipeline.ingest import ingest\n"""',
-        id="cli-import-inside-a-docstring",
+        # A banned construction inside a triple-quoted block, at column 0 so no
+        # indentation hides it: the case that proves multi-line string masking
+        # works, and not merely that the single-line kind above does.
+        "app.py",
+        'HELP = """\nChroma(collection_name="x")\n"""',
+        id="chroma-inside-a-docstring",
     ),
     pytest.param("README.md", "Never construct Chroma(...) inline.", id="not-python"),
 ]
@@ -183,8 +146,9 @@ def test_masking_is_linear_on_pathological_input() -> None:
     """An unterminated quote plus backslash-heavy text must not blow up.
 
     The earlier two-pass masking backtracked exponentially here: 8 such lines
-    took 6.5s and 12 never finished, which in a PreToolUse hook wedges the edit.
-    Edit fragments that open a docstring without closing it are routine.
+    took 6.5s and 12 never finished, i.e. the sweep hung rather than failed.
+    Kept as a regression guard on the alternation in `invariants.py`, which is
+    only linear as long as no two branches can match a backslash.
     """
     fragment = "'''\n" + 'x = re.compile(r"\\d+\\w*\\s")\n' * 40
     assert violations("rag_pipeline/ingest.py", fragment) == []
@@ -192,7 +156,7 @@ def test_masking_is_linear_on_pathological_input() -> None:
 
 def test_every_rule_has_a_case_in_both_directions() -> None:
     """A rule with no test is a rule that can rot unnoticed."""
-    assert len(RULES) == 6
+    assert len(RULES) == 3
     assert len({rule.name for rule in RULES}) == len(RULES)
 
 

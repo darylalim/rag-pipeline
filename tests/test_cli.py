@@ -20,6 +20,9 @@ suite's offline guarantee.
 
 from __future__ import annotations
 
+import subprocess
+import sys
+
 import pytest
 
 from rag_pipeline import cli
@@ -184,3 +187,40 @@ def test_settings_come_from_the_environment_not_a_literal(
     # even if the command ignored the environment entirely.
     assert str(elsewhere) in capsys.readouterr().out
     assert elsewhere.exists()
+
+
+# --- the cost of `rag --help` ------------------------------------------------
+
+# The heavy half of the dependency tree. cli.py reaches all of it, but only from
+# inside a command function: importing the module must not pay for a stack the
+# user may never reach, since `rag --help` and a usage error load cli.py and
+# then exit.
+HEAVY = ("chromadb", "langchain_chroma", "langchain_voyageai", "langchain_anthropic")
+
+
+def test_importing_cli_does_not_load_the_heavy_stack():
+    """`import rag_pipeline.cli` must not drag in chromadb/langchain.
+
+    The behavioral form of what used to be a text rule matching import
+    spellings in cli.py. Asserting on `sys.modules` is strictly stronger: it
+    fails for *any* route to the heavy stack -- a new module that imports it
+    eagerly, a re-export, an `importlib` call -- rather than the handful of
+    spellings a regex was able to enumerate.
+
+    In a subprocess because this suite has already imported all of it; the
+    question is what a fresh interpreter loads, which is the only place the
+    ~0.9s-vs-~0.02s difference is observable.
+    """
+    probe = (
+        "import sys, rag_pipeline.cli; "
+        f"print(','.join(m for m in {HEAVY!r} if m in sys.modules))"
+    )
+    loaded = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=True,
+    ).stdout.strip()
+
+    assert not loaded, f"importing cli.py loaded: {loaded}"

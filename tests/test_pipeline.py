@@ -15,6 +15,7 @@ import anthropic
 import httpx
 import pytest
 import voyageai
+from langchain_anthropic import ChatAnthropic
 from langchain_core.documents import Document
 from langchain_core.documents.compressor import BaseDocumentCompressor
 from langchain_core.embeddings import DeterministicFakeEmbedding, Embeddings
@@ -25,6 +26,7 @@ from langchain_core.runnables import RunnableLambda
 from rag_pipeline import ingest as ingest_mod
 from rag_pipeline.pipeline import (
     RAGPipeline,
+    build_chat_model,
     build_reranker,
     format_docs,
     source_excerpts,
@@ -314,6 +316,32 @@ def test_retrieve_reranks_and_truncates(settings, fake_embeddings, monkeypatch):
     reranked = pipeline.retrieve("apples")
 
     assert reranked == list(reversed(candidates))[: settings.retrieval_k]
+
+
+def test_build_chat_model_sets_no_sampling_params(settings, monkeypatch):
+    """Grounding comes from the retrieved context, so neither is set.
+
+    The behavioral form of what used to be a text rule forbidding `temperature=`
+    anywhere in this module. Reading them back off the constructed model is
+    stronger: it holds however they might arrive — a keyword here, a dict
+    splatted in, a default changed upstream — where matching the assignment only
+    caught the one spelling.
+
+    Left as None rather than tuned because some models reject sampling params
+    outright: Opus 4.8 errors on a request carrying either.
+    """
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-fake")
+    # The real factory, not a fake: this asserts what production builds. No
+    # socket opens — ChatAnthropic constructs its client lazily, and the key is
+    # never sent anywhere.
+    model = build_chat_model(settings)
+
+    # Narrowed before the reads, so they are type-checked rather than resolved
+    # on `BaseChatModel` at runtime — and because "production builds a
+    # ChatAnthropic" is half of what this test is for.
+    assert isinstance(model, ChatAnthropic)
+    assert model.temperature is None
+    assert model.top_p is None
 
 
 # The exception union both frontends catch (`cli.py`, `app.py`). A failure mode

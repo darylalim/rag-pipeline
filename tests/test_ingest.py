@@ -247,6 +247,14 @@ def test_save_upload_writes_bytes_unchanged(tmp_path):
 
 
 def test_ingest_preserves_unrelated_files_in_persist_dir(settings, fake_embeddings):
+    """ingest() is a scoped collection rebuild, never a directory wipe.
+
+    The sole enforcement of that invariant, and enough on its own: a text rule
+    forbidding `rmtree` in this module only ever caught one spelling, while a
+    surviving neighbour proves the property however the deletion was written --
+    `unlink` in a loop, `shutil.rmtree` aliased, a Chroma call that resets more
+    than the collection.
+    """
     settings.persist_dir.mkdir(parents=True, exist_ok=True)
     sentinel = settings.persist_dir / "KEEP_ME.txt"
     sentinel.write_text("do not delete", encoding="utf-8")
