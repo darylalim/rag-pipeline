@@ -47,7 +47,11 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+# No `addopts = "-q"`. Verbosity is a signed integer and flags sum rather than
+# override, so a baseline of -1 rebases every flag typed after it: `-q` becomes
+# -2, which prints nothing at all for a run that collected nothing (`-k` typo,
+# exit 5) — indistinguishable on screen from a pass — and `-v` only reaches 0,
+# pytest's default. Terseness is not worth a green-looking empty run.
 
 [tool.ruff.lint]
 # Beyond ruff's default (E4/E7/E9 + F): import sorting (I), 3.11+ idioms (UP),
