@@ -1,4 +1,4 @@
-# rag-pipeline
+# RAG Pipeline
 
 A small, readable **Retrieval-Augmented Generation** pipeline built with
 [LangChain](https://docs.langchain.com). Documents are embedded with **Voyage
