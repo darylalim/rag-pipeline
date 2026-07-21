@@ -11,6 +11,7 @@ from __future__ import annotations
 import socket
 
 import pytest
+from langchain_core.documents.compressor import BaseDocumentCompressor
 from langchain_core.embeddings import DeterministicFakeEmbedding
 from langchain_core.language_models import FakeListChatModel
 
@@ -47,6 +48,26 @@ def fake_embeddings() -> DeterministicFakeEmbedding:
     embedding model.
     """
     return DeterministicFakeEmbedding(size=32)
+
+
+class _SliceReranker(BaseDocumentCompressor):
+    """Offline stand-in for VoyageAIRerank: keep retrieval order, cap at top_k.
+
+    Enough to exercise the retrieve->rerank wiring and the top_k contract with no
+    network call. A test that must prove reranking *reorders* builds a reversing
+    variant of its own instead.
+    """
+
+    top_k: int
+
+    def compress_documents(self, documents, query, callbacks=None):
+        return documents[: self.top_k]
+
+
+@pytest.fixture
+def fake_reranker(settings) -> BaseDocumentCompressor:
+    """Deterministic, offline reranker (identity + truncate to retrieval_k)."""
+    return _SliceReranker(top_k=settings.retrieval_k)
 
 
 @pytest.fixture
@@ -87,7 +108,7 @@ def settings(tmp_path, sample_data_dir) -> Settings:
 
 
 @pytest.fixture
-def wired_env(settings, fake_embeddings, monkeypatch) -> Settings:
+def wired_env(settings, fake_embeddings, fake_reranker, monkeypatch) -> Settings:
     """A frontend's view of the world: fixture settings in the environment, fakes
     behind both factories.
 
@@ -114,6 +135,7 @@ def wired_env(settings, fake_embeddings, monkeypatch) -> Settings:
         "build_chat_model",
         lambda _s: FakeListChatModel(responses=[_CANNED_ANSWER]),
     )
+    monkeypatch.setattr(pipeline_mod, "build_reranker", lambda _s: fake_reranker)
     return settings
 
 

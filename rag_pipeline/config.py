@@ -44,10 +44,11 @@ def _env_str(name: str, default: str) -> str:
 def require_env_key(name: str, message: str) -> None:
     """Raise ``RuntimeError`` if an API-key variable is unset or set-but-empty.
 
-    Shared by the two provider guards — ``VOYAGE_API_KEY`` before embedding and
-    ``ANTHROPIC_API_KEY`` before generation — so they agree on the set-but-empty
-    treatment (matching the ``_env_*`` helpers) and both land in the exception
-    union the frontends catch. The caller supplies the remediation message.
+    Shared by the provider-key guards — ``VOYAGE_API_KEY`` before embedding and
+    reranking, ``ANTHROPIC_API_KEY`` before generation — so they agree on the
+    set-but-empty treatment (matching the ``_env_*`` helpers) and all land in the
+    exception union the frontends catch. The caller supplies the remediation
+    message.
     """
     if not os.getenv(name):
         raise RuntimeError(message)
@@ -79,8 +80,21 @@ class Settings:
     chunk_size: int = 1000
     chunk_overlap: int = 200
 
-    # Number of chunks retrieved per question and stuffed into the prompt.
+    # Number of chunks kept after reranking and stuffed into the prompt.
     retrieval_k: int = 4
+
+    # Candidates pulled from vector search before the reranker narrows them to
+    # retrieval_k. Wider than retrieval_k so the cross-encoder has room to rescue
+    # a relevant chunk the embedding search ranked just out of the top few.
+    fetch_k: int = 20
+
+    # Voyage AI reranker (cross-encoder). Rescores the fetch_k candidates against
+    # the question jointly, which embedding cosine similarity only approximates.
+    # rerank-2.5-lite is the latency/cost-optimized tier (same 32K context and
+    # instruction-following as rerank-2.5), matching the voyage-4-lite /
+    # claude-haiku-4-5 defaults; override via RERANK_MODEL for higher-quality
+    # ranking (e.g. rerank-2.5).
+    rerank_model: str = "rerank-2.5-lite"
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -95,6 +109,8 @@ class Settings:
             chunk_size=_env_int("CHUNK_SIZE", cls.chunk_size),
             chunk_overlap=_env_int("CHUNK_OVERLAP", cls.chunk_overlap),
             retrieval_k=_env_int("RETRIEVAL_K", cls.retrieval_k),
+            fetch_k=_env_int("FETCH_K", cls.fetch_k),
+            rerank_model=_env_str("RERANK_MODEL", cls.rerank_model),
         )
 
 

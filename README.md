@@ -7,11 +7,12 @@ library, a CLI, and a Streamlit chat app — all sharing the same code.
 
 ```
 Ingest (once):   data/ ──load──▶ split ──embed──▶ store (Chroma, on disk)
-Query (per Q):   question ──embed──▶ search ──▶ [top-k chunks + question] ──▶ Claude ──▶ grounded answer + sources
+Query (per Q):   question ──embed──▶ search ──rerank──▶ [top-k chunks + question] ──▶ Claude ──▶ grounded answer + sources
 ```
 
-At query time the vector search runs locally against the on-disk index; the two
-network calls are embedding the question (Voyage AI) and generation (Claude).
+At query time the vector search runs locally against the on-disk index; the
+network calls are embedding the question and reranking the candidates (both
+Voyage AI), then generation (Claude).
 
 ## Prerequisites
 
@@ -107,7 +108,9 @@ Everything is set in `.env` (see `.env.example`). `ANTHROPIC_API_KEY` and
 | `CHAT_MODEL`      | `claude-haiku-4-5`                         | Generation model (e.g. `claude-opus-4-8` for higher-quality answers) |
 | `MAX_TOKENS`      | `1024`                                     | Maximum length of a generated answer     |
 | `EMBEDDING_MODEL` | `voyage-4-lite`                            | Voyage AI embedding model                |
-| `RETRIEVAL_K`     | `4`                                        | Chunks retrieved per question            |
+| `RETRIEVAL_K`     | `4`                                        | Chunks kept after reranking              |
+| `FETCH_K`         | `20`                                       | Candidates retrieved before reranking    |
+| `RERANK_MODEL`    | `rerank-2.5-lite`                          | Voyage AI reranker (cross-encoder; e.g. `rerank-2.5` for higher quality) |
 | `CHUNK_SIZE`      | `1000`                                     | Characters per chunk                     |
 | `CHUNK_OVERLAP`   | `200`                                      | Overlap between adjacent chunks          |
 | `DATA_DIR`        | `./data`                                   | Source documents                         |
@@ -132,9 +135,10 @@ stack; the tests themselves take ~3s. It covers configuration, the loader/splitt
 (including PDF extraction and the files it must skip), ingest idempotency, the
 source helpers, upload handling (that a saved file comes back out of the loader,
 that a name cannot escape `data_dir`, and that a same-named file is replaced
-rather than duplicated), the setup guards, an ingest→retrieve round-trip, the
-generation path end-to-end (answer text plus source citations, and that retrieved
-context is injected into the prompt), and the CLI as a terminal program — its
+rather than duplicated), the setup guards, an ingest→retrieve round-trip (including that reranking reorders
+the candidates and caps them at `RETRIEVAL_K`), the generation path end-to-end
+(answer text plus source citations, and that retrieved context is injected into
+the prompt), and the CLI as a terminal program — its
 output, its deduplicated sources block, and the exit code each member of the
 caught exception union produces.
 
@@ -145,10 +149,10 @@ number to keep green invites tests that execute code without asserting anything:
 uv run pytest --cov=rag_pipeline --cov=app --cov-report=term-missing
 ```
 
-It currently reports 99%, and both uncovered lines are meant to be uncovered:
-`cli.py`'s `if __name__ == "__main__"` guard, and the `VoyageAIEmbeddings(...)`
-construction in `build_embeddings()` — the one line the offline suite exists to
-never execute.
+It currently reports 99%, and the uncovered lines are meant to be uncovered:
+`cli.py`'s `if __name__ == "__main__"` guard, and the `VoyageAIEmbeddings(...)` /
+`VoyageAIRerank(...)` constructions in `build_embeddings()` / `build_reranker()` —
+the lines the offline suite exists to never execute.
 
 `tests/test_app.py` drives the Streamlit app itself headlessly, through the same
 fakes, so the frontend is covered by CI rather than by hand. Its main job is the
@@ -251,6 +255,14 @@ data/                 sample documents (swap in your own)
   compare, so a single factory (`build_embeddings`) is shared by ingest and query.
 - **Persistent Chroma** writes vectors to disk once at ingest, so querying just
   reloads the index instead of re-embedding.
+- **Voyage AI reranking** (`langchain-voyageai`) sharpens retrieval: vector search
+  casts a wide net (`FETCH_K` candidates), then a cross-encoder reranker scores
+  each candidate against the question *jointly* — which embedding cosine
+  similarity only approximates — and keeps the top `RETRIEVAL_K`. It defaults to
+  `rerank-2.5-lite`, the cost/latency tier matching the `voyage-4-lite` /
+  `claude-haiku-4-5` defaults; set `RERANK_MODEL=rerank-2.5` for higher-quality
+  ranking. This is the single query-time factory that lives in `pipeline.py`
+  rather than `ingest.py`, because reranking has no ingest-side counterpart.
 - **Claude generation** (`langchain-anthropic`) is prompted to answer only from
   the retrieved context and to cite its sources, which is what turns a general
   chat model into a document-grounded question-answerer. Both frontends stream

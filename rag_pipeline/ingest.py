@@ -65,20 +65,21 @@ def open_store(settings: Settings, embeddings: Embeddings | None = None) -> Chro
 
 
 @contextmanager
-def embedding_errors_as_runtime() -> Iterator[None]:
-    """Translate embedding-time failures into the RuntimeError the frontends catch.
+def voyage_errors_as_runtime() -> Iterator[None]:
+    """Translate Voyage/Chroma failures into the RuntimeError the frontends catch.
 
-    Embedding is a Voyage AI API call and the store is chromadb; neither's
-    exception type is in the ``FileNotFoundError | RuntimeError | ValueError``
-    union both frontends handle, and neither belongs in a frontend. This is the
-    embedding half's parallel to ``_generate()``'s ``anthropic.APIError``
-    translation, wrapping both embed sites: ``ingest()`` here and
-    ``RAGPipeline.retrieve()`` in pipeline.py.
+    Wraps every Voyage AI call — embedding at ingest and query, and reranking at
+    query — plus the Chroma store ops around them. Neither voyageai's nor
+    chromadb's exception type is in the ``FileNotFoundError | RuntimeError |
+    ValueError`` union both frontends handle, and neither belongs in a frontend.
+    This is the retrieval-side parallel to ``_generate()``'s ``anthropic.APIError``
+    translation, wrapping all three sites: ``ingest()`` here and
+    ``RAGPipeline.retrieve()`` in pipeline.py (which reranks as well as embeds).
     """
     try:
         yield
     except voyageai.error.VoyageError as exc:
-        raise RuntimeError(f"Voyage embedding request failed: {exc}") from exc
+        raise RuntimeError(f"Voyage API request failed: {exc}") from exc
     except chromadb.errors.ChromaError as exc:
         # Translate any store-layer failure into the caught union. Add the
         # "rebuild your index" hint only for a dimension mismatch, keyed off the
@@ -245,7 +246,7 @@ def ingest(settings: Settings, embeddings: Embeddings | None = None) -> int:
     # add the fresh chunks. Scoped to the collection, so re-ingest never touches
     # other files in the persist directory. `include=[]` fetches only the ids,
     # not every chunk's text and metadata.
-    with embedding_errors_as_runtime():
+    with voyage_errors_as_runtime():
         existing_ids = store.get(include=[])["ids"]
         if existing_ids:
             store.delete(ids=existing_ids)

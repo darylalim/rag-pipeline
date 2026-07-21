@@ -14,14 +14,16 @@ from typing import TypedDict
 import anthropic
 from langchain_anthropic import ChatAnthropic
 from langchain_core.documents import Document
+from langchain_core.documents.compressor import BaseDocumentCompressor
 from langchain_core.embeddings import Embeddings
 from langchain_core.language_models import BaseChatModel
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import Runnable
+from langchain_voyageai import VoyageAIRerank
 
 from rag_pipeline.config import Settings, require_env_key
-from rag_pipeline.ingest import embedding_errors_as_runtime, open_store
+from rag_pipeline.ingest import open_store, voyage_errors_as_runtime
 
 # Grounding prompt: the model must answer from the retrieved context only, and
 # admit when the context does not contain the answer. This is what turns a
@@ -111,6 +113,27 @@ def build_chat_model(settings: Settings) -> BaseChatModel:
     return ChatAnthropic(model=settings.chat_model, max_tokens=settings.max_tokens)
 
 
+def build_reranker(settings: Settings) -> BaseDocumentCompressor:
+    """Construct the Voyage AI reranker.
+
+    Here, not in ingest.py: reranking is a query-only stage with no ingest-side
+    counterpart, so the shared-factory reason that keeps build_embeddings in
+    ingest.py doesn't apply — it sits beside build_chat_model, both query-time
+    model factories. ``top_k`` is the reranker's own cap, so it returns exactly
+    retrieval_k docs and ``retrieve()`` needs no manual slice.
+
+    Guards VOYAGE_API_KEY up front like build_embeddings, so a missing key fails
+    fast inside the caught union rather than as a raw validation error escaping to
+    a frontend.
+    """
+    require_env_key(
+        "VOYAGE_API_KEY",
+        "VOYAGE_API_KEY is not set. Reranking uses Voyage AI; set the key in "
+        "your environment or a .env file (see .env.example).",
+    )
+    return VoyageAIRerank(model=settings.rerank_model, top_k=settings.retrieval_k)
+
+
 class RAGPipeline:
     """Loads the persisted index and answers questions against it."""
 
@@ -119,6 +142,7 @@ class RAGPipeline:
         settings: Settings,
         embeddings: Embeddings | None = None,
         llm: Runnable | None = None,
+        reranker: BaseDocumentCompressor | None = None,
     ) -> None:
         if not settings.persist_dir.exists():
             raise FileNotFoundError(
@@ -152,24 +176,31 @@ class RAGPipeline:
                 f"'{settings.collection_name}') is empty. Run `rag ingest` first, "
                 "and check COLLECTION_NAME matches the one used to ingest."
             )
+        # Retrieve a wide candidate set (fetch_k); the reranker below narrows it
+        # to retrieval_k. `reranker` is injectable for tests alongside
+        # `embeddings`/`llm`; production leaves it None and builds the real one.
         self._retriever = vectorstore.as_retriever(
-            search_kwargs={"k": settings.retrieval_k}
+            search_kwargs={"k": settings.fetch_k}
         )
+        self._reranker = reranker or build_reranker(settings)
 
         # StrOutputParser extracts plain text whether the model returns a string
         # or structured content blocks.
         self._chain = _PROMPT | (llm or build_chat_model(settings)) | StrOutputParser()
 
     def retrieve(self, question: str) -> list[Document]:
-        """Return the chunks most relevant to the question.
+        """Return the reranked top chunks for the question.
 
-        Wrapped so an embedding failure — a Voyage provider error, or a
-        query-time dimension mismatch against a stale index — surfaces as the
-        RuntimeError both frontends catch rather than a raw voyageai/chromadb
-        exception.
+        Vector search casts a wide net (fetch_k); the Voyage reranker — a
+        cross-encoder scoring each candidate against the question jointly —
+        narrows it to retrieval_k. Both calls are wrapped so a Voyage provider
+        error (embedding *or* reranking), or a query-time dimension mismatch
+        against a stale index, surfaces as the RuntimeError both frontends catch
+        rather than a raw voyageai/chromadb exception.
         """
-        with embedding_errors_as_runtime():
-            return self._retriever.invoke(question)
+        with voyage_errors_as_runtime():
+            candidates = self._retriever.invoke(question)
+            return list(self._reranker.compress_documents(candidates, question))
 
     def _generate(self, question: str, docs: list[Document]) -> Iterator[str]:
         """Yield the grounded answer in pieces, as the model produces them.

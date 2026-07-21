@@ -59,7 +59,7 @@ Two phases with a hard boundary between them, and one shared config object:
 
 ```
 ingest (rag_pipeline/ingest.py)    load → split → embed → store (Chroma on disk)
-query  (rag_pipeline/pipeline.py)  embed question → search → stuff prompt → Claude
+query  (rag_pipeline/pipeline.py)  embed question → search → rerank → stuff prompt → Claude
 ```
 
 `Settings` (`config.py`) is a frozen dataclass built via `Settings.from_env()`.
@@ -94,6 +94,15 @@ embedding models are not comparable, and a Chroma collection's identity is
 therefore go through one factory each. **Never construct `Chroma(...)` or
 `VoyageAIEmbeddings(...)` inline** — route through these factories.
 
+The reranker is the deliberate exception: `build_reranker()` lives in
+`pipeline.py`, not here. Reranking is query-only — it has no ingest-side
+counterpart, so the "same model must serve both phases" reason that pins the
+embedding/store factories here simply does not apply. It sits beside
+`build_chat_model()`, the other query-time model factory. This is enforced by an
+ordinary behavioral test (the socket block + the injection seam), not a text
+invariant, because the risk it guards — offline testability — is one a behavioral
+test already covers.
+
 ### chromadb's per-process client cache
 
 chromadb caches one client per persist directory *within a process*. Any code
@@ -125,12 +134,14 @@ is idempotent: same input → same chunk count, no duplicate append.
 ### Dependency injection is the test seam
 
 `ingest()`, `open_store()`, and `RAGPipeline.__init__` all accept optional
-`embeddings` / `llm`. **Production always passes `None`**; the parameters exist
-so tests can inject `DeterministicFakeEmbedding` and `FakeListChatModel`. This is
-why the suite needs no network and no API key: the real `build_embeddings()`
-makes a Voyage AI HTTP call and the real LLM calls Claude, but neither runs under
-test. Any new code path touching an embedding model or the LLM should thread
-these through rather than constructing them unconditionally.
+`embeddings` / `llm` — and `RAGPipeline.__init__` also `reranker`. **Production
+always passes `None`**; the parameters exist so tests can inject
+`DeterministicFakeEmbedding`, `FakeListChatModel`, and a fake
+`BaseDocumentCompressor`. This is why the suite needs no network and no API key:
+the real `build_embeddings()`/`build_reranker()` make Voyage AI HTTP calls and the
+real LLM calls Claude, but none runs under test. Any new code path touching an
+embedding model, the reranker, or the LLM should thread these through rather than
+constructing them unconditionally.
 
 Injection is a convention, so `conftest.py` backs it with an autouse fixture that
 blocks `socket.socket`/`create_connection`. A test that simply forgets
@@ -141,8 +152,9 @@ quietly.
 
 `app.py` takes no such parameters — it is a script, not a function — so
 `test_app.py` reaches the same seam through the factories instead, patching
-`ingest.build_embeddings` and `pipeline.build_chat_model` on their modules. That
-works only because both are looked up as module globals at call time, which is a
+`ingest.build_embeddings`, `pipeline.build_chat_model`, and
+`pipeline.build_reranker` on their modules. That
+works only because all are looked up as module globals at call time, which is a
 second reason the never-construct-inline rule above is load-bearing: inline a
 `VoyageAIEmbeddings(...)` anywhere and the frontend stops being testable
 offline, not just inconsistent. `st.cache_resource` is cleared per test, since
