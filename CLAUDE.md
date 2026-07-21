@@ -183,6 +183,25 @@ offline, not just inconsistent. `st.cache_resource` is cleared per test, since
 its key deliberately ignores `_settings` and would otherwise serve one test's
 pipeline to the next.
 
+What `test_app.py` is *for* is the set of guarantees no lower-level test can see,
+because they are only observable at the frontend:
+
+- A chat turn is stored as a user/assistant **pair** whatever happens to it —
+  success, a failed generation, or the run being torn down mid-answer — so a
+  question can never be left in the history with nothing under it. This is what
+  the `finally` in `app.py` buys, and the reason a failed turn is stored with an
+  `error` flag rather than as ordinary text.
+- An uploaded file is *answerable* on the same run, and the uploader is reachable
+  when no index exists — the state it is most needed in, and the one a test that
+  starts from a built index would never enter.
+- A browser-supplied name cannot escape `data_dir` through the widget that
+  delivers it.
+- A later rerun does not silently re-index. This one is **counted, not
+  displayed**: `st.file_uploader` re-reports its files on every rerun, so
+  re-indexing on sight would rebuild the whole corpus once per chat message —
+  correct output at absurd cost, and invisible to any assertion about what the
+  app renders.
+
 ## Gotchas
 
 - `config.py` calls `load_dotenv(override=False)` at **import time**. A real

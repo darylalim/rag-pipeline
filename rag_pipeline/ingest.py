@@ -155,6 +155,11 @@ def save_upload(data_dir: Path, filename: str, data: bytes) -> str:
     any directory the uploader meant to keep, which is the safe direction to be
     wrong in and is recoverable by writing to ``data_dir`` directly.
 
+    Where that boundary stops: this does write through a symlink already sitting
+    in ``data_dir``, as any program would. Putting one there needs the access it
+    would grant, so it is not a boundary this is trying to hold — the untrusted
+    input here is the *name*, not the directory's existing contents.
+
     Bytes are written through unchanged rather than decoded and re-encoded: a
     ``.pdf`` is binary, and a mis-encoded ``.txt`` should meet the same warn-and
     -skip path in ``load_documents`` that one copied in by hand does.
