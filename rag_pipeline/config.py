@@ -41,17 +41,30 @@ def _env_str(name: str, default: str) -> str:
     return value if value else default
 
 
-def require_env_key(name: str, message: str) -> None:
+def require_env_key(name: str, used_for: str) -> None:
     """Raise ``RuntimeError`` if an API-key variable is unset or set-but-empty.
 
     Shared by the provider-key guards — ``VOYAGE_API_KEY`` before embedding and
     reranking, ``ANTHROPIC_API_KEY`` before generation — so they agree on the
     set-but-empty treatment (matching the ``_env_*`` helpers) and all land in the
-    exception union the frontends catch. The caller supplies the remediation
-    message.
+    exception union the frontends catch.
+
+    The message is built here rather than passed in, so those guards also agree
+    on what they *tell* the user. The variable named in the message is then the
+    one that was actually checked — these guards are copied from each other, and
+    a copy that updates the name but not the text sends a reader off to set the
+    wrong variable — and the remediation has one spelling to keep current when
+    ``.env.example`` or the setup instructions change. Where the key goes is a
+    fact about this module, the only one that loads ``.env``, rather than about
+    the stage that needs it. ``used_for`` is the only part that varies: a clause
+    naming that stage ("Embedding uses Voyage AI"), spliced in ahead of a
+    semicolon, so it takes no trailing punctuation.
     """
     if not os.getenv(name):
-        raise RuntimeError(message)
+        raise RuntimeError(
+            f"{name} is not set. {used_for}; set the key in your environment "
+            "or a .env file (see .env.example)."
+        )
 
 
 @dataclass(frozen=True)

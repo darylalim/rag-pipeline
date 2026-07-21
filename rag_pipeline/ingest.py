@@ -41,11 +41,7 @@ def build_embeddings(settings: Settings) -> Embeddings:
     # Fast-fail before the first API call — mirroring RAGPipeline's
     # ANTHROPIC_API_KEY guard. Unlike the old on-device model, embedding now
     # needs a key at ingest as well as query.
-    require_env_key(
-        "VOYAGE_API_KEY",
-        "VOYAGE_API_KEY is not set. Embedding uses Voyage AI; set the key in "
-        "your environment or a .env file (see .env.example).",
-    )
+    require_env_key("VOYAGE_API_KEY", "Embedding uses Voyage AI")
     return VoyageAIEmbeddings(model=settings.embedding_model)
 
 
@@ -56,12 +52,22 @@ def open_store(settings: Settings, embeddings: Embeddings | None = None) -> Chro
     match between indexing and querying, so both stages open it through this one
     factory. ``embeddings`` is injectable for tests; production leaves it None
     and builds the embedding model.
+
+    The translation is here rather than left to each caller because ``Chroma(...)``
+    creates and validates the collection eagerly: an invalid ``COLLECTION_NAME``,
+    or an index file that cannot be read, raises a ``ChromaError`` *at
+    construction* — above whatever block a caller wraps its own store ops in, and
+    so outside the union both frontends catch. Failing to establish the store's
+    identity belongs with the code that establishes it. ``build_embeddings()``'s
+    missing-key ``RuntimeError`` passes through unchanged; it is neither a Voyage
+    nor a Chroma error.
     """
-    return Chroma(
-        collection_name=settings.collection_name,
-        embedding_function=embeddings or build_embeddings(settings),
-        persist_directory=str(settings.persist_dir),
-    )
+    with voyage_errors_as_runtime():
+        return Chroma(
+            collection_name=settings.collection_name,
+            embedding_function=embeddings or build_embeddings(settings),
+            persist_directory=str(settings.persist_dir),
+        )
 
 
 @contextmanager
@@ -73,8 +79,11 @@ def voyage_errors_as_runtime() -> Iterator[None]:
     chromadb's exception type is in the ``FileNotFoundError | RuntimeError |
     ValueError`` union both frontends handle, and neither belongs in a frontend.
     This is the retrieval-side parallel to ``_generate()``'s ``anthropic.APIError``
-    translation, wrapping all three sites: ``ingest()`` here and
+    translation, covering all three Voyage calls: ``ingest()`` here and
     ``RAGPipeline.retrieve()`` in pipeline.py (which reranks as well as embeds).
+    ``open_store()`` is the third wrapping site, for the store errors that land
+    before either of those — including the bad ``COLLECTION_NAME`` the comment
+    below keys off, which is raised at construction and reachable no other way.
     """
     try:
         yield

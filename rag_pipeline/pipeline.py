@@ -1,4 +1,4 @@
-"""Query phase: embed question -> search -> generate a grounded answer.
+"""Query phase: embed question -> search -> rerank -> generate a grounded answer.
 
 ``RAGPipeline`` loads the persisted Chroma index and a Claude chat model once,
 then answers questions against it. Both the CLI and the Streamlit app build a
@@ -126,11 +126,7 @@ def build_reranker(settings: Settings) -> BaseDocumentCompressor:
     fast inside the caught union rather than as a raw validation error escaping to
     a frontend.
     """
-    require_env_key(
-        "VOYAGE_API_KEY",
-        "VOYAGE_API_KEY is not set. Reranking uses Voyage AI; set the key in "
-        "your environment or a .env file (see .env.example).",
-    )
+    require_env_key("VOYAGE_API_KEY", "Reranking uses Voyage AI")
     return VoyageAIRerank(model=settings.rerank_model, top_k=settings.retrieval_k)
 
 
@@ -153,11 +149,7 @@ class RAGPipeline:
         # only when we're going to build the real Claude client (an injected
         # `llm`, as in tests, needs no key).
         if llm is None:
-            require_env_key(
-                "ANTHROPIC_API_KEY",
-                "ANTHROPIC_API_KEY is not set. Generation uses Claude; set the "
-                "key in your environment or a .env file (see .env.example).",
-            )
+            require_env_key("ANTHROPIC_API_KEY", "Generation uses Claude")
 
         self.settings = settings
 
