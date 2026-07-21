@@ -41,10 +41,18 @@ uv run rag ingest
 ```
 
 Loads every `.md`/`.txt`/`.pdf` in `data/`, splits them into overlapping chunks,
-embeds them with Voyage AI, and persists a Chroma index to `chroma_db/`. Re-run this
-whenever the documents change — it clears this collection's existing vectors and
-re-adds fresh chunks, so no duplicates, and nothing else in `chroma_db/` is
-touched.
+embeds them with Voyage AI, and persists a Chroma index to `chroma_db/`.
+
+Re-run it whenever the documents change. It is incremental: each document is
+fingerprinted, and only new, edited, or removed ones are re-embedded, so adding
+one file to a large corpus costs one file rather than the corpus — embedding is
+a billed API call. Afterwards the index holds exactly what is in `data/`, so
+deletions and edits are picked up too, there are never duplicates, and nothing
+else in `chroma_db/` is touched. Re-running with nothing changed makes no
+embedding calls at all.
+
+Changing `EMBEDDING_MODEL`, `CHUNK_SIZE` or `CHUNK_OVERLAP` re-embeds
+everything, since all three change what the stored vectors represent.
 
 ### 2. Ask questions from the terminal
 
@@ -75,11 +83,13 @@ Two routes, same result:
 
 - **From the app** — drag `.md`/`.txt`/`.pdf` files onto **Add documents** in the
   sidebar and click **Add to index**. They are written into `data/` and the index
-  is rebuilt on the spot; the answer to your next question already includes them,
-  with no reload and no terminal. This also works before any index exists, which
-  is how a fresh checkout can be brought up entirely from the browser. A file
-  whose name already exists in `data/` replaces it, so re-uploading a corrected
-  document updates it rather than leaving both versions retrievable.
+  is refreshed on the spot — only the new files are embedded, the rest of the
+  corpus keeps the vectors it has — and the answer to your next question already
+  includes them, with no reload and no terminal. This also works before any index
+  exists, which is how a fresh checkout can be brought up entirely from the
+  browser. A file whose name already exists in `data/` replaces it, so
+  re-uploading a corrected document updates it rather than leaving both versions
+  retrievable.
 - **From the filesystem** — drop files into `data/` (the three sample files are
   just a starter corpus — delete them if you like), then re-run
   `uv run rag ingest`.

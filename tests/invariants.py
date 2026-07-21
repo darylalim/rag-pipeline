@@ -208,28 +208,7 @@ def rules_problems(root: Path) -> list[str]:
 SETTINGS_SITES = (".env.example", "README.md")
 
 
-def settings_fields(config_source: str) -> list[str]:
-    """Environment variable names declared by the Settings dataclass.
-
-    Parsed rather than regexed: this is the one place where missing a field
-    means silently not enforcing it, and `ast` cannot be fooled by a field
-    mentioned in a docstring. A field's variable is its name uppercased, which
-    is also how `config.ENV_VARS` derives them — one convention, not two lists.
-    """
-    try:
-        module = ast.parse(config_source)
-    except SyntaxError:
-        return []  # mid-edit; the next check sees a parseable file
-    return [
-        stmt.target.id.upper()
-        for node in module.body
-        if isinstance(node, ast.ClassDef) and node.name == "Settings"
-        for stmt in node.body
-        if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name)
-    ]
-
-
-def _render_default(node: ast.expr) -> str | None:
+def _render_default(node: ast.expr | None) -> str | None:
     """How a field's default should be spelled in the docs, or None if unknowable.
 
     Read from the AST rather than off `Settings`, because what the docs state is
@@ -240,6 +219,10 @@ def _render_default(node: ast.expr) -> str | None:
     Reading the class default rather than `from_env()` matters for a second
     reason: `from_env()` would answer to the developer's own `.env`, which is the
     drift `config.ENV_VARS` exists to make inexpressible.
+
+    A field with no default at all (`node is None`) is unknowable in the same
+    way, and lands in the same branch: its documentation is still required, only
+    its value is not checkable.
     """
     if isinstance(node, ast.Constant) and isinstance(node.value, str | int):
         return str(node.value)
@@ -258,24 +241,34 @@ def _render_default(node: ast.expr) -> str | None:
 
 
 def settings_defaults(config_source: str) -> dict[str, str | None]:
-    """Each Settings field's documented default, keyed by environment variable.
+    """Every Settings field's documented default, keyed by environment variable.
 
-    A field whose default does not render (a call, a computed expression) maps
-    to None, and its value simply goes unchecked -- an unrenderable default is
-    one no documentation could state literally either.
+    The single extraction: the keys are the set of fields that must be
+    documented, and the values are what their rows must say. Splitting the two
+    apart -- one pass for names, another for defaults -- would let a field be
+    checked for presence but not for value, or the reverse, depending on which
+    pass its shape happened to survive.
+
+    Parsed rather than regexed: this is the one place where missing a field
+    means silently not enforcing it, and `ast` cannot be fooled by a field
+    mentioned in a docstring. A field's variable is its name uppercased, which
+    is also how `config.ENV_VARS` derives them -- one convention, not two lists.
+
+    A field whose default does not render -- a call, a computed expression, or
+    no default at all -- maps to None, and its value simply goes unchecked. Its
+    documentation is still required; an unrenderable default is one no
+    documentation could state literally either.
     """
     try:
         module = ast.parse(config_source)
     except SyntaxError:
-        return {}
+        return {}  # mid-edit; the next check sees a parseable file
     return {
         stmt.target.id.upper(): _render_default(stmt.value)
         for node in module.body
         if isinstance(node, ast.ClassDef) and node.name == "Settings"
         for stmt in node.body
-        if isinstance(stmt, ast.AnnAssign)
-        and isinstance(stmt.target, ast.Name)
-        and stmt.value is not None
+        if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name)
     }
 
 
@@ -290,18 +283,15 @@ def settings_problems(root: Path) -> list[str]:
     if not config.is_file():
         return []
 
-    config_source = config.read_text()
-    declared = settings_fields(config_source)
-    if not declared:
+    defaults = settings_defaults(config.read_text())
+    if not defaults:
         return []
-    defaults = settings_defaults(config_source)
 
     env_text = (root / ".env.example").read_text(errors="ignore")
     readme_text = (root / "README.md").read_text(errors="ignore")
 
     problems = []
-    for name in dict.fromkeys(declared):
-        default = defaults.get(name)
+    for name, default in defaults.items():
         shown = f"`{default}`" if default is not None else "<default>"
         missing = []
         # A commented default line, e.g. "# RETRIEVAL_K=4", stating the value the

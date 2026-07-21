@@ -22,7 +22,6 @@ from tests.invariants import (
     RULES,
     rules_problems,
     settings_defaults,
-    settings_fields,
     settings_problems,
     violations,
 )
@@ -244,15 +243,17 @@ def test_a_documented_default_that_lies_is_reported(
     assert any("RETRIEVAL_K" in problem for problem in settings_problems(tmp_path))
 
 
-def test_settings_fields_matches_config_env_vars() -> None:
+def test_settings_extraction_matches_config_env_vars() -> None:
     """The text-level extraction agrees with the imported dataclass.
 
-    These are two different mechanisms — ast parsing for the hook, `fields()`
-    for the tests — and they must not drift.
+    Two mechanisms — `settings_defaults` parses config.py's AST, `ENV_VARS`
+    reads `fields(Settings)` — and only the first decides what gets documented.
+    A field the AST pass failed to see would go unchecked at both sites while
+    every other test stayed green, so the disagreement is asserted directly.
     """
-    assert tuple(settings_fields((ROOT / "rag_pipeline/config.py").read_text())) == (
-        ENV_VARS
-    )
+    declared = settings_defaults((ROOT / "rag_pipeline/config.py").read_text())
+
+    assert tuple(declared) == ENV_VARS
 
 
 @pytest.mark.parametrize("var", ENV_VARS)

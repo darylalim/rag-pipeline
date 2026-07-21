@@ -499,9 +499,19 @@ def _fail_ingest_dimension_change(
     # A collection keeps its dimensionality after its ids are deleted, so a
     # re-ingest with a different-sized model — as an EMBEDDING_MODEL change would
     # give — hits chromadb's dimension check on add.
+    #
+    # EMBEDDING_MODEL moves with the injected fake, and must: ingest() re-embeds
+    # only what its fingerprint says is stale, and the model name is part of that
+    # fingerprint. A different-sized model injected under the *same* name is a
+    # state production cannot reach — the name is the only way to ask for a
+    # different model — so pinning it here would test a mismatch nothing can
+    # produce, and let the real one through unembedded.
     ingest_mod.ingest(settings, embeddings=DeterministicFakeEmbedding(size=8))
     ingest_mod.reset_store_cache()
-    ingest_mod.ingest(settings, embeddings=DeterministicFakeEmbedding(size=16))
+    ingest_mod.ingest(
+        dataclasses.replace(settings, embedding_model="voyage-4"),
+        embeddings=DeterministicFakeEmbedding(size=16),
+    )
 
 
 def _fail_retrieve_on_voyage_error(

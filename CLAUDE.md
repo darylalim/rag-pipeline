@@ -123,12 +123,35 @@ The Streamlit cache key is `index_version()` — the mtime of `chroma.sqlite3`,
 which chromadb bumps on every write. That's how the running app picks up a
 `rag ingest` without a restart.
 
-### Ingest is a scoped rebuild, not a directory wipe
+### Ingest is incremental, and scoped — never a directory wipe
 
-`ingest()` deletes only the current collection's ids, then adds fresh chunks.
+`ingest()` leaves the collection holding exactly the chunks for whatever is in
+`data_dir` right now. It gets there by re-embedding only what changed: each
+document carries a `content_hash` in its metadata, and a source whose hash still
+matches keeps the vectors it has.
+
+**The state after the run is the contract, not the work skipped.** Every caller
+depends on it — the app rebuilds after an upload and expects the rest of the
+corpus to still be answerable, and a file edited by hand between runs is picked
+up without being announced. Two consequences that are easy to get wrong:
+
+- Deletions are computed over the *indexed* sources, not the fresh ones. A file
+  that is gone from `data_dir` has no fresh chunk to compare against, so an
+  add-only pass would leave its vectors retrievable forever.
+- `_fingerprint()` covers `EMBEDDING_MODEL`, `CHUNK_SIZE` and `CHUNK_OVERLAP`
+  as well as the text, because all three change what the stored vectors *are*.
+  Dropping the model from it is the dangerous one: the chunks still look
+  current, so the skip is silent and every later query compares against vectors
+  from a model that is no longer configured.
+
 It must never `rmtree` the persist directory — that dir may hold unrelated data
-(`test_ingest_preserves_unrelated_files_in_persist_dir` guards this). Re-ingest
-is idempotent: same input → same chunk count, no duplicate append.
+(`test_ingest_preserves_unrelated_files_in_persist_dir` guards this, and is now
+the only thing that does). Re-ingest is idempotent: same input → same chunk
+count, no duplicate append, and no embedding calls at all.
+
+`ingest()` returns the number of chunks the index *holds*, not the number
+re-embedded. That is what keeps re-ingesting the same corpus reporting the same
+number, and what both frontends' "Indexed N chunks" means.
 
 ### Dependency injection is the test seam
 

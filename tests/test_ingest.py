@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import dataclasses
 import io
 from pathlib import Path
 
 import pytest
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings
 from pypdf import PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
@@ -303,6 +305,131 @@ def test_ingest_is_idempotent(settings, fake_embeddings):
         persist_directory=str(settings.persist_dir),
     )
     assert len(store.get()["ids"]) == n2
+
+
+# --- incremental re-indexing -------------------------------------------------
+
+
+class _CountingEmbeddings(Embeddings):
+    """Records the texts it was asked to embed, so a *skipped* file is visible.
+
+    The whole point of the incremental path is a call that does not happen, and
+    a chunk count cannot see that: the index holds the same vectors either way,
+    whether they were just re-embedded or left alone. Only the embedder knows.
+    """
+
+    def __init__(self, inner: Embeddings) -> None:
+        self.inner = inner
+        self.embedded: list[str] = []
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        self.embedded.extend(texts)
+        return self.inner.embed_documents(texts)
+
+    def embed_query(self, text: str) -> list[float]:
+        return self.inner.embed_query(text)
+
+
+@pytest.fixture
+def counting_embeddings(fake_embeddings):
+    return _CountingEmbeddings(fake_embeddings)
+
+
+def sources_in(settings, embeddings) -> set[str]:
+    """Every `source` the persisted collection currently holds chunks for."""
+    ingest_mod.reset_store_cache()
+    store = ingest_mod.open_store(settings, embeddings)
+    return {meta["source"] for meta in store.get(include=["metadatas"])["metadatas"]}
+
+
+def test_reingest_embeds_nothing_when_no_document_changed(
+    settings, counting_embeddings
+):
+    """The saving that justifies the fingerprint at all.
+
+    Embedding is a billed Voyage call, so re-ingesting an unchanged corpus must
+    cost nothing. Asserted on the embedder rather than the returned count, which
+    is deliberately the same both times.
+    """
+    ingest_mod.ingest(settings, embeddings=counting_embeddings)
+    assert counting_embeddings.embedded, "the first ingest must embed everything"
+
+    counting_embeddings.embedded.clear()
+    ingest_mod.reset_store_cache()
+    ingest_mod.ingest(settings, embeddings=counting_embeddings)
+
+    assert counting_embeddings.embedded == []
+
+
+def test_only_the_edited_document_is_re_embedded(settings, counting_embeddings):
+    """A one-file edit costs one file, not the corpus."""
+    ingest_mod.ingest(settings, embeddings=counting_embeddings)
+    counting_embeddings.embedded.clear()
+
+    (settings.data_dir / "a.md").write_text("# Alpha\nrewritten.\n", encoding="utf-8")
+    ingest_mod.reset_store_cache()
+    ingest_mod.ingest(settings, embeddings=counting_embeddings)
+
+    assert counting_embeddings.embedded, "the edited file must be re-embedded"
+    # b.txt's text is untouched, so none of it may appear in what was embedded.
+    b_text = (settings.data_dir / "sub" / "b.txt").read_text(encoding="utf-8")
+    assert not any(b_text.strip() in text for text in counting_embeddings.embedded)
+
+
+def test_a_new_document_joins_the_existing_index(settings, counting_embeddings):
+    """Adding a file must not cost, or disturb, the documents already indexed.
+
+    This is the case a naive "index only what was just uploaded" would get
+    wrong in the other direction — it is asserted from both ends, that the new
+    file is present *and* that the old ones survived, because an implementation
+    that rebuilt from the upload alone would still pass the first half.
+    """
+    ingest_mod.ingest(settings, embeddings=counting_embeddings)
+    before = sources_in(settings, counting_embeddings)
+    counting_embeddings.embedded.clear()
+
+    (settings.data_dir / "c.md").write_text("# Gamma\nbrand new.\n", encoding="utf-8")
+    ingest_mod.reset_store_cache()
+    ingest_mod.ingest(settings, embeddings=counting_embeddings)
+
+    assert sources_in(settings, counting_embeddings) == before | {"c.md"}
+    assert all("brand new" in text for text in counting_embeddings.embedded)
+
+
+def test_a_removed_document_loses_its_chunks(settings, fake_embeddings):
+    """The index tracks `data_dir`, so a deleted file must not answer questions.
+
+    The half of "only embed what changed" that is easy to skip: a file that is
+    gone has no fresh chunks to add, so nothing about the add path would ever
+    notice it. Its vectors would linger and stay retrievable.
+    """
+    ingest_mod.ingest(settings, embeddings=fake_embeddings)
+    assert "a.md" in sources_in(settings, fake_embeddings)
+
+    (settings.data_dir / "a.md").unlink()
+    ingest_mod.reset_store_cache()
+    ingest_mod.ingest(settings, embeddings=fake_embeddings)
+
+    assert "a.md" not in sources_in(settings, fake_embeddings)
+
+
+def test_changing_the_chunking_re_embeds_everything(settings, counting_embeddings):
+    """Chunk boundaries are part of what the stored vectors represent.
+
+    Content-only fingerprinting would leave every existing chunk in place under
+    a new CHUNK_SIZE, so the index would keep vectors the current settings could
+    not have produced — stale in a way no file inspection would reveal.
+    """
+    ingest_mod.ingest(settings, embeddings=counting_embeddings)
+    counting_embeddings.embedded.clear()
+
+    ingest_mod.reset_store_cache()
+    ingest_mod.ingest(
+        dataclasses.replace(settings, chunk_size=80, chunk_overlap=10),
+        embeddings=counting_embeddings,
+    )
+
+    assert counting_embeddings.embedded != []
 
 
 def test_every_source_is_a_relative_posix_path_that_resolves_under_data_dir(tmp_path):

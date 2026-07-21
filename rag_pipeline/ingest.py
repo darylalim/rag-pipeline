@@ -7,7 +7,9 @@ Chroma index from disk.
 
 from __future__ import annotations
 
+import hashlib
 import sys
+from collections import defaultdict
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
@@ -232,14 +234,53 @@ def split_documents(documents: list[Document], settings: Settings) -> list[Docum
     return splitter.split_documents(documents)
 
 
-def ingest(settings: Settings, embeddings: Embeddings | None = None) -> int:
-    """Run the full indexing phase and persist the vector store.
+def _fingerprint(text: str, settings: Settings) -> str:
+    """What must be unchanged for a document's existing chunks to still be valid.
 
-    Only this collection's existing vectors are cleared before the fresh chunks
-    are added, so re-ingesting is idempotent (no duplicate chunks) *without*
-    deleting the persist directory — which may hold unrelated data. Returns the
-    number of chunks indexed. ``embeddings`` is injectable so tests can
-    substitute a lightweight fake; production callers leave it as None.
+    The extracted text, and every setting the stored vectors depend on: the
+    splitter's, because the same file under a new ``CHUNK_SIZE`` is cut into
+    different chunks, and ``EMBEDDING_MODEL``, because a vector means nothing
+    except with respect to the model that produced it. Content alone would let a
+    re-ingest keep vectors the current settings would never have produced — and
+    a changed model is the dangerous half: the chunks still *look* current, so
+    the skip is silent and every later query compares against vectors from a
+    model that is no longer configured.
+
+    Hashed rather than compared against mtime or size. mtime moves when nothing
+    changed (a checkout, a copy, `touch`) and stands still when something did (a
+    write that preserves it), and either error is silent — one re-embeds the
+    corpus for nothing, the other serves answers from a file's previous
+    contents. This reads the bytes we already read.
+    """
+    payload = (
+        f"{settings.embedding_model}:{settings.chunk_size}:"
+        f"{settings.chunk_overlap}:{text}"
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def ingest(settings: Settings, embeddings: Embeddings | None = None) -> int:
+    """Bring the index in line with ``data_dir``, embedding only what changed.
+
+    Afterwards the collection holds exactly the chunks for the documents
+    currently in ``data_dir`` — nothing stale, nothing missing — which is the
+    property every caller depends on: the app rebuilds after an upload and
+    expects the sample corpus to still be answerable, and a file edited by hand
+    between runs must be picked up without being announced.
+
+    Reaching that state costs one embedding call per *changed* document rather
+    than per document. Embedding is a paid, rate-limited Voyage API call, so a
+    corpus that is re-ingested whenever one file is added would otherwise charge
+    for the whole of it every time. Unchanged documents keep the vectors they
+    already have; changed and removed ones have their chunks dropped first, so a
+    file's old text can never outlive it in the index.
+
+    Scoped to this collection's own ids throughout — the persist directory may
+    hold unrelated data and is never deleted. Returns the number of chunks the
+    index now holds, not the number re-embedded: it describes the index, which
+    is what makes re-ingesting the same corpus report the same number.
+    ``embeddings`` is injectable so tests can substitute a lightweight fake;
+    production callers leave it as None.
     """
     documents = load_documents(settings.data_dir)
     if not documents:
@@ -248,16 +289,48 @@ def ingest(settings: Settings, embeddings: Embeddings | None = None) -> int:
             f"(looked for {', '.join(sorted(SUPPORTED_SUFFIXES))})."
         )
 
+    for document in documents:
+        document.metadata["content_hash"] = _fingerprint(
+            document.page_content, settings
+        )
+    # Chunks inherit their parent's metadata, so each carries the source's
+    # fingerprint and the comparison below needs no second pass over the files.
     chunks = split_documents(documents, settings)
+    fresh = {doc.metadata["source"]: doc.metadata["content_hash"] for doc in documents}
 
     store = open_store(settings, embeddings)
-    # Rebuild this collection in place: drop its existing vectors (if any), then
-    # add the fresh chunks. Scoped to the collection, so re-ingest never touches
-    # other files in the persist directory. `include=[]` fetches only the ids,
-    # not every chunk's text and metadata.
     with voyage_errors_as_runtime():
-        existing_ids = store.get(include=[])["ids"]
-        if existing_ids:
-            store.delete(ids=existing_ids)
-        store.add_documents(chunks)
+        # Metadata, not ids alone: the fingerprints are what decide the work.
+        # Documents are still whole here, so one chunk per source answers for it.
+        stored = store.get(include=["metadatas"])
+        ids_by_source: dict[str, list[str]] = defaultdict(list)
+        indexed: dict[str, str | None] = {}
+        for chunk_id, metadata in zip(stored["ids"], stored["metadatas"], strict=True):
+            source = str(metadata.get("source", "unknown"))
+            ids_by_source[source].append(chunk_id)
+            # `.get`, because an index built before fingerprints existed has no
+            # such key -- it reads as changed and is re-embedded once.
+            fingerprint = metadata.get("content_hash")
+            indexed[source] = str(fingerprint) if fingerprint is not None else None
+
+        # Deleted first, and computed over the *indexed* sources, so a source
+        # that is gone from data_dir is dropped rather than merely not refreshed.
+        superseded = [
+            chunk_id
+            for source, fingerprint in indexed.items()
+            if fresh.get(source) != fingerprint
+            for chunk_id in ids_by_source[source]
+        ]
+        if superseded:
+            store.delete(ids=superseded)
+
+        changed = {
+            source
+            for source, fingerprint in fresh.items()
+            if indexed.get(source) != fingerprint
+        }
+        if changed:
+            store.add_documents(
+                [chunk for chunk in chunks if chunk.metadata["source"] in changed]
+            )
     return len(chunks)
