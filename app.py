@@ -35,26 +35,25 @@ st.session_state.setdefault("messages", [])
 # Bounded because `version` is a deliberately changing key: every rebuild mints
 # a new entry, and cache_resource never evicts on its own, so unbounded each
 # `rag ingest` against a running server strands another embedding model and
-# Chroma client for the life of the process.
+# Mongo client for the life of the process.
 #
-# Two entries rather than one. The cache is process-wide, not per-session, and
-# during an ingest two browser sessions can read `chroma.sqlite3` at different
-# moments and derive different mtimes. At size one those keys evict each other
-# on every rerun, reloading the embedding model each time; the second slot lets
-# the outgoing and incoming versions coexist until the writes settle.
+# Two entries rather than one. The digest is a single server-authoritative
+# value, so the two-sessions-derive-different-keys race the mtime had is gone;
+# the second slot now just cushions reload churn, letting the outgoing and
+# incoming versions coexist for a rerun rather than evicting each other.
 @st.cache_resource(max_entries=2, show_spinner="Loading index and embedding model...")
-def load_pipeline(_settings: Settings, version: float) -> RAGPipeline:
-    """Build the pipeline, cached until the on-disk index changes.
+def load_pipeline(_settings: Settings, version: str) -> RAGPipeline:
+    """Build the pipeline, cached until the indexed corpus changes.
 
-    `version` (the index's fingerprint) is the cache key: it changes when
-    `rag ingest` rebuilds the store, busting this cache. `_settings` is passed
+    `version` (the corpus fingerprint digest) is the cache key: it changes when
+    `rag ingest` re-embeds the store, busting this cache. `_settings` is passed
     in — the leading underscore tells Streamlit not to hash it — so we don't
-    re-read the environment here. On a rebuild we clear chromadb's client cache
-    first, or the fresh pipeline would reuse a stale cached client instead of
-    reading the new index from disk.
+    re-read the environment here. On a rebuild we drop the pooled Mongo client
+    first, so the fresh pipeline reconnects rather than reusing a client from a
+    torn-down run.
     """
     del version  # used only as the cache key; not needed in the body
-    reset_store_cache()
+    reset_store_cache()  # drop the pooled client so this pipeline reconnects fresh
     return RAGPipeline(_settings)
 
 

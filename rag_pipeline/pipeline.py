@@ -1,8 +1,8 @@
 """Query phase: embed question -> search -> rerank -> generate a grounded answer.
 
-``RAGPipeline`` loads the persisted Chroma index and a Claude chat model once,
-then answers questions against it. Both the CLI and the Streamlit app build a
-single pipeline and reuse it across queries.
+``RAGPipeline`` opens the Atlas Vector Search collection and a Claude chat model
+once, then answers questions against it. Both the CLI and the Streamlit app build
+a single pipeline and reuse it across queries.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from langchain_core.runnables import Runnable
 from langchain_voyageai import VoyageAIRerank
 
 from rag_pipeline.config import Settings, require_env_key
-from rag_pipeline.ingest import open_store, voyage_errors_as_runtime
+from rag_pipeline.ingest import open_store, provider_errors_as_runtime
 
 # Grounding prompt: the model must answer from the retrieved context only, and
 # admit when the context does not contain the answer. This is what turns a
@@ -140,11 +140,6 @@ class RAGPipeline:
         llm: Runnable | None = None,
         reranker: BaseDocumentCompressor | None = None,
     ) -> None:
-        if not settings.persist_dir.exists():
-            raise FileNotFoundError(
-                f"No index found at {settings.persist_dir}. "
-                "Run `rag ingest` (or `uv run rag ingest`) first."
-            )
         # Fast-fail on a missing key *before* loading the embedding model — but
         # only when we're going to build the real Claude client (an injected
         # `llm`, as in tests, needs no key).
@@ -153,26 +148,51 @@ class RAGPipeline:
 
         self.settings = settings
 
-        # Reload the existing store via the shared factory, so the same
+        # Reopen the existing store via the shared factory, so the same
         # embedding model that indexed the documents also embeds queries.
         # `embeddings` and `llm` are injectable for tests; production leaves
-        # both as None and gets the embedding model + ChatAnthropic.
+        # both as None and gets the embedding model + ChatAnthropic. Opening
+        # the store pings the cluster, so an unreachable/paused one fails here.
         vectorstore = open_store(settings, embeddings)
-        # `persist_dir.exists()` alone is too weak: an empty directory or a
-        # COLLECTION_NAME that doesn't match what was ingested yields a
-        # silently-empty collection (get_or_create), so every question would be
-        # answered "I don't know". Fail loudly instead.
-        if not vectorstore.get(limit=1)["ids"]:
+        collection = vectorstore.collection
+        with provider_errors_as_runtime():
+            index_info = list(
+                collection.list_search_indexes(settings.vector_index_name)
+            )
+            has_documents = collection.count_documents(
+                {"content_hash": {"$exists": True}}, limit=1
+            )
+
+        # Two distinct failures, checked in order. A full collection with no
+        # (or a not-yet-built) vector index answers every question "I don't know"
+        # off zero rows — and the empty-collection guard below would not catch
+        # it, because the documents are there. Unlike Chroma, Atlas builds no
+        # index implicitly on write, so this is the query-side half of what
+        # `rag ingest` promises.
+        if not index_info or not index_info[0].get("queryable"):
             raise FileNotFoundError(
-                f"Index at {settings.persist_dir} (collection "
-                f"'{settings.collection_name}') is empty. Run `rag ingest` first, "
-                "and check COLLECTION_NAME matches the one used to ingest."
+                f"No queryable vector index '{settings.vector_index_name}' on "
+                f"{settings.mongodb_db}.{settings.collection_name}. Run `rag ingest` "
+                "first (index builds are asynchronous)."
+            )
+        # An empty (or wrong) namespace yields a silently-empty result set —
+        # Mongo creates a namespace implicitly on first write and returns zero
+        # documents, with no error, for one that was never ingested into. Scoped
+        # to this pipeline's own chunks, so a collection holding only unrelated
+        # documents (or only the version marker) reads as empty-for-this-pipeline.
+        if has_documents == 0:
+            raise FileNotFoundError(
+                f"Namespace {settings.mongodb_db}.{settings.collection_name} is "
+                "empty. Run `rag ingest` first, and check MONGODB_DB/COLLECTION_NAME "
+                "match the ones used to ingest."
             )
         # Retrieve a wide candidate set (fetch_k); the reranker below narrows it
-        # to retrieval_k. `reranker` is injectable for tests alongside
-        # `embeddings`/`llm`; production leaves it None and builds the real one.
+        # to retrieval_k. `exact` runs exact (ENN) search, correct for a corpus
+        # under ~10k chunks and free of numCandidates tuning. `reranker` is
+        # injectable for tests alongside `embeddings`/`llm`; production leaves it
+        # None and builds the real one.
         self._retriever = vectorstore.as_retriever(
-            search_kwargs={"k": settings.fetch_k}
+            search_kwargs={"k": settings.fetch_k, "exact": True}
         )
         self._reranker = reranker or build_reranker(settings)
 
@@ -188,9 +208,9 @@ class RAGPipeline:
         narrows it to retrieval_k. Both calls are wrapped so a Voyage provider
         error (embedding *or* reranking), or a query-time dimension mismatch
         against a stale index, surfaces as the RuntimeError both frontends catch
-        rather than a raw voyageai/chromadb exception.
+        rather than a raw voyageai/pymongo/bson exception.
         """
-        with voyage_errors_as_runtime():
+        with provider_errors_as_runtime():
             candidates = self._retriever.invoke(question)
             return list(self._reranker.compress_documents(candidates, question))
 

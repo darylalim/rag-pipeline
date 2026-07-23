@@ -17,7 +17,10 @@ def cmd_ingest(settings: Settings) -> int:
 
     print(f"Ingesting documents from {settings.data_dir} ...")
     n_chunks = ingest(settings)
-    print(f"Indexed {n_chunks} chunks into {settings.persist_dir}")
+    print(
+        f"Indexed {n_chunks} chunks into "
+        f"{settings.mongodb_db}.{settings.collection_name}"
+    )
     print('Ready. Ask a question with:  rag query "..."')
     return 0
 

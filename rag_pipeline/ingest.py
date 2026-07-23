@@ -1,132 +1,189 @@
 """Indexing phase: load -> split -> embed -> store.
 
 Run once (via ``rag ingest``) whenever the documents in ``data/`` change. The
-expensive embedding step happens here; querying later just reloads the persisted
-Chroma index from disk.
+expensive embedding step happens here; querying later just reopens the
+MongoDB Atlas collection and its vector index.
 """
 
 from __future__ import annotations
 
 import hashlib
+import os
 import sys
+import time
 from collections import defaultdict
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
+from typing import Any
 
-import chromadb.errors
+import bson.errors
+import pymongo.errors
 import voyageai
-from chromadb.api.shared_system_client import SharedSystemClient
-from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
+from langchain_mongodb import MongoDBAtlasVectorSearch
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_voyageai import VoyageAIEmbeddings
+from pymongo import MongoClient
+from pymongo.collection import Collection
+from pymongo.operations import SearchIndexModel
 
 from rag_pipeline.config import Settings, require_env_key
 
 # File extensions we know how to read into text.
 SUPPORTED_SUFFIXES = {".md", ".txt", ".pdf"}
 
+# The reserved document that records the corpus fingerprint the Streamlit app
+# keys its cache on (see index_version). It carries neither `content_hash` nor
+# `embedding`, so it is invisible to every {"content_hash": {"$exists": True}}
+# scan below and to $vectorSearch — it is bookkeeping, not a chunk.
+_VERSION_ID = "__rag_ingest_version__"
+
+# One MongoClient per process, reused across every open_store call. Unlike
+# Chroma's per-directory client (which cached a stale on-disk snapshot), a
+# MongoClient is a connection pool that always reads current server state — so
+# the hazard inverts: the client must be created ONCE and reused, not cleared.
+# reset_store_cache() closes and drops it (connection hygiene + fresh-process
+# emulation for tests).
+_client: MongoClient[dict[str, Any]] | None = None
+
 
 def build_embeddings(settings: Settings) -> Embeddings:
     """Construct the embedding model.
 
     Defined here (not in the pipeline) because it is the one component that
-    *must* be identical for indexing and querying — vectors from different
+    *must* be identical for indexing and querying -- vectors from different
     models are not comparable. Both stages import this single factory.
 
     Voyage embeds queries and documents asymmetrically; the wrapper handles
     that itself (input_type="document" from embed_documents at ingest,
     "query" from embed_query at retrieval), so neither stage passes it here.
     """
-    # Fast-fail before the first API call — mirroring RAGPipeline's
+    # Fast-fail before the first API call -- mirroring RAGPipeline's
     # ANTHROPIC_API_KEY guard. Unlike the old on-device model, embedding now
     # needs a key at ingest as well as query.
     require_env_key("VOYAGE_API_KEY", "Embedding uses Voyage AI")
     return VoyageAIEmbeddings(model=settings.embedding_model)
 
 
-def open_store(settings: Settings, embeddings: Embeddings | None = None) -> Chroma:
-    """Open the persisted Chroma collection.
+def _get_client(settings: Settings) -> MongoClient[dict[str, Any]]:
+    """The process-wide MongoClient, created once and pinged for fail-fast.
 
-    The store's identity (collection name, persist dir, embedding function) must
-    match between indexing and querying, so both stages open it through this one
-    factory. ``embeddings`` is injectable for tests; production leaves it None
-    and builds the embedding model.
-
-    The translation is here rather than left to each caller because ``Chroma(...)``
-    creates and validates the collection eagerly: an invalid ``COLLECTION_NAME``,
-    or an index file that cannot be read, raises a ``ChromaError`` *at
-    construction* — above whatever block a caller wraps its own store ops in, and
-    so outside the union both frontends catch. Failing to establish the store's
-    identity belongs with the code that establishes it. ``build_embeddings()``'s
-    missing-key ``RuntimeError`` passes through unchanged; it is neither a Voyage
-    nor a Chroma error.
+    ``MongoClient(...)`` is lazy -- it opens no connection and validates nothing
+    until the first operation -- so a paused cluster, an IP not on the Atlas
+    access list, or a bad URI would otherwise surface much later, deep inside an
+    ingest or a query. The ``ping`` here is the one eager check that replaces the
+    validation Chroma did at construction. ``MONGODB_URI`` carries credentials,
+    so it is guarded like the provider API keys rather than living in Settings.
     """
-    with voyage_errors_as_runtime():
-        return Chroma(
-            collection_name=settings.collection_name,
-            embedding_function=embeddings or build_embeddings(settings),
-            persist_directory=str(settings.persist_dir),
-        )
+    global _client
+    if _client is None:
+        require_env_key("MONGODB_URI", "The vector store is MongoDB Atlas")
+        with provider_errors_as_runtime():
+            client: MongoClient[dict[str, Any]] = MongoClient(
+                os.environ["MONGODB_URI"],
+                serverSelectionTimeoutMS=settings.mongodb_timeout_ms,
+            )
+            client.admin.command("ping")
+        _client = client
+    return _client
+
+
+def _collection(settings: Settings) -> Collection[dict[str, Any]]:
+    """The pymongo collection holding this pipeline's chunks."""
+    return _get_client(settings)[settings.mongodb_db][settings.collection_name]
+
+
+def open_store(
+    settings: Settings, embeddings: Embeddings | None = None
+) -> MongoDBAtlasVectorSearch:
+    """Open the Atlas Vector Search store over this pipeline's collection.
+
+    The store's identity -- (connection URI, database, collection, vector index
+    name, embedding function) -- must match between indexing and querying, so
+    both stages open it through this one factory. ``embeddings`` is injectable
+    for tests; production leaves it None and builds the embedding model.
+
+    Construction is deliberately inert: with the default ``auto_create_index``
+    and ``dimensions`` langchain-mongodb creates nothing and makes no call, so
+    the query path never builds an index (``ingest()`` owns that, via
+    ``_ensure_vector_index``). ``.collection`` exposes the raw pymongo handle the
+    incremental bookkeeping needs -- MongoDBAtlasVectorSearch has no enumerate.
+    """
+    return MongoDBAtlasVectorSearch(
+        collection=_collection(settings),
+        embedding=embeddings or build_embeddings(settings),
+        index_name=settings.vector_index_name,
+        text_key="text",
+        embedding_key="embedding",
+        relevance_score_fn=settings.atlas_similarity,
+    )
 
 
 @contextmanager
-def voyage_errors_as_runtime() -> Iterator[None]:
-    """Translate Voyage/Chroma failures into the RuntimeError the frontends catch.
+def provider_errors_as_runtime() -> Iterator[None]:
+    """Translate Voyage/MongoDB failures into the RuntimeError the frontends catch.
 
-    Wraps every Voyage AI call — embedding at ingest and query, and reranking at
-    query — plus the Chroma store ops around them. Neither voyageai's nor
-    chromadb's exception type is in the ``FileNotFoundError | RuntimeError |
-    ValueError`` union both frontends handle, and neither belongs in a frontend.
-    This is the retrieval-side parallel to ``_generate()``'s ``anthropic.APIError``
-    translation, covering all three Voyage calls: ``ingest()`` here and
-    ``RAGPipeline.retrieve()`` in pipeline.py (which reranks as well as embeds).
-    ``open_store()`` is the third wrapping site, for the store errors that land
-    before either of those — including the bad ``COLLECTION_NAME`` the comment
-    below keys off, which is raised at construction and reachable no other way.
+    Wraps every provider call the retrieval side makes -- Voyage embedding at
+    ingest and query and Voyage reranking at query, plus every MongoDB store op
+    around them. None of voyageai's, pymongo's or bson's exception types is in
+    the ``FileNotFoundError | RuntimeError | ValueError`` union both frontends
+    handle, and none belongs in a frontend. This is the retrieval-side parallel
+    to ``_generate()``'s ``anthropic.APIError`` translation.
+
+    ``bson.errors.BSONError`` sits *outside* ``pymongo.errors.PyMongoError``, so
+    it needs its own arm. Everything here becomes a RuntimeError, never a
+    ValueError -- a bad ``MONGODB_URI`` (``ConfigurationError``) must land in the
+    branch ``app.py`` catches *below* its sidebar, keeping the uploader reachable,
+    rather than the ``ValueError`` branch that stops the script above it.
     """
     try:
         yield
     except voyageai.error.VoyageError as exc:
         raise RuntimeError(f"Voyage API request failed: {exc}") from exc
-    except chromadb.errors.ChromaError as exc:
-        # Translate any store-layer failure into the caught union. Add the
-        # "rebuild your index" hint only for a dimension mismatch, keyed off the
-        # message rather than the exception type: chromadb raises the same type
-        # for unrelated validation (e.g. a bad COLLECTION_NAME) that the hint
-        # would misdiagnose.
+    except (pymongo.errors.PyMongoError, bson.errors.BSONError) as exc:
+        # The dimension hint keys off the message, not the type: a wrong-width
+        # index surfaces at *query* time (Atlas accepts a wrong-width vector on
+        # insert and only fails at $vectorSearch), as an ordinary OperationFailure.
         hint = (
-            " The index was likely built with a different EMBEDDING_MODEL; delete "
-            "the persist directory (or change COLLECTION_NAME), then run `rag ingest`."
+            " The vectors were likely built at a different EMBEDDING_MODEL/"
+            "EMBEDDING_DIMENSIONS; run `rag ingest` to re-embed and rebuild the index."
             if "dimension" in str(exc).lower()
             else ""
         )
-        raise RuntimeError(f"{exc}.{hint}") from exc
+        raise RuntimeError(f"Vector store request failed: {exc}.{hint}") from exc
 
 
 def reset_store_cache() -> None:
-    """Drop chromadb's per-process client cache.
+    """Close and drop the process-wide MongoClient.
 
-    chromadb caches one client per persist directory within a process. A caller
-    that re-opens a store after it was rebuilt on disk (e.g. the Streamlit app
-    after `rag ingest`) must clear this first, or it reuses the stale client and
-    reads the old index. Centralized here so callers don't reach into chromadb
-    internals themselves.
+    The inverse of the old chromadb cache-clear: there is no stale on-disk
+    snapshot to discard (a live server is always current), but the pooled client
+    must be created once and reused, so this is connection hygiene. Callers use
+    it to emulate a fresh CLI process -- the Streamlit app before rebuilding its
+    cached pipeline, and the tests at every boundary and between in-process
+    re-ingests.
     """
-    SharedSystemClient.clear_system_cache()
+    global _client
+    if _client is not None:
+        _client.close()
+        _client = None
 
 
-def index_version(settings: Settings) -> float:
-    """A value that changes whenever the on-disk index is rebuilt.
+def index_version(settings: Settings) -> str:
+    """A value that changes whenever the on-disk corpus is rebuilt.
 
     The Streamlit app keys its pipeline cache on this so a `rag ingest` is
-    picked up automatically. Reads one sentinel file's mtime (chromadb bumps it
-    on every write) rather than walking the whole index directory.
+    picked up automatically. Reads the digest ingest() stamps over the corpus
+    fingerprints (see _write_index_version) -- stable across an unchanged
+    re-ingest, so it does not needlessly bust the cache. ``""`` means nothing has
+    been ingested yet. Can raise RuntimeError (e.g. a paused cluster); the app
+    reads it inside the guard that already catches that.
     """
-    sentinel = settings.persist_dir / "chroma.sqlite3"
-    return sentinel.stat().st_mtime if sentinel.exists() else 0.0
+    with provider_errors_as_runtime():
+        doc = _collection(settings).find_one({"_id": _VERSION_ID}, {"digest": 1})
+    return doc["digest"] if doc else ""
 
 
 def _read_pdf(path: Path) -> str:
@@ -141,13 +198,13 @@ def save_upload(data_dir: Path, filename: str, data: bytes) -> str:
     """Write one uploaded file into ``data_dir``; return the name it landed under.
 
     Here rather than in the frontend that calls it because the name it produces
-    has to satisfy ``load_documents``' contract — a supported suffix, and a
+    has to satisfy ``load_documents``' contract -- a supported suffix, and a
     relative POSIX path that resolves back under ``data_dir``. ``index_version``
     sits in this module for the same reason: serving one frontend is not the
     same as belonging to it.
 
     The name is reduced to its final component, and *that* is what keeps an
-    upload from writing outside ``data_dir`` — a browser supplies this string,
+    upload from writing outside ``data_dir`` -- a browser supplies this string,
     so ``../../.ssh/authorized_keys`` arrives as an ordinary value rather than
     an attack the caller has to notice. Backslashes are folded first, because a
     POSIX server does not read a Windows separator as one and would otherwise
@@ -157,7 +214,7 @@ def save_upload(data_dir: Path, filename: str, data: bytes) -> str:
 
     Where that boundary stops: this does write through a symlink already sitting
     in ``data_dir``, as any program would. Putting one there needs the access it
-    would grant, so it is not a boundary this is trying to hold — the untrusted
+    would grant, so it is not a boundary this is trying to hold -- the untrusted
     input here is the *name*, not the directory's existing contents.
 
     Bytes are written through unchanged rather than decoded and re-encoded: a
@@ -170,9 +227,9 @@ def save_upload(data_dir: Path, filename: str, data: bytes) -> str:
     path = PurePosixPath(filename.replace("\\", "/"))
     name = path.name
     # An empty name (``..``, ``/``, ``""``) has an empty suffix, so this one
-    # check rejects it too — there is no name to write it under either way.
+    # check rejects it too -- there is no name to write it under either way.
     # `.suffix` reads the final component, so it is the same on the whole path
-    # as on ``name`` — one object, not two.
+    # as on ``name`` -- one object, not two.
     if path.suffix.lower() not in SUPPORTED_SUFFIXES:
         raise ValueError(
             f"Cannot index {filename!r}: expected one of "
@@ -209,7 +266,7 @@ def load_documents(data_dir: Path) -> list[Document]:
                 text = path.read_text(encoding="utf-8")
         except Exception as exc:
             # One unreadable file (bad encoding, corrupt PDF, permissions)
-            # must not abort the whole ingest — skip it with a warning.
+            # must not abort the whole ingest -- skip it with a warning.
             print(
                 f"Warning: skipping unreadable file {source!r}: {exc}", file=sys.stderr
             )
@@ -244,31 +301,146 @@ def _fingerprint(text: str, settings: Settings) -> str:
 
     The extracted text, and every setting the stored vectors depend on: the
     splitter's, because the same file under a new ``CHUNK_SIZE`` is cut into
-    different chunks, and ``EMBEDDING_MODEL``, because a vector means nothing
-    except with respect to the model that produced it. Content alone would let a
-    re-ingest keep vectors the current settings would never have produced — and
-    a changed model is the dangerous half: the chunks still *look* current, so
-    the skip is silent and every later query compares against vectors from a
-    model that is no longer configured.
+    different chunks; ``EMBEDDING_MODEL``, because a vector means nothing except
+    with respect to the model that produced it; and ``EMBEDDING_DIMENSIONS``,
+    because the Atlas index fixes ``numDimensions`` at create time, so a
+    different-width model produces vectors the existing index cannot serve.
+    Content alone would let a re-ingest keep vectors the current settings would
+    never have produced -- and a changed model is the dangerous half: the chunks
+    still *look* current, so the skip is silent and every later query compares
+    against vectors from a model that is no longer configured.
 
     Hashed rather than compared against mtime or size. mtime moves when nothing
     changed (a checkout, a copy, `touch`) and stands still when something did (a
-    write that preserves it), and either error is silent — one re-embeds the
+    write that preserves it), and either error is silent -- one re-embeds the
     corpus for nothing, the other serves answers from a file's previous
     contents. This reads the bytes we already read.
     """
     payload = (
-        f"{settings.embedding_model}:{settings.chunk_size}:"
-        f"{settings.chunk_overlap}:{text}"
+        f"{settings.embedding_model}:{settings.embedding_dimensions}:"
+        f"{settings.chunk_size}:{settings.chunk_overlap}:{text}"
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _ensure_vector_index(
+    collection: Collection[dict[str, Any]], settings: Settings
+) -> None:
+    """Create the Atlas Vector Search index if it is absent, then wait for it.
+
+    Programmatic creation works on the free tier, so ``rag ingest`` stays a
+    complete setup step -- there is no separate "create the index" instruction.
+    Create-if-missing only: a change to ``EMBEDDING_DIMENSIONS``/
+    ``ATLAS_SIMILARITY`` needs the index dropped (or ``VECTOR_INDEX_NAME``
+    changed), since editing width in place is a larger operation than a demo
+    warrants. The build is asynchronous and a query against a not-yet-ready
+    index returns *zero rows with no error*, so the queryable poll is
+    load-bearing, not politeness.
+    """
+    if not list(collection.list_search_indexes(settings.vector_index_name)):
+        collection.create_search_index(
+            model=SearchIndexModel(
+                definition={
+                    "fields": [
+                        {
+                            "type": "vector",
+                            "path": "embedding",
+                            "numDimensions": settings.embedding_dimensions,
+                            "similarity": settings.atlas_similarity,
+                        },
+                        {"type": "filter", "path": "source"},
+                    ]
+                },
+                name=settings.vector_index_name,
+                type="vectorSearch",
+            )
+        )
+    _await_queryable(collection, settings.vector_index_name)
+
+
+def _await_queryable(
+    collection: Collection[dict[str, Any]], index_name: str, timeout_s: float = 90.0
+) -> None:
+    """Block until the named search index reports ``queryable`` is True."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        info = list(collection.list_search_indexes(index_name))
+        if info and info[0].get("queryable"):
+            return
+        time.sleep(1)
+    raise RuntimeError(
+        f"Vector index {index_name!r} did not become queryable within {timeout_s:.0f}s."
+    )
+
+
+def _await_searchable(
+    collection: Collection[dict[str, Any]],
+    settings: Settings,
+    ids: list[str],
+    timeout_s: float = 60.0,
+) -> None:
+    """Block until freshly-inserted chunks are returned by ``$vectorSearch``.
+
+    Atlas Vector Search indexes asynchronously off the collection's change
+    stream, so a document is in the collection (``find`` sees it) before it is
+    searchable. Every caller that ingests and then retrieves in the same process
+    -- the app answering a question about a file just uploaded, the round-trip
+    test -- depends on this, so the wait lives in ingest rather than in each of
+    them, and ``retrieve()`` stays free of a poll on the hot path.
+
+    Probes with one inserted chunk's own vector: under cosine it is its own
+    nearest neighbour, so it ranks first the moment the index has caught up.
+    """
+    probe = collection.find_one({"_id": ids[0]}, {"embedding": 1})
+    if not probe or "embedding" not in probe:
+        return
+    query_vector = probe["embedding"]
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        hits = collection.aggregate(
+            [
+                {
+                    "$vectorSearch": {
+                        "index": settings.vector_index_name,
+                        "path": "embedding",
+                        "queryVector": query_vector,
+                        "exact": True,
+                        "limit": 1,
+                    }
+                },
+                {"$project": {"_id": 1}},
+            ]
+        )
+        if any(hit["_id"] == ids[0] for hit in hits):
+            return
+        time.sleep(1)
+    raise RuntimeError("Newly ingested documents did not become searchable in time.")
+
+
+def _write_index_version(
+    collection: Collection[dict[str, Any]], fresh: dict[str, str]
+) -> None:
+    """Stamp a digest of the corpus fingerprints, for index_version to read.
+
+    A reserved document with no ``content_hash`` or ``embedding`` field, so it is
+    invisible to the incremental scans and to $vectorSearch. Digesting the
+    fingerprints (not a counter or timestamp) keeps it stable across an unchanged
+    re-ingest, so the Streamlit cache is busted on exactly the events an edit,
+    add, or removal changes -- and no others.
+    """
+    digest = hashlib.sha256(
+        "".join(f"{source}:{h};" for source, h in sorted(fresh.items())).encode("utf-8")
+    ).hexdigest()
+    collection.replace_one(
+        {"_id": _VERSION_ID}, {"_id": _VERSION_ID, "digest": digest}, upsert=True
+    )
 
 
 def ingest(settings: Settings, embeddings: Embeddings | None = None) -> int:
     """Bring the index in line with ``data_dir``, embedding only what changed.
 
     Afterwards the collection holds exactly the chunks for the documents
-    currently in ``data_dir`` — nothing stale, nothing missing — which is the
+    currently in ``data_dir`` -- nothing stale, nothing missing -- which is the
     property every caller depends on: the app rebuilds after an upload and
     expects the sample corpus to still be answerable, and a file edited by hand
     between runs must be picked up without being announced.
@@ -280,12 +452,16 @@ def ingest(settings: Settings, embeddings: Embeddings | None = None) -> int:
     already have; changed and removed ones have their chunks dropped first, so a
     file's old text can never outlive it in the index.
 
-    Scoped to this collection's own ids throughout — the persist directory may
-    hold unrelated data and is never deleted. Returns the number of chunks the
-    index now holds, not the number re-embedded: it describes the index, which
-    is what makes re-ingesting the same corpus report the same number.
-    ``embeddings`` is injectable so tests can substitute a lightweight fake;
-    production callers leave it as None.
+    Scoped throughout to the documents this pipeline wrote -- every read and
+    delete is filtered to ``{"content_hash": {"$exists": True}}`` -- so a
+    collection shared with unrelated data is never read, counted, or deleted from
+    (``ingest`` never wipes anything wholesale). Chunks are keyed by a
+    deterministic ``_id`` (``source:index:content_hash``), so re-adding is an
+    idempotent upsert-replace rather than a duplicating append. Returns the
+    number of chunks the index now holds, not the number re-embedded: it
+    describes the index, which is what makes re-ingesting the same corpus report
+    the same number. ``embeddings`` is injectable so tests can substitute a
+    lightweight fake; production callers leave it as None.
     """
     documents = load_documents(settings.data_dir)
     if not documents:
@@ -293,6 +469,8 @@ def ingest(settings: Settings, embeddings: Embeddings | None = None) -> int:
             f"No readable documents found in {settings.data_dir} "
             f"(looked for {', '.join(sorted(SUPPORTED_SUFFIXES))})."
         )
+
+    embedder = embeddings or build_embeddings(settings)
 
     for document in documents:
         document.metadata["content_hash"] = _fingerprint(
@@ -303,39 +481,70 @@ def ingest(settings: Settings, embeddings: Embeddings | None = None) -> int:
     chunks = split_documents(documents, settings)
     fresh = {doc.metadata["source"]: doc.metadata["content_hash"] for doc in documents}
 
-    store = open_store(settings, embeddings)
-    with voyage_errors_as_runtime():
-        # Metadata, not ids alone: the fingerprints are what decide the work.
-        # Documents are still whole here, so one chunk per source answers for it.
-        stored = store.get(include=["metadatas"])
-        ids_by_source: dict[str, list[str]] = defaultdict(list)
-        indexed: dict[str, str | None] = {}
-        for chunk_id, metadata in zip(stored["ids"], stored["metadatas"], strict=True):
-            source = str(metadata.get("source", "unknown"))
-            ids_by_source[source].append(chunk_id)
-            # `.get`, because an index built before fingerprints existed has no
-            # such key -- it reads as changed and is re-embedded once.
-            fingerprint = metadata.get("content_hash")
-            indexed[source] = str(fingerprint) if fingerprint is not None else None
+    store = open_store(settings, embedder)
+    collection = store.collection
+    with provider_errors_as_runtime():
+        # Read the state SCOPED to this pipeline's chunks. langchain-mongodb
+        # flattens Document metadata to top-level fields, so `source` and
+        # `content_hash` are queryable directly; one row per source answers for
+        # all its chunks, so the aggregation groups them server-side.
+        indexed = {
+            row["_id"]: row["hash"]
+            for row in collection.aggregate(
+                [
+                    {"$match": {"content_hash": {"$exists": True}}},
+                    {"$group": {"_id": "$source", "hash": {"$first": "$content_hash"}}},
+                ]
+            )
+        }
 
-        # Deleted first, and computed over the *indexed* sources, so a source
-        # that is gone from data_dir is dropped rather than merely not refreshed.
-        superseded = [
-            chunk_id
-            for source, fingerprint in indexed.items()
-            if fresh.get(source) != fingerprint
-            for chunk_id in ids_by_source[source]
-        ]
-        if superseded:
-            store.delete(ids=superseded)
+        # Group fresh chunks by source, then split the sources into what to drop
+        # and what to (re-)embed. Deletion is computed over the *indexed* sources,
+        # so a source gone from data_dir is dropped rather than merely not added.
+        chunks_by_source: dict[str, list[Document]] = defaultdict(list)
+        for chunk in chunks:
+            chunks_by_source[chunk.metadata["source"]].append(chunk)
 
         changed = {
             source
             for source, fingerprint in fresh.items()
             if indexed.get(source) != fingerprint
         }
-        if changed:
-            store.add_documents(
-                [chunk for chunk in chunks if chunk.metadata["source"] in changed]
+        new_chunks: list[Document] = []
+        ids: list[str] = []
+        for source in changed:
+            for i, chunk in enumerate(chunks_by_source[source]):
+                new_chunks.append(chunk)
+                ids.append(f"{source}:{i}:{chunk.metadata['content_hash']}")
+
+        # Validate the declared width against the live model *before* creating an
+        # index or embedding anything -- Atlas would otherwise accept a
+        # wrong-width vector on insert and only fail at query time. Only when
+        # there is something to embed, so an unchanged re-ingest still makes no
+        # embedding call at all (embed_query here is the sole exception, and it
+        # runs only on a run that is about to embed documents regardless).
+        if new_chunks:
+            probe_dims = len(embedder.embed_query("dimension probe"))
+            if probe_dims != settings.embedding_dimensions:
+                raise ValueError(
+                    f"EMBEDDING_DIMENSIONS={settings.embedding_dimensions} but "
+                    f"{settings.embedding_model} produced {probe_dims}-wide vectors. "
+                    f"Set EMBEDDING_DIMENSIONS={probe_dims}."
+                )
+
+        _ensure_vector_index(collection, settings)
+
+        superseded = [
+            source for source in indexed if fresh.get(source) != indexed[source]
+        ]
+        if superseded:
+            collection.delete_many(
+                {"source": {"$in": superseded}, "content_hash": {"$exists": True}}
             )
+
+        if new_chunks:
+            store.add_documents(new_chunks, ids=ids)
+            _await_searchable(collection, settings, ids)
+
+        _write_index_version(collection, fresh)
     return len(chunks)
