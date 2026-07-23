@@ -63,7 +63,7 @@ jobs:
 
       # ruff is a standalone binary and needs none of the project's dependencies,
       # so install just the dev group first — seconds, versus longer for the full
-      # project (chromadb, langchain, streamlit). A ruff failure then costs
+      # project (pymongo, langchain, streamlit). A ruff failure then costs
       # nothing further.
       #
       # --locked installs from uv.lock *and* asserts the lock is up to date with
@@ -114,7 +114,10 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked
 
-      # Tests are fully offline (fake embedding + chat models), so no
-      # ANTHROPIC_API_KEY / secrets are required.
+      # Tests inject fake embedding + chat models and reach only a local
+      # mongodb-atlas-local container over loopback — started by testcontainers,
+      # torn down with the session. So no ANTHROPIC_API_KEY / VOYAGE_API_KEY /
+      # MONGODB_URI cloud secret is needed; the one requirement is Docker, which
+      # ubuntu-latest provides. First run pulls the image (~minutes), then cached.
       - name: Run tests
         run: uv run pytest

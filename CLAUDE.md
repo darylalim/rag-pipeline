@@ -6,10 +6,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 uv sync                              # install deps (creates .venv)
-uv run rag ingest                    # rebuild the Chroma index from data/
+uv run rag ingest                    # embed data/ into the Atlas collection (+ create the index)
 uv run rag query "your question"     # ask from the terminal
 uv run streamlit run app.py          # chat UI over the same pipeline
-uv run pytest                        # full suite (~6s warm: ~3s tests, rest imports + startup; offline)
+uv run pytest                        # full suite (runs a local Atlas container; needs Docker, no secrets)
 uv run pytest tests/test_config.py::test_defaults   # single test
 uv run pytest -k idempotent -v                      # by keyword
 uv run pytest --cov=rag_pipeline --cov=app --cov-report=term-missing   # coverage, on demand
@@ -58,13 +58,15 @@ both rather than duplicating that material here. Every CI job must stay green.
 Two phases with a hard boundary between them, and one shared config object:
 
 ```
-ingest (rag_pipeline/ingest.py)    load → split → embed → store (Chroma on disk)
+ingest (rag_pipeline/ingest.py)    load → split → embed → store (MongoDB Atlas Vector Search)
 query  (rag_pipeline/pipeline.py)  embed question → search → rerank → stuff prompt → Claude
 ```
 
 `Settings` (`config.py`) is a frozen dataclass built via `Settings.from_env()`.
 Both frontends — `rag_pipeline/cli.py` and `app.py` — construct it the same way,
-which is what keeps them agreeing on index location, models, and chunking.
+which is what keeps them agreeing on the Atlas namespace, models, and chunking.
+`MONGODB_URI` carries credentials, so it is a `require_env_key` guard like the
+API keys, not a Settings field (a field needs a documentable literal default).
 
 All tunables live here — never inline a literal at a call site. Adding one is a
 **three-file change**:
@@ -88,10 +90,13 @@ that drift is not merely detected — it is inexpressible.
 
 `build_embeddings()` and `open_store()` are defined in `ingest.py` and imported
 *by* `pipeline.py`, not the reverse. This is deliberate: vectors from different
-embedding models are not comparable, and a Chroma collection's identity is
-(persist dir, collection name, embedding function). Indexing and querying must
-therefore go through one factory each. **Never construct `Chroma(...)` or
-`VoyageAIEmbeddings(...)` inline** — route through these factories.
+embedding models are not comparable, and the store's identity is (connection URI,
+database, collection, vector index name, embedding function). Indexing and
+querying must therefore go through one factory each. **Never construct
+`MongoDBAtlasVectorSearch(...)`, `MongoClient(...)` or `VoyageAIEmbeddings(...)`
+inline** — route through these factories. `open_store()` returns the vectorstore;
+its `.collection` is the raw pymongo handle the incremental bookkeeping needs, and
+the `MongoClient` behind it is memoized once per process (see below).
 
 The reranker is the deliberate exception: `build_reranker()` lives in
 `pipeline.py`, not here. Reranking is query-only — it has no ingest-side
@@ -102,52 +107,66 @@ ordinary behavioral test (the socket block + the injection seam), not a text
 invariant, because the risk it guards — offline testability — is one a behavioral
 test already covers.
 
-### chromadb's per-process client cache
+### The process-wide MongoClient (the cache hazard inverts)
 
-chromadb caches one client per persist directory *within a process*. Any code
-that re-opens a store after it was rebuilt on disk will otherwise reuse the stale
-client and silently read the old index. `reset_store_cache()` wraps this
-(`SharedSystemClient.clear_system_cache()`) so callers never touch chromadb
-internals directly. Callers (`grep reset_store_cache`):
+`ingest.py` memoizes one `MongoClient` per process (`_client`). Unlike Chroma's
+per-directory client — which cached a stale on-disk *snapshot*, so a re-open
+after a rebuild read the old index — a `MongoClient` is a connection pool that
+always reads current server state. So the hazard flips: the client must be
+created *once* and reused, not cleared. `reset_store_cache()` still exists and
+callers are unchanged, but its body now *closes and drops* the client (connection
+hygiene + fresh-process emulation) rather than clearing a snapshot. Callers
+(`grep reset_store_cache`):
 
 - `app.py` calls it before rebuilding the cached pipeline.
-- `tests/conftest.py` clears it autouse at every test boundary, so an in-process
-  re-ingest behaves like a fresh CLI run.
+- `tests/conftest.py` calls it autouse at every test boundary.
 - `tests/test_ingest.py::test_ingest_is_idempotent` calls it directly between
   ingests to emulate a fresh CLI process.
-- `tests/test_pipeline.py` does the same around the collection-mismatch tests,
-  which re-open a store after it was written and so need the state a real
-  `rag query` starts from.
+- `tests/test_pipeline.py` does the same around the collection-mismatch tests.
 
-The Streamlit cache key is `index_version()` — the mtime of `chroma.sqlite3`,
-which chromadb bumps on every write. That's how the running app picks up a
-`rag ingest` without a restart.
+The Streamlit cache key is `index_version()` (a `str`) — a SHA-256 digest over
+the corpus fingerprints that `ingest()` stamps into a reserved document
+(`_VERSION_ID`, no `content_hash`/`embedding`, so invisible to the incremental
+scans and to `$vectorSearch`). It changes on exactly the events an edit, add, or
+removal changes and no others, so the running app picks up a `rag ingest` without
+a restart and an unchanged re-ingest does not needlessly bust the cache.
 
-### Ingest is incremental, and scoped — never a directory wipe
+### Ingest is incremental, and scoped — never a wholesale wipe
 
 `ingest()` leaves the collection holding exactly the chunks for whatever is in
 `data_dir` right now. It gets there by re-embedding only what changed: each
-document carries a `content_hash` in its metadata, and a source whose hash still
-matches keeps the vectors it has.
+document carries a `content_hash` in its metadata (langchain-mongodb flattens
+metadata to top-level fields, so it is queryable directly), and a source whose
+hash still matches keeps the vectors it has. Chunks are keyed by a deterministic
+`_id` (`source:index:content_hash`), so re-adding is an idempotent upsert-replace,
+not a duplicating append.
 
 **The state after the run is the contract, not the work skipped.** Every caller
 depends on it — the app rebuilds after an upload and expects the rest of the
 corpus to still be answerable, and a file edited by hand between runs is picked
-up without being announced. Two consequences that are easy to get wrong:
+up without being announced. Consequences that are easy to get wrong:
 
 - Deletions are computed over the *indexed* sources, not the fresh ones. A file
   that is gone from `data_dir` has no fresh chunk to compare against, so an
   add-only pass would leave its vectors retrievable forever.
-- `_fingerprint()` covers `EMBEDDING_MODEL`, `CHUNK_SIZE` and `CHUNK_OVERLAP`
-  as well as the text, because all three change what the stored vectors *are*.
-  Dropping the model from it is the dangerous one: the chunks still look
-  current, so the skip is silent and every later query compares against vectors
-  from a model that is no longer configured.
+- `_fingerprint()` covers `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS`, `CHUNK_SIZE`
+  and `CHUNK_OVERLAP` as well as the text, because all four change what the stored
+  vectors *are* — and the Atlas index fixes `numDimensions` at create time, so a
+  different-width model produces vectors the existing index cannot serve. Dropping
+  the model or dimensions is the dangerous case: the chunks still look current, so
+  the skip is silent.
+- Every read and delete is **scoped to `{"content_hash": {"$exists": True}}`**, so
+  a collection shared with unrelated documents is never read, counted, or deleted
+  from — the document-level form of "never a wipe". `_await_searchable` after an
+  add, and `_ensure_vector_index` before the query path, exist because Atlas
+  indexes asynchronously: an added chunk is in the collection before it is
+  searchable, and a query against a not-yet-ready index returns zero rows with no
+  error. Ordering is forced: insert (creates the collection), *then* create the
+  index (`create_search_index` on a missing namespace fails).
 
-It must never `rmtree` the persist directory — that dir may hold unrelated data
-(`test_ingest_preserves_unrelated_files_in_persist_dir` guards this, and is now
-the only thing that does). Re-ingest is idempotent: same input → same chunk
-count, no duplicate append, and no embedding calls at all.
+`test_ingest_preserves_foreign_documents_in_a_shared_collection` guards the
+scoping (a foreign doc survives a rebuild that deletes). Re-ingest is idempotent:
+same input → same chunk count, no duplicate append, and no embedding calls at all.
 
 `ingest()` returns the number of chunks the index *holds*, not the number
 re-embedded. That is what keeps re-ingesting the same corpus reporting the same
@@ -165,12 +184,16 @@ real LLM calls Claude, but none runs under test. Any new code path touching an
 embedding model, the reranker, or the LLM should thread these through rather than
 constructing them unconditionally.
 
-Injection is a convention, so `conftest.py` backs it with an autouse fixture that
-blocks `socket.socket`/`create_connection`. A test that simply forgets
-`embeddings=` names no banned symbol and no grep would find it — but the real
-Voyage AI path opens a socket to embed, and that fails. The block is the whole
-guarantee: with no local model to fall back to, a forgotten fake cannot succeed
-quietly.
+Injection is a convention, so `conftest.py` backs it with an autouse fixture. The
+store is real now (a local `mongodb-atlas-local` container, started once per
+session via testcontainers), so the fixture is a **loopback allowlist** rather
+than a blanket block: it patches `socket.socket.connect`/`connect_ex` and
+`socket.create_connection` to permit `127.0.0.1` (the container) and reject every
+other host. A test that forgets `embeddings=` names no banned symbol and no grep
+would find it — but the real Voyage AI path connects to `api.voyageai.com`, a
+public host, and that fails. That is the whole guarantee, and it is why the store
+being real does not weaken it: only the store is on loopback; the paid APIs are
+not. Needs Docker; the suite makes no cloud call and needs no secret.
 
 `app.py` takes no such parameters — it is a script, not a function — so
 `test_app.py` reaches the same seam through the factories instead, patching
@@ -210,8 +233,17 @@ because they are only observable at the frontend:
   This is why `test_config.py` clears `config.ENV_VARS` rather than a
   hand-written list — see the Settings rule above.
 - `cli.py` imports `ingest`/`pipeline` lazily inside the command functions. This
-  is load-bearing: importing them pulls in the chromadb/langchain stack, measured
-  at ~0.9s versus ~0.02s to import `cli` alone today. Keep those imports local.
+  is load-bearing: importing them pulls in the pymongo/langchain stack, so
+  `rag --help` and a usage error stay cheap. Keep those imports local.
+- Atlas indexes asynchronously and validates a vector's width at *query* time,
+  not insert — a wrong-width vector inserts fine and fails at `$vectorSearch`, and
+  a query against a missing/not-yet-built index returns zero rows with no error.
+  This is why ingest polls (`_await_queryable`/`_await_searchable`) and validates
+  `EMBEDDING_DIMENSIONS` against the live model with a probe before writing.
+- A free Atlas cluster auto-pauses after 30 idle days and must be resumed
+  manually; a paused cluster surfaces as a `ServerSelectionTimeoutError` →
+  RuntimeError. `MONGODB_TIMEOUT_MS` is generous so a cold resume is not misread
+  as unreachable.
 
 ## Enforcing the invariants
 
@@ -238,16 +270,16 @@ whole suite green. Two properties are load-bearing and easy to break:
 **Prefer a behavioral test to a rule.** A rule matches spellings; a test
 observes the property, so it covers routes nobody thought to enumerate. Reach
 for `RULES` only when there is nothing to observe — which is the case exactly
-when the point is that some call never happens (`chroma-factory`,
+when the point is that some call never happens (`store-factory`,
 `embeddings-factory`, `no-suppressions`). Everything else is asserted where the
 behavior is:
 
 | Invariant | Enforced by |
 | --------- | ----------- |
 | the exception union, the empty-collection guard, `source` metadata on loaders | `test_pipeline.py`, `test_ingest.py` |
-| `cli.py`'s imports stay cheap | `test_importing_cli_does_not_load_the_heavy_stack` — subprocess-imports the module, asserts chromadb/langchain are absent from `sys.modules` |
+| `cli.py`'s imports stay cheap | `test_importing_cli_does_not_load_the_heavy_stack` — subprocess-imports the module, asserts pymongo/langchain_mongodb are absent from `sys.modules` |
 | `build_chat_model` sets no sampling params | `test_build_chat_model_sets_no_sampling_params` — reads them back off the constructed model |
-| `ingest()` never wipes the persist dir | `test_ingest_preserves_unrelated_files_in_persist_dir` — a neighbouring file survives a rebuild |
+| `ingest()` never deletes documents it did not write | `test_ingest_preserves_foreign_documents_in_a_shared_collection` — a foreign doc survives a rebuild that deletes |
 
 The last three replaced text rules (`lazy-cli-imports`, `no-sampling-params`,
 `no-rmtree`) and are each strictly stronger than the regex they retired.
@@ -278,9 +310,20 @@ The last three replaced text rules (`lazy-cli-imports`, `no-sampling-params`,
   displayed citations from drifting via a second search. Its two halves settle at
   different times — retrieval has run when it returns, generation has not — which
   is what lets a caller wrap a spinner around just the call.
-- Keep the empty-collection guard in `RAGPipeline.__init__`: Chroma's
-  `get_or_create` silently returns an *empty* collection on a `COLLECTION_NAME`
-  mismatch, so without it every question is answered "I don't know."
+- `RAGPipeline.__init__` has two guards, checked in order. First: the vector
+  index exists and is `queryable` — a full collection with no index answers every
+  question "I don't know" off zero rows, which the empty-collection guard cannot
+  see. Second: the namespace holds at least one of this pipeline's chunks (Mongo
+  creates a namespace implicitly on first write and returns zero documents, with
+  no error, for one never ingested into — and a wrong `MONGODB_DB`/
+  `COLLECTION_NAME`/`VECTOR_INDEX_NAME` is a *different* namespace). Keep both.
+- Retrieval-side provider failures are translated in `provider_errors_as_runtime`
+  (`ingest.py`), the parallel to `_generate()`'s `anthropic.APIError` handling:
+  it wraps every Voyage call and every MongoDB store op, mapping
+  `voyageai.error.VoyageError`, `pymongo.errors.PyMongoError` *and*
+  `bson.errors.BSONError` (which is outside `PyMongoError`) to **RuntimeError,
+  never ValueError** — a bad `MONGODB_URI` must land below `app.py`'s sidebar so
+  the uploader stays reachable, not in the `ValueError` branch that stops above it.
 - `build_chat_model()` sets no `temperature`/`top_p` — grounding comes from
   retrieved context, and some models (Opus 4.8) reject sampling params outright.
   Don't add them.

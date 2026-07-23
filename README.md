@@ -2,20 +2,22 @@
 
 A small, readable **Retrieval-Augmented Generation** pipeline built with
 [LangChain](https://docs.langchain.com). Documents are embedded with **Voyage
-AI** and answers are generated with **Claude**. It ships with a reusable core
-library, a CLI, and a Streamlit chat app — all sharing the same code.
+AI**, stored and searched in **MongoDB Atlas Vector Search**, and answers are
+generated with **Claude**. It ships with a reusable core library, a CLI, and a
+Streamlit chat app — all sharing the same code.
 
 ```
-Ingest (once):   data/ ──load──▶ split ──embed──▶ store (Chroma, on disk)
+Ingest (once):   data/ ──load──▶ split ──embed──▶ store (MongoDB Atlas Vector Search)
 Query (per Q):   question ──embed──▶ search ──rerank──▶ [top-k chunks + question] ──▶ Claude ──▶ grounded answer + sources
 ```
 
-At query time the vector search runs locally against the on-disk index; the
-network calls are embedding the question and reranking the candidates (both
-Voyage AI), then generation (Claude).
+Every step of a query is a network call: embedding the question and reranking the
+candidates (both Voyage AI), the `$vectorSearch` itself (MongoDB Atlas), and
+generation (Claude).
 
 **Contents** — [Prerequisites](#prerequisites) · [Setup](#setup) ·
-[Usage](#usage) · [Add your own documents](#add-your-own-documents) ·
+[Deploy a free Atlas cluster](#deploy-a-free-atlas-cluster) · [Usage](#usage) ·
+[Add your own documents](#add-your-own-documents) ·
 [Configuration](#configuration) · [Development](#development) ·
 [Project structure](#project-structure) · [How it works](#how-it-works) ·
 [Invariants](#invariants)
@@ -25,18 +27,44 @@ Voyage AI), then generation (Claude).
 - [uv](https://docs.astral.sh/uv/) and Python 3.11+
 - An **Anthropic API key** (generation) and a **Voyage AI API key** (embedding
   and reranking). Ingest embeds too, so it needs the Voyage AI key as well.
+- A **MongoDB Atlas cluster** and its connection string (the vector store). The
+  free tier is enough — see [below](#deploy-a-free-atlas-cluster).
+- **Docker** — only to run the test suite, which uses a local Atlas container.
+  Not needed to run the app itself.
 
 ## Setup
 
 ```bash
 uv sync                      # create the venv and install dependencies
-cp .env.example .env         # then add your ANTHROPIC_API_KEY and VOYAGE_API_KEY
+cp .env.example .env         # then add ANTHROPIC_API_KEY, VOYAGE_API_KEY, MONGODB_URI
 ```
 
 Embedding calls the Voyage AI API — there is no local embedding model. The
 `voyageai` SDK does fetch a small tokenizer from the Hugging Face Hub on first
 use (for client-side token counting), cached under `~/.cache/huggingface`; the
 *"unauthenticated requests to the HF Hub"* notice it prints is harmless.
+
+## Deploy a free Atlas cluster
+
+The vectors live in MongoDB Atlas. A free (M0) cluster is enough for a demo:
+
+1. In the [Atlas console](https://cloud.mongodb.com), **Create** a cluster and
+   pick the **Free** tier (still labelled `M0` in places), a provider, and a
+   region near you.
+2. In the **Security Quickstart** that appears, create a **database user**
+   (save the password) and, under **Network Access**, **Add My Current IP
+   Address** (or `0.0.0.0/0` for a laptop on changing networks — that leaves the
+   password as the only barrier, fine for a demo, not for real data).
+3. **Connect → Drivers → Python**, copy the `mongodb+srv://…` string, put your
+   database-user password in it (percent-encode any special characters), and set
+   it as `MONGODB_URI` in `.env`. Plain `pymongo` resolves `mongodb+srv://` — no
+   `[srv]` extra needed.
+
+`uv run rag ingest` creates the vector search index itself, so nothing else to
+set up. Free-tier limits worth knowing: at most **3** search + vector indexes,
+**0.5 GB** storage, and a cluster **auto-pauses after 30 idle days** and must be
+resumed manually — a paused cluster surfaces as a connection error, so if queries
+start hanging or erroring after a break, resume it in the console.
 
 ## Usage
 
@@ -48,7 +76,8 @@ uv run rag ingest
 
 Loads the `.md`/`.txt`/`.pdf` files under `data/` — recursively, matching the
 extension case-insensitively — splits them into overlapping chunks, embeds them
-with Voyage AI, and persists a Chroma index to `chroma_db/`.
+with Voyage AI, and stores them in the MongoDB Atlas collection, creating the
+vector search index if it does not exist yet.
 
 A file it cannot use is skipped rather than aborting the run: an unreadable one
 (bad encoding, corrupt PDF, permissions) warns on stderr, and one that yields no
@@ -58,10 +87,10 @@ a scanned, image-only PDF, whose text extraction returns empty without failing.
 Re-run it whenever the documents change. It is incremental: each document is
 fingerprinted, and only new, edited, or removed ones are re-embedded, so adding
 one file to a large corpus costs one file rather than the corpus — embedding is
-a billed API call. Afterwards the index holds exactly what is in `data/`, so
-deletions and edits are picked up too, there are never duplicates, and nothing
-else in `chroma_db/` is touched. Re-running with nothing changed makes no
-embedding calls at all.
+a billed API call. Afterwards the collection holds exactly what is in `data/`, so
+deletions and edits are picked up too, there are never duplicates, and any
+unrelated documents sharing the collection are left alone. Re-running with
+nothing changed makes no embedding calls at all.
 
 Changing `EMBEDDING_MODEL`, `CHUNK_SIZE` or `CHUNK_OVERLAP` re-embeds
 everything, since all three change what the stored vectors represent.
@@ -106,8 +135,8 @@ Two routes, same result:
   `uv run rag ingest`.
 
 Either way the CLI and the app immediately answer against the new content: they
-read the same index, and the app reloads it when its `chroma.sqlite3` mtime
-changes.
+read the same Atlas collection, and the app reloads its pipeline when the corpus
+fingerprint `rag ingest` stamps changes.
 
 Uploaded filenames are treated as untrusted input: `save_upload()` reduces a name
 to its final path component and rejects unsupported suffixes before writing, so
@@ -168,11 +197,12 @@ formatting then tidies.
 uv run pytest
 ```
 
-The suite runs **fully offline** and needs no API key: it injects a deterministic
-fake embedding model and a fake chat model, and an autouse fixture blocks network
-sockets, so a test that forgets to inject a fake fails instead of quietly calling
-the Voyage AI API. Most of its ~6s warm wall time is process startup and importing
-the chromadb/langchain stack; the tests themselves take ~3s.
+The suite needs **no API keys and no cloud Atlas**: it injects a deterministic
+fake embedding model and a fake chat model, and reaches only a local
+`mongodb-atlas-local` container (started by testcontainers) over loopback. A
+relaxed socket guard still blocks every third-party host, so a test that forgets
+to inject a fake fails instead of quietly calling the Voyage AI API. It does need
+**Docker** for that container — the first run pulls the image, then it is cached.
 
 It covers the configuration, the loader and splitter, ingest idempotency, upload
 handling, an ingest→retrieve→generate round trip, the CLI as a terminal program,
@@ -187,10 +217,10 @@ number to keep green invites tests that execute code without asserting anything:
 uv run pytest --cov=rag_pipeline --cov=app --cov-report=term-missing
 ```
 
-It currently reports 99%, and the uncovered lines are meant to be uncovered:
-`cli.py`'s `if __name__ == "__main__"` guard, and the two real model
-constructions in `build_embeddings()` / `build_reranker()` — the lines the
-offline suite exists to never execute.
+The uncovered lines are meant to be uncovered: `cli.py`'s
+`if __name__ == "__main__"` guard, and the two real model constructions in
+`build_embeddings()` / `build_reranker()` — the lines whose injected fakes stand
+in for the paid Voyage AI calls, so the suite never makes them.
 
 ### Continuous integration
 
@@ -207,7 +237,8 @@ Both install with `uv sync --locked`, which fails if `uv.lock` has drifted from
 rather than silently skipped. The `lint` job installs only the dev group before
 running ruff, and the full environment only for `ty check`.
 
-Tests need no secrets: the suite is fully offline.
+Tests need no secrets and no cloud Atlas — they run against a local container
+over loopback — but they do need Docker, which the GitHub runners provide.
 
 Every branch push gets CI immediately, so a branch that has been broken for
 several commits is visible before review rather than after. A same-repo pull
@@ -241,8 +272,11 @@ data/           sample documents (swap in your own)
   questions at query; the *same* model must embed both for their vectors to
   compare, so a single factory (`build_embeddings()`) is shared by ingest and
   query.
-- **Persistent Chroma** (`langchain-chroma`) writes vectors to disk once at
-  ingest, so querying just reloads the index instead of re-embedding.
+- **MongoDB Atlas Vector Search** (`langchain-mongodb`) stores the vectors and
+  serves `$vectorSearch`, so querying searches the collection instead of
+  re-embedding. `ingest()` creates the index; the factory that opens the store
+  (`open_store()`) lives in `ingest.py` and is imported by the query side, so
+  both open it the same way.
 - **Voyage AI reranking** (`langchain-voyageai`) sharpens retrieval: vector search
   casts a wide net (`FETCH_K` candidates), then a cross-encoder reranker scores
   each candidate against the question *jointly* — which embedding cosine
@@ -261,7 +295,9 @@ data/           sample documents (swap in your own)
 Because these are LangChain integrations, swapping the embedding model or the
 chat model is a one-line change in `.env`. Swapping the vector store is a code
 change rather than a config one: `open_store()` in `ingest.py` is the single
-place `Chroma` is constructed, so it is the only place to edit.
+place the Mongo client and `MongoDBAtlasVectorSearch` are constructed, so it is
+the main place to edit — though the incremental bookkeeping in `ingest()` also
+speaks pymongo directly (its reads and deletes).
 
 ## Invariants
 
