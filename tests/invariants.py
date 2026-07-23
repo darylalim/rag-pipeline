@@ -75,18 +75,22 @@ def _blank(match: re.Match[str]) -> str:
 
 RULES = [
     Rule(
-        name="chroma-factory",
+        name="store-factory",
+        # tests/ is exempt: conftest constructs MongoClient directly to manage the
+        # local Atlas container, which is legitimate. ingest.py is the factory home.
         applies=lambda p: (
             p.endswith(".py")
             and not p.startswith("tests/")
             and p != "rag_pipeline/ingest.py"
         ),
-        pattern=re.compile(r"(?<![\w.])Chroma\s*\("),
+        pattern=re.compile(r"(?<![\w.])(?:MongoDBAtlasVectorSearch|MongoClient)\s*\("),
         scan_comments=False,
         message=(
-            "Constructing Chroma(...) inline. A collection's identity is (persist "
-            "dir, collection name, embedding function), so indexing and querying "
-            "must go through open_store() in rag_pipeline/ingest.py."
+            "Constructing the vector store inline. A collection's identity is "
+            "(connection URI, database, collection, vector index name, embedding "
+            "function), so indexing and querying must go through open_store() in "
+            "rag_pipeline/ingest.py -- never MongoDBAtlasVectorSearch(...) or "
+            "MongoClient(...) directly."
         ),
     ),
     Rule(

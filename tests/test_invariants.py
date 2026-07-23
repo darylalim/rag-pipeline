@@ -7,7 +7,7 @@ The rules that live in `invariants.py` are only the ones about how source is
 *written*. Their behavioral counterparts are asserted where the behavior is:
 `test_cli.py` proves cli.py's imports stay cheap, `test_pipeline.py` proves
 `build_chat_model` sets no sampling params, and `test_ingest.py` proves ingest
-leaves unrelated files in the persist dir alone.
+leaves a shared collection's foreign documents alone.
 """
 
 from __future__ import annotations
@@ -84,11 +84,15 @@ def test_the_sweep_actually_covers_the_tree() -> None:
 # --- the rules themselves, in-process ----------------------------------------
 
 VIOLATIONS = [
-    pytest.param("app.py", 'store = Chroma(collection_name="x")', id="inline-chroma"),
+    pytest.param(
+        "app.py",
+        "store = MongoDBAtlasVectorSearch(collection=c)",
+        id="inline-store",
+    ),
     pytest.param("app.py", "e = VoyageAIEmbeddings(model=m)", id="inline-embeddings"),
     pytest.param(
-        # tests/ may open Chroma directly, but never build a real embedding model.
-        # The rule catches the legacy HuggingFace spelling here too.
+        # tests/ may open the store directly, but never build a real embedding
+        # model. The rule catches the legacy HuggingFace spelling here too.
         "tests/test_pipeline.py",
         'emb = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")',
         id="embeddings-in-tests",
@@ -100,19 +104,20 @@ VIOLATIONS = [
 ALLOWED = [
     pytest.param(
         "rag_pipeline/ingest.py",
-        "return Chroma(collection_name=n)",
+        "return MongoDBAtlasVectorSearch(collection=c)",
         id="ingest-is-the-factory-home",
     ),
     pytest.param(
-        "tests/test_ingest.py",
-        'store = Chroma(collection_name="x")',
-        id="tests-may-open-chroma",
+        # tests/ construct MongoClient directly to manage the local container.
+        "tests/conftest.py",
+        "client = MongoClient(uri)",
+        id="tests-may-open-the-store",
     ),
     # Prose describing a rule must not trip it, or the rule cannot be documented.
     pytest.param(
         "app.py",
-        "# Never construct Chroma(...) inline -- use open_store().",
-        id="comment-describing-chroma-rule",
+        "# Never construct MongoClient(...) inline -- use open_store().",
+        id="comment-describing-store-rule",
     ),
     pytest.param(
         "rag_pipeline/config.py",
@@ -124,10 +129,12 @@ ALLOWED = [
         # indentation hides it: the case that proves multi-line string masking
         # works, and not merely that the single-line kind above does.
         "app.py",
-        'HELP = """\nChroma(collection_name="x")\n"""',
-        id="chroma-inside-a-docstring",
+        'HELP = """\nMongoClient(uri)\n"""',
+        id="store-inside-a-docstring",
     ),
-    pytest.param("README.md", "Never construct Chroma(...) inline.", id="not-python"),
+    pytest.param(
+        "README.md", "Never construct MongoClient(...) inline.", id="not-python"
+    ),
 ]
 
 
@@ -176,7 +183,7 @@ def test_an_undocumented_rule_is_reported(tmp_path: Path) -> None:
     Without this, `rules_problems` returning [] unconditionally — a bad regex, a
     renamed table — would read as success forever.
     """
-    (tmp_path / "README.md").write_text("| `chroma-factory` | only this one |\n")
+    (tmp_path / "README.md").write_text("| `store-factory` | only this one |\n")
     assert len(rules_problems(tmp_path)) == len(RULES) - 1
 
 
@@ -273,7 +280,11 @@ def test_every_env_var_actually_overrides_its_field(
     default = getattr(Settings, field.name)
     # isinstance, not type(): a Path default is a PosixPath, and bool must be
     # checked before int because bool subclasses it.
-    if isinstance(default, Path):
+    if var == "ATLAS_SIMILARITY":
+        # A validated field: its override must be a real metric other than the
+        # default, not the generic "sentinel" (which from_env rejects).
+        override = "dotProduct"
+    elif isinstance(default, Path):
         override = str(tmp_path)
     elif isinstance(default, bool):
         override = "1"

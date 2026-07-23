@@ -272,7 +272,7 @@ enforces them across every tracked `.py` file:
 
 | Rule                 | Forbids                                                        | Why |
 | -------------------- | -------------------------------------------------------------- | --- |
-| `chroma-factory`     | constructing `Chroma(...)` outside `ingest.py` — `tests/` exempt   | a collection's identity is (persist dir, name, embedding function); ingest and query must open it the same way |
+| `store-factory`      | constructing `MongoDBAtlasVectorSearch(...)` or `MongoClient(...)` outside `ingest.py` — `tests/` exempt | a collection's identity is (connection URI, database, collection, vector index name, embedding function); ingest and query must open it the same way |
 | `embeddings-factory` | constructing an embedding model (`VoyageAIEmbeddings(...)`) outside `ingest.py`, `tests/` included | the same model must embed documents and questions; in tests, inject a fake instead |
 | `no-suppressions`    | lint/type suppression comments                                   | fix the finding instead |
 
