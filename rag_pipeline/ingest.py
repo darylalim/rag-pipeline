@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import os
 import sys
+import threading
 import time
 from collections import defaultdict
 from collections.abc import Iterator
@@ -45,8 +46,17 @@ _VERSION_ID = "__rag_ingest_version__"
 # MongoClient is a connection pool that always reads current server state — so
 # the hazard inverts: the client must be created ONCE and reused, not cleared.
 # reset_store_cache() closes and drops it (connection hygiene + fresh-process
-# emulation for tests).
+# emulation for tests). The lock makes the lazy create/close atomic: Streamlit
+# can build two pipelines concurrently, and an unguarded check-then-set would
+# let both create a client and leak one.
 _client: MongoClient[dict[str, Any]] | None = None
+_client_lock = threading.Lock()
+
+# Ceiling and interval for the search-index readiness polls below. Not a Setting
+# (an internal build-latency bound, not user config), but named rather than
+# inlined so the two related timeouts stay one value.
+_INDEX_POLL_TIMEOUT_S = 120.0
+_INDEX_POLL_INTERVAL_S = 1.0
 
 
 def build_embeddings(settings: Settings) -> Embeddings:
@@ -78,15 +88,20 @@ def _get_client(settings: Settings) -> MongoClient[dict[str, Any]]:
     so it is guarded like the provider API keys rather than living in Settings.
     """
     global _client
+    # Double-checked: the common case (client already built) never takes the
+    # lock, and the create is serialized so two concurrent callers can't each
+    # build one and leak the loser.
     if _client is None:
-        require_env_key("MONGODB_URI", "The vector store is MongoDB Atlas")
-        with provider_errors_as_runtime():
-            client: MongoClient[dict[str, Any]] = MongoClient(
-                os.environ["MONGODB_URI"],
-                serverSelectionTimeoutMS=settings.mongodb_timeout_ms,
-            )
-            client.admin.command("ping")
-        _client = client
+        with _client_lock:
+            if _client is None:
+                require_env_key("MONGODB_URI", "The vector store is MongoDB Atlas")
+                with provider_errors_as_runtime():
+                    client: MongoClient[dict[str, Any]] = MongoClient(
+                        os.environ["MONGODB_URI"],
+                        serverSelectionTimeoutMS=settings.mongodb_timeout_ms,
+                    )
+                    client.admin.command("ping")
+                _client = client
     return _client
 
 
@@ -159,16 +174,17 @@ def reset_store_cache() -> None:
     """Close and drop the process-wide MongoClient.
 
     The inverse of the old chromadb cache-clear: there is no stale on-disk
-    snapshot to discard (a live server is always current), but the pooled client
-    must be created once and reused, so this is connection hygiene. Callers use
-    it to emulate a fresh CLI process -- the Streamlit app before rebuilding its
-    cached pipeline, and the tests at every boundary and between in-process
-    re-ingests.
+    snapshot to discard (a live server is always current), so production never
+    needs this -- a rebuilt pipeline reuses the live pooled client. It exists for
+    the tests, which call it at every boundary and between in-process re-ingests
+    to emulate a fresh CLI process. Locked, so it cannot race a concurrent
+    ``_get_client`` create.
     """
     global _client
-    if _client is not None:
-        _client.close()
-        _client = None
+    with _client_lock:
+        if _client is not None:
+            _client.close()
+            _client = None
 
 
 def index_version(settings: Settings) -> str:
@@ -183,7 +199,10 @@ def index_version(settings: Settings) -> str:
     """
     with provider_errors_as_runtime():
         doc = _collection(settings).find_one({"_id": _VERSION_ID}, {"digest": 1})
-    return doc["digest"] if doc else ""
+    # `.get`, not `doc["digest"]`: a marker present but missing the field (hand
+    # edited, a partial write) reads as "no version" rather than a KeyError that
+    # would escape the caught union into a crash page.
+    return doc.get("digest", "") if doc else ""
 
 
 def _read_pdf(path: Path) -> str:
@@ -359,7 +378,9 @@ def _ensure_vector_index(
 
 
 def _await_queryable(
-    collection: Collection[dict[str, Any]], index_name: str, timeout_s: float = 120.0
+    collection: Collection[dict[str, Any]],
+    index_name: str,
+    timeout_s: float = _INDEX_POLL_TIMEOUT_S,
 ) -> None:
     """Block until the named search index reports ``queryable`` is True.
 
@@ -373,7 +394,7 @@ def _await_queryable(
         info = list(collection.list_search_indexes(index_name))
         if info and info[0].get("queryable"):
             return
-        time.sleep(1)
+        time.sleep(_INDEX_POLL_INTERVAL_S)
     raise RuntimeError(
         f"Vector index {index_name!r} did not become queryable within {timeout_s:.0f}s."
     )
@@ -383,7 +404,7 @@ def _await_searchable(
     collection: Collection[dict[str, Any]],
     settings: Settings,
     ids: list[str],
-    timeout_s: float = 120.0,
+    timeout_s: float = _INDEX_POLL_TIMEOUT_S,
 ) -> None:
     """Block until freshly-inserted chunks are returned by ``$vectorSearch``.
 
@@ -396,37 +417,33 @@ def _await_searchable(
 
     Probes with one inserted chunk's own vector: under cosine it is its own
     nearest neighbour, so it surfaces the moment the index has caught up. The
-    query asks for as many results as were just added rather than only the top
-    one, because a repetitive corpus embeds distinct chunks to *identical*
-    vectors -- the probe then ties with its duplicates, and a top-1 query could
-    stably return a tie-mate instead of the probe itself, never matching even
-    once everything is searchable. Its ties are a subset of what was added, so a
-    limit of ``len(ids)`` (capped at the $vectorSearch maximum) always includes it.
+    search is pre-filtered to that chunk's own ``source`` (an indexed filter
+    field), which both keeps the exact (brute-force) scan off the rest of the
+    collection and bounds the tie set: a repetitive corpus embeds distinct chunks
+    to *identical* vectors, so a top-1 query could stably return a tie-mate rather
+    than the probe itself and never match; asking for ``len(ids)`` results (capped
+    at the $vectorSearch maximum) within the one source always includes the probe.
     """
-    probe = collection.find_one({"_id": ids[0]}, {"embedding": 1})
+    probe = collection.find_one({"_id": ids[0]}, {"embedding": 1, "source": 1})
     if not probe or "embedding" not in probe:
         return
-    query_vector = probe["embedding"]
-    limit = min(len(ids), 10000)
+    stage: dict[str, Any] = {
+        "index": settings.vector_index_name,
+        "path": "embedding",
+        "queryVector": probe["embedding"],
+        "exact": True,
+        "limit": min(len(ids), 10000),
+    }
+    if probe.get("source") is not None:
+        stage["filter"] = {"source": probe["source"]}
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         hits = collection.aggregate(
-            [
-                {
-                    "$vectorSearch": {
-                        "index": settings.vector_index_name,
-                        "path": "embedding",
-                        "queryVector": query_vector,
-                        "exact": True,
-                        "limit": limit,
-                    }
-                },
-                {"$project": {"_id": 1}},
-            ]
+            [{"$vectorSearch": stage}, {"$project": {"_id": 1}}]
         )
         if any(hit["_id"] == ids[0] for hit in hits):
             return
-        time.sleep(1)
+        time.sleep(_INDEX_POLL_INTERVAL_S)
     raise RuntimeError("Newly ingested documents did not become searchable in time.")
 
 
@@ -564,5 +581,8 @@ def ingest(settings: Settings, embeddings: Embeddings | None = None) -> int:
         if new_chunks:
             _await_searchable(collection, settings, ids)
 
-        _write_index_version(collection, fresh)
+        # Only when the corpus actually changed: on a no-op re-ingest the stored
+        # digest already equals hash(fresh), so re-writing it is a needless write.
+        if new_chunks or superseded:
+            _write_index_version(collection, fresh)
     return len(chunks)

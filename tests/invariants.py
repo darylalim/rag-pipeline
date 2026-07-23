@@ -12,11 +12,11 @@ thought to enumerate. Enforced that way, and deliberately not in ``RULES``:
 
 - the exception union, the empty-collection guard, and ``source`` metadata on
   loaders (``test_pipeline.py``, ``test_ingest.py``)
-- ingest never wiping the persist directory --
-  ``test_ingest_preserves_unrelated_files_in_persist_dir`` notices a neighbouring
-  file being deleted by any means, not only a literal ``rmtree``
+- ingest never deleting documents it did not write --
+  ``test_ingest_preserves_foreign_documents_in_a_shared_collection`` notices a
+  foreign document being deleted by any means, not only a literal wipe
 - cli.py's lazy imports -- ``test_importing_cli_does_not_load_the_heavy_stack``
-  imports the module in a subprocess and asserts chromadb/langchain never
+  imports the module in a subprocess and asserts pymongo/langchain never
   loaded, covering routes no list of import spellings would reach
 - ``build_chat_model`` setting no sampling params --
   ``test_build_chat_model_sets_no_sampling_params`` reads them back off the

@@ -17,7 +17,6 @@ from rag_pipeline.ingest import (
     SUPPORTED_SUFFIXES,
     index_version,
     ingest,
-    reset_store_cache,
     save_upload,
 )
 from rag_pipeline.pipeline import Excerpt, RAGPipeline, source_excerpts
@@ -34,8 +33,9 @@ st.session_state.setdefault("messages", [])
 
 # Bounded because `version` is a deliberately changing key: every rebuild mints
 # a new entry, and cache_resource never evicts on its own, so unbounded each
-# `rag ingest` against a running server strands another embedding model and
-# Mongo client for the life of the process.
+# `rag ingest` against a running server strands another embedding model for the
+# life of the process. (The Mongo client is not multiplied — it is a single
+# process-wide pool every pipeline shares.)
 #
 # Two entries rather than one. The digest is a single server-authoritative
 # value, so the two-sessions-derive-different-keys race the mtime had is gone;
@@ -48,12 +48,12 @@ def load_pipeline(_settings: Settings, version: str) -> RAGPipeline:
     `version` (the corpus fingerprint digest) is the cache key: it changes when
     `rag ingest` re-embeds the store, busting this cache. `_settings` is passed
     in — the leading underscore tells Streamlit not to hash it — so we don't
-    re-read the environment here. On a rebuild we drop the pooled Mongo client
-    first, so the fresh pipeline reconnects rather than reusing a client from a
-    torn-down run.
+    re-read the environment here. The rebuilt pipeline reuses the process-wide
+    Mongo client rather than resetting it: a live pool is always current, so
+    there is nothing stale to drop, and closing it would strand the still-cached
+    outgoing pipeline (kept by `max_entries`) on a dead connection.
     """
     del version  # used only as the cache key; not needed in the body
-    reset_store_cache()  # drop the pooled client so this pipeline reconnects fresh
     return RAGPipeline(_settings)
 
 
