@@ -7,10 +7,9 @@ license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = [
-    "langchain-core>=0.3",
-    "langchain-text-splitters>=0.3",
-    "langchain-chroma>=0.2",
-    "langchain-anthropic>=0.3",
+    "langchain-core>=1.2.5",
+    "langchain-text-splitters>=1.0",
+    "langchain-anthropic>=1.0",
     # Imported directly by pipeline.py, which catches anthropic.APIError to
     # translate provider failures into RuntimeError. Declared rather than left
     # transitive through langchain-anthropic: an import we name ourselves is an
@@ -20,8 +19,16 @@ dependencies = [
     # Voyage AI embeddings, used by build_embeddings() at both ingest and query.
     # The voyageai SDK it wraps is a thin HTTP client (no torch), so there is no
     # local model to download and nothing platform-specific to pin.
-    "langchain-voyageai>=0.1.4",
-    "chromadb>=0.5",
+    "langchain-voyageai>=0.2",
+    # MongoDB Atlas Vector Search — the vector store (build_embeddings + open_store
+    # live in ingest.py). langchain-mongodb wraps pymongo; pymongo is declared
+    # directly because ingest.py/pipeline.py import it themselves — for
+    # SearchIndexModel at ingest, and to translate pymongo/bson errors into the
+    # FileNotFoundError | RuntimeError | ValueError union both frontends catch.
+    # dnspython (an unconditional pymongo dep) makes mongodb+srv:// work with no
+    # [srv] extra.
+    "langchain-mongodb>=0.11.0",
+    "pymongo>=4.7",
     "streamlit>=1.59",
     "python-dotenv>=1.0",
     "pypdf>=5.0",
@@ -42,6 +49,7 @@ dev = [
     "pytest>=9.1.1",
     "pytest-cov>=7.0",
     "ruff>=0.15.22",
+    "testcontainers[mongodb]>=4.0",
     "ty>=0.0.61",
 ]
 
