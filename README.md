@@ -116,24 +116,29 @@ including where that boundary deliberately stops.
 
 ## Configuration
 
-Everything is set in `.env` (see `.env.example`). `ANTHROPIC_API_KEY` and
-`VOYAGE_API_KEY` are required; the rest have sensible defaults:
+Everything is set in `.env` (see `.env.example`). `ANTHROPIC_API_KEY`,
+`VOYAGE_API_KEY` and `MONGODB_URI` are required; the rest have sensible defaults:
 
 | Variable            | Default            | Purpose |
 | ------------------- | ------------------ | ------- |
 | `ANTHROPIC_API_KEY` | —                  | Anthropic key (generation) |
 | `VOYAGE_API_KEY`    | —                  | Voyage AI key — embedding (ingest + query) and reranking (query) |
+| `MONGODB_URI`       | —                  | MongoDB Atlas connection string (the vector store); carries credentials, so it is a key, not a tunable |
 | `CHAT_MODEL`        | `claude-haiku-4-5` | Generation model (e.g. `claude-opus-4-8` for higher-quality answers) |
 | `MAX_TOKENS`        | `1024`             | Maximum length of a generated answer |
 | `EMBEDDING_MODEL`   | `voyage-4-lite`    | Voyage AI embedding model |
+| `EMBEDDING_DIMENSIONS` | `1024`          | Width of the embedding vectors; pins the Atlas index's `numDimensions` |
 | `RETRIEVAL_K`       | `4`                | Chunks kept after reranking |
 | `FETCH_K`           | `20`               | Candidates retrieved before reranking |
 | `RERANK_MODEL`      | `rerank-2.5-lite`  | Voyage AI reranker (cross-encoder; e.g. `rerank-2.5` for higher quality) |
 | `CHUNK_SIZE`        | `1000`             | Characters per chunk |
 | `CHUNK_OVERLAP`     | `200`              | Overlap between adjacent chunks |
 | `DATA_DIR`          | `./data`           | Source documents |
-| `PERSIST_DIR`       | `./chroma_db`      | Where the index is stored |
-| `COLLECTION_NAME`   | `rag_docs`         | Chroma collection holding the vectors — must match between ingest and query |
+| `MONGODB_DB`        | `rag_db`           | Atlas database holding the collection |
+| `COLLECTION_NAME`   | `rag_docs`         | Atlas collection holding the vectors — must match between ingest and query |
+| `VECTOR_INDEX_NAME` | `vector_index`     | Atlas Vector Search index over the collection — must match between ingest and query |
+| `ATLAS_SIMILARITY`  | `cosine`           | Vector similarity metric (`cosine`, `euclidean`, or `dotProduct`) |
+| `MONGODB_TIMEOUT_MS` | `10000`           | `serverSelectionTimeoutMS` for the Mongo client |
 
 Optional LangSmith tracing (`LANGSMITH_TRACING=true` + `LANGSMITH_API_KEY`, with
 `LANGSMITH_PROJECT` naming the project) is picked up automatically if set — see
