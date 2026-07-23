@@ -359,9 +359,15 @@ def _ensure_vector_index(
 
 
 def _await_queryable(
-    collection: Collection[dict[str, Any]], index_name: str, timeout_s: float = 90.0
+    collection: Collection[dict[str, Any]], index_name: str, timeout_s: float = 120.0
 ) -> None:
-    """Block until the named search index reports ``queryable`` is True."""
+    """Block until the named search index reports ``queryable`` is True.
+
+    The ceiling is generous because the poll returns the instant the index is
+    ready: it only bites when the search process is genuinely lagging (a busy
+    shared mongot, a cold cluster), where a short timeout would surface a false
+    "index never built" for what a moment's wait would have resolved.
+    """
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         info = list(collection.list_search_indexes(index_name))
@@ -377,7 +383,7 @@ def _await_searchable(
     collection: Collection[dict[str, Any]],
     settings: Settings,
     ids: list[str],
-    timeout_s: float = 60.0,
+    timeout_s: float = 120.0,
 ) -> None:
     """Block until freshly-inserted chunks are returned by ``$vectorSearch``.
 
@@ -389,12 +395,19 @@ def _await_searchable(
     them, and ``retrieve()`` stays free of a poll on the hot path.
 
     Probes with one inserted chunk's own vector: under cosine it is its own
-    nearest neighbour, so it ranks first the moment the index has caught up.
+    nearest neighbour, so it surfaces the moment the index has caught up. The
+    query asks for as many results as were just added rather than only the top
+    one, because a repetitive corpus embeds distinct chunks to *identical*
+    vectors -- the probe then ties with its duplicates, and a top-1 query could
+    stably return a tie-mate instead of the probe itself, never matching even
+    once everything is searchable. Its ties are a subset of what was added, so a
+    limit of ``len(ids)`` (capped at the $vectorSearch maximum) always includes it.
     """
     probe = collection.find_one({"_id": ids[0]}, {"embedding": 1})
     if not probe or "embedding" not in probe:
         return
     query_vector = probe["embedding"]
+    limit = min(len(ids), 10000)
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         hits = collection.aggregate(
@@ -405,7 +418,7 @@ def _await_searchable(
                         "path": "embedding",
                         "queryVector": query_vector,
                         "exact": True,
-                        "limit": 1,
+                        "limit": limit,
                     }
                 },
                 {"$project": {"_id": 1}},
@@ -517,12 +530,11 @@ def ingest(settings: Settings, embeddings: Embeddings | None = None) -> int:
                 new_chunks.append(chunk)
                 ids.append(f"{source}:{i}:{chunk.metadata['content_hash']}")
 
-        # Validate the declared width against the live model *before* creating an
-        # index or embedding anything -- Atlas would otherwise accept a
-        # wrong-width vector on insert and only fail at query time. Only when
-        # there is something to embed, so an unchanged re-ingest still makes no
-        # embedding call at all (embed_query here is the sole exception, and it
-        # runs only on a run that is about to embed documents regardless).
+        # Validate the declared width against the live model *before* any write --
+        # Atlas would otherwise accept a wrong-width vector on insert and only fail
+        # at query time. Only when there is something to embed, so an unchanged
+        # re-ingest still makes no embedding call at all (this embed_query is the
+        # sole exception, and it runs only on a run about to embed documents anyway).
         if new_chunks:
             probe_dims = len(embedder.embed_query("dimension probe"))
             if probe_dims != settings.embedding_dimensions:
@@ -532,8 +544,11 @@ def ingest(settings: Settings, embeddings: Embeddings | None = None) -> int:
                     f"Set EMBEDDING_DIMENSIONS={probe_dims}."
                 )
 
-        _ensure_vector_index(collection, settings)
-
+        # Delete superseded chunks, then add changed ones, then build the index.
+        # The order is forced by Atlas: MongoDB creates the collection implicitly
+        # on the first insert, and create_search_index over a namespace that does
+        # not exist yet fails -- so the index can only be ensured once documents
+        # are present.
         superseded = [
             source for source in indexed if fresh.get(source) != indexed[source]
         ]
@@ -541,9 +556,12 @@ def ingest(settings: Settings, embeddings: Embeddings | None = None) -> int:
             collection.delete_many(
                 {"source": {"$in": superseded}, "content_hash": {"$exists": True}}
             )
-
         if new_chunks:
             store.add_documents(new_chunks, ids=ids)
+
+        _ensure_vector_index(collection, settings)
+
+        if new_chunks:
             _await_searchable(collection, settings, ids)
 
         _write_index_version(collection, fresh)
