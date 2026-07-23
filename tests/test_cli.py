@@ -47,9 +47,9 @@ def test_ingest_reports_where_it_wrote_and_how_much(wired_env, capsys):
     out = capsys.readouterr().out
     assert "Indexed" in out
     assert "chunks" in out
-    # The path is the actionable half: an ingest that silently wrote somewhere
-    # else is the failure a user cannot otherwise see.
-    assert str(wired_env.persist_dir) in out
+    # The namespace is the actionable half: an ingest that silently wrote to a
+    # different database or collection is the failure a user cannot otherwise see.
+    assert f"{wired_env.mongodb_db}.{wired_env.collection_name}" in out
 
 
 def test_query_prints_the_answer_then_its_sources(indexed, capsys, canned_answer):
@@ -177,16 +177,15 @@ def test_settings_come_from_the_environment_not_a_literal(
     Asserted through `rag ingest`'s own output rather than by reading Settings,
     so it covers the wiring from environment to command and not just `from_env`.
     """
-    elsewhere = wired_env.persist_dir.parent / "moved"
-    monkeypatch.setenv("PERSIST_DIR", str(elsewhere))
+    # A distinctive collection, within the fixture's own (auto-dropped) database.
+    monkeypatch.setenv("COLLECTION_NAME", "a_distinctive_collection")
 
     assert cli.main(["ingest"]) == 0
 
-    # Compared against the path this test chose, not against a second
+    # Compared against the value this test chose, not against a second
     # `from_env()` call -- that would derive both sides from one source and pass
     # even if the command ignored the environment entirely.
-    assert str(elsewhere) in capsys.readouterr().out
-    assert elsewhere.exists()
+    assert "a_distinctive_collection" in capsys.readouterr().out
 
 
 # --- the cost of `rag --help` ------------------------------------------------
@@ -195,11 +194,11 @@ def test_settings_come_from_the_environment_not_a_literal(
 # inside a command function: importing the module must not pay for a stack the
 # user may never reach, since `rag --help` and a usage error load cli.py and
 # then exit.
-HEAVY = ("chromadb", "langchain_chroma", "langchain_voyageai", "langchain_anthropic")
+HEAVY = ("pymongo", "langchain_mongodb", "langchain_voyageai", "langchain_anthropic")
 
 
 def test_importing_cli_does_not_load_the_heavy_stack():
-    """`import rag_pipeline.cli` must not drag in chromadb/langchain.
+    """`import rag_pipeline.cli` must not drag in pymongo/langchain.
 
     The behavioral form of what used to be a text rule matching import
     spellings in cli.py. Asserting on `sys.modules` is strictly stronger: it

@@ -238,14 +238,16 @@ def test_an_uploaded_document_is_indexed_and_answerable(app, wired_env):
     )
 
 
-def test_documents_can_be_added_before_any_index_exists(app, settings, monkeypatch):
+def test_documents_can_be_added_before_any_index_exists(app, monkeypatch):
     """The bootstrap case, and the reason the sidebar renders above the guard.
 
     With no index the app stops before the chat input, which is exactly when a
     user needs the uploader most — so it must be on screen in the failed state,
     and using it must lift the app out of that state without a reload.
     """
-    monkeypatch.setenv("PERSIST_DIR", str(settings.persist_dir / "fresh"))
+    # A collection never ingested into (within the fixture's own database), so it
+    # has no vector index — the "no index yet" state, without a persist dir.
+    monkeypatch.setenv("COLLECTION_NAME", "fresh_uningested_collection")
     st.cache_resource.clear()
 
     at = app.run()
@@ -405,12 +407,12 @@ def test_an_uploaded_name_cannot_escape_the_data_dir(app, wired_env, tmp_path):
     assert not (tmp_path.parent / "escape.md").exists(), "wrote outside data_dir"
 
 
-def test_missing_index_is_reported_not_raised(app, settings, monkeypatch):
+def test_missing_index_is_reported_not_raised(app, monkeypatch):
     """A setup failure must land in the caught union and render as a message."""
-    monkeypatch.setenv("PERSIST_DIR", str(settings.persist_dir / "no-such-index"))
+    monkeypatch.setenv("COLLECTION_NAME", "never_ingested_collection")
     st.cache_resource.clear()
 
     at = app.run()
     assert not at.exception, [e.value for e in at.exception]
-    assert any("No index found at" in e.value for e in at.error)
+    assert any("No queryable vector index" in e.value for e in at.error)
     assert not at.chat_input, "the app must stop before offering an input"

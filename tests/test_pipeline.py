@@ -79,11 +79,12 @@ def test_format_docs_labels_each_source():
     assert "world" in out
 
 
-def test_pipeline_requires_index(settings, monkeypatch):
-    # Key is present so we know it's the *index* check that fails, not the key.
+def test_pipeline_requires_index(settings, fake_embeddings, monkeypatch):
+    # Key present, embeddings injected: so it is the *index* check that fails,
+    # not the ANTHROPIC or VOYAGE key guard. Nothing ingested -> no vector index.
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-fake")
-    with pytest.raises(FileNotFoundError):
-        RAGPipeline(settings)  # nothing ingested yet
+    with pytest.raises(FileNotFoundError, match="No queryable vector index"):
+        RAGPipeline(settings, embeddings=fake_embeddings)  # nothing ingested yet
 
 
 def test_pipeline_requires_api_key(settings, fake_embeddings, monkeypatch):
@@ -94,10 +95,16 @@ def test_pipeline_requires_api_key(settings, fake_embeddings, monkeypatch):
 
 
 def test_pipeline_rejects_empty_index(settings, fake_embeddings, monkeypatch):
-    # persist_dir exists but nothing was ingested -> loud error, not silent empty.
+    # A queryable index over zero of this pipeline's chunks -> loud error, not a
+    # silent "I don't know" to every question. Build the index by ingesting, then
+    # drop the chunks (keeping the index), reaching exactly that state.
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-fake")
-    settings.persist_dir.mkdir(parents=True, exist_ok=True)
-    with pytest.raises(FileNotFoundError):
+    ingest_mod.ingest(settings, embeddings=fake_embeddings)
+    ingest_mod.reset_store_cache()
+    store = ingest_mod.open_store(settings, fake_embeddings)
+    store.collection.delete_many({"content_hash": {"$exists": True}})
+    ingest_mod.reset_store_cache()
+    with pytest.raises(FileNotFoundError, match="is empty"):
         RAGPipeline(settings, embeddings=fake_embeddings)
 
 
@@ -257,34 +264,30 @@ def test_answer_injects_retrieved_context_into_prompt(
     assert result.sources[0].metadata["source"] in human
 
 
-def test_collection_mismatch_is_caught_by_the_empty_collection_guard(
+def test_collection_mismatch_is_caught_by_the_index_guard(
     settings, fake_embeddings, fake_reranker, monkeypatch
 ):
-    """Pins *which* guard rejects a COLLECTION_NAME mismatch, and that the index
-    it rejected was not actually empty.
+    """Pins *which* guard rejects a COLLECTION_NAME mismatch, and that the store
+    it rejected was not actually broken.
 
-    Chroma's `get_or_create` hands back a silently-empty collection when the
-    name doesn't match what was ingested, so without the guard every question is
-    answered "I don't know". `raises(FileNotFoundError)` alone can't tell that
-    guard apart from the `persist_dir.exists()` check that runs before it — a
-    populated persist_dir plus `match=` does. The `reset_store_cache()` puts the
-    re-open in the state a real `rag query` starts from, rather than letting
-    chromadb's per-process client cache decide the outcome.
+    A wrong COLLECTION_NAME (or MONGODB_DB) points at a different physical
+    namespace, which has no vector index — so unlike Chroma's silently-empty
+    `get_or_create`, the mismatch surfaces as the *index* guard, not the
+    empty-collection one. `match=` pins that, and the correctly-named collection
+    still retrieving proves the rejection was about the name, not a genuine
+    problem. The `reset_store_cache()` puts each re-open in the state a real
+    `rag query` starts from.
     """
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-fake")
     ingest_mod.ingest(settings, embeddings=fake_embeddings)
     ingest_mod.reset_store_cache()
 
     mismatched = dataclasses.replace(settings, collection_name="not_the_ingested_one")
-    assert mismatched.persist_dir.exists(), (
-        "the index must exist for this to prove anything"
-    )
-
-    with pytest.raises(FileNotFoundError, match="is empty"):
+    with pytest.raises(FileNotFoundError, match="No queryable vector index"):
         RAGPipeline(mismatched, embeddings=fake_embeddings)
 
     # And the correctly-named collection still retrieves: the failure above was
-    # about the name, not a genuinely empty index.
+    # about the name, not a genuinely missing index.
     ingest_mod.reset_store_cache()
     assert RAGPipeline(
         settings, embeddings=fake_embeddings, reranker=fake_reranker
@@ -372,10 +375,8 @@ def _fail_pipeline_missing_index(
     settings, fake_embeddings, fake_reranker, monkeypatch, tmp_path
 ):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-fake")
-    RAGPipeline(
-        dataclasses.replace(settings, persist_dir=tmp_path / "no-such-index"),
-        embeddings=fake_embeddings,
-    )
+    # Nothing ingested into this unique namespace, so there is no vector index.
+    RAGPipeline(settings, embeddings=fake_embeddings)
 
 
 def _fail_pipeline_missing_api_key(
@@ -392,7 +393,25 @@ def _fail_pipeline_empty_collection(
     settings, fake_embeddings, fake_reranker, monkeypatch, tmp_path
 ):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-fake")
-    settings.persist_dir.mkdir(parents=True, exist_ok=True)
+    # A queryable index over zero of this pipeline's chunks: ingest, then drop the
+    # chunks but leave the index standing.
+    ingest_mod.ingest(settings, embeddings=fake_embeddings)
+    ingest_mod.reset_store_cache()
+    store = ingest_mod.open_store(settings, fake_embeddings)
+    store.collection.delete_many({"content_hash": {"$exists": True}})
+    ingest_mod.reset_store_cache()
+    RAGPipeline(settings, embeddings=fake_embeddings)
+
+
+def _fail_pipeline_bad_mongo_uri(
+    settings, fake_embeddings, fake_reranker, monkeypatch, tmp_path
+):
+    # A malformed MONGODB_URI must translate to RuntimeError, not ValueError, so
+    # it lands in the branch app.py catches below its sidebar (keeping the
+    # uploader reachable) rather than the one that stops the script above it.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-fake")
+    monkeypatch.setenv("MONGODB_URI", "not-a-valid://uri")
+    ingest_mod.reset_store_cache()  # force the client to rebuild with the bad URI
     RAGPipeline(settings, embeddings=fake_embeddings)
 
 
@@ -496,20 +515,12 @@ def _fail_ingest_on_voyage_error(
 def _fail_ingest_dimension_change(
     settings, fake_embeddings, fake_reranker, monkeypatch, tmp_path
 ):
-    # A collection keeps its dimensionality after its ids are deleted, so a
-    # re-ingest with a different-sized model — as an EMBEDDING_MODEL change would
-    # give — hits chromadb's dimension check on add.
-    #
-    # EMBEDDING_MODEL moves with the injected fake, and must: ingest() re-embeds
-    # only what its fingerprint says is stale, and the model name is part of that
-    # fingerprint. A different-sized model injected under the *same* name is a
-    # state production cannot reach — the name is the only way to ask for a
-    # different model — so pinning it here would test a mismatch nothing can
-    # produce, and let the real one through unembedded.
-    ingest_mod.ingest(settings, embeddings=DeterministicFakeEmbedding(size=8))
-    ingest_mod.reset_store_cache()
+    # Atlas accepts a wrong-width vector on insert and only fails at query time,
+    # so the guard is ingest's own probe: a model whose actual width disagrees
+    # with EMBEDDING_DIMENSIONS raises a ValueError before anything is written.
+    # (Under Chroma this surfaced as a dimension error at add time instead.)
     ingest_mod.ingest(
-        dataclasses.replace(settings, embedding_model="voyage-4"),
+        dataclasses.replace(settings, embedding_dimensions=8),
         embeddings=DeterministicFakeEmbedding(size=16),
     )
 
@@ -573,8 +584,14 @@ def _fail_retrieve_on_rerank_error(
         pytest.param(
             _fail_pipeline_missing_index,
             FileNotFoundError,
-            "No index found at",
+            "No queryable vector index",
             id="pipeline-missing-index",
+        ),
+        pytest.param(
+            _fail_pipeline_bad_mongo_uri,
+            RuntimeError,
+            "Vector store request failed",
+            id="pipeline-mongo-connection-error",
         ),
         pytest.param(
             _fail_pipeline_missing_api_key,
@@ -626,8 +643,8 @@ def _fail_retrieve_on_rerank_error(
         ),
         pytest.param(
             _fail_ingest_dimension_change,
-            RuntimeError,
-            "EMBEDDING_MODEL",
+            ValueError,
+            "EMBEDDING_DIMENSIONS",
             id="ingest-dimension-mismatch",
         ),
         pytest.param(

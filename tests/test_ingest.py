@@ -7,7 +7,6 @@ import io
 from pathlib import Path
 
 import pytest
-from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from pypdf import PdfWriter
@@ -248,22 +247,37 @@ def test_save_upload_writes_bytes_unchanged(tmp_path):
     assert "Uploaded page text" in docs[0].page_content
 
 
-def test_ingest_preserves_unrelated_files_in_persist_dir(settings, fake_embeddings):
-    """ingest() is a scoped collection rebuild, never a directory wipe.
+def test_ingest_preserves_foreign_documents_in_a_shared_collection(
+    settings, fake_embeddings
+):
+    """ingest() is a scoped rebuild, never a collection wipe.
 
-    The sole enforcement of that invariant, and enough on its own: a text rule
-    forbidding `rmtree` in this module only ever caught one spelling, while a
-    surviving neighbour proves the property however the deletion was written --
-    `unlink` in a loop, `shutil.rmtree` aliased, a Chroma call that resets more
-    than the collection.
+    The document-level successor to the old persist-dir guard, and stronger,
+    because Atlas has no separate directory to preserve -- the collection itself
+    may be shared. A document this pipeline did not write (no `content_hash`)
+    must survive a rebuild that *does* delete, however the deletion is written.
+    Proves the {"content_hash": {"$exists": True}} scoping on every read and
+    delete: without it, ingest's deletion set would sweep up foreign documents,
+    which under Chroma's exclusive persist dir could never happen.
     """
-    settings.persist_dir.mkdir(parents=True, exist_ok=True)
-    sentinel = settings.persist_dir / "KEEP_ME.txt"
-    sentinel.write_text("do not delete", encoding="utf-8")
-
     ingest_mod.ingest(settings, embeddings=fake_embeddings)
 
-    assert sentinel.exists(), "ingest must not delete unrelated files in persist_dir"
+    ingest_mod.reset_store_cache()
+    store = ingest_mod.open_store(settings, fake_embeddings)
+    # No content_hash, no source, no embedding: unrelated application data.
+    store.collection.insert_one({"_id": "external:1", "text": "unrelated app data"})
+
+    # Force a real deletion path: remove a file so the re-ingest runs delete_many.
+    (settings.data_dir / "a.md").unlink()
+    ingest_mod.reset_store_cache()
+    ingest_mod.ingest(settings, embeddings=fake_embeddings)
+
+    ingest_mod.reset_store_cache()
+    store = ingest_mod.open_store(settings, fake_embeddings)
+    assert store.collection.find_one({"_id": "external:1"}) is not None, (
+        "ingest must not delete documents it did not write"
+    )
+    assert "a.md" not in sources_in(settings, fake_embeddings)
 
 
 def test_split_preserves_source_and_bounds_chunk_size(settings):
@@ -280,7 +294,7 @@ def test_split_preserves_source_and_bounds_chunk_size(settings):
 def test_ingest_empty_dir_raises(tmp_path, fake_embeddings):
     empty = tmp_path / "data"
     empty.mkdir()
-    s = Settings(data_dir=empty, persist_dir=tmp_path / "chroma")
+    s = Settings(data_dir=empty)
 
     # `match` pins this to the empty-corpus ValueError; without it the test
     # would also pass on an unrelated ValueError (e.g. a bad numeric env var).
@@ -297,14 +311,12 @@ def test_ingest_is_idempotent(settings, fake_embeddings):
 
     assert n1 == n2 >= 2
 
-    # The rebuilt store holds n2 vectors, not 2*n2 — no duplicate append.
+    # The collection holds n2 chunks, not 2*n2 — deterministic _ids make the
+    # re-add an idempotent upsert-replace, not a duplicating append.
     ingest_mod.reset_store_cache()
-    store = Chroma(
-        collection_name=settings.collection_name,
-        embedding_function=fake_embeddings,
-        persist_directory=str(settings.persist_dir),
-    )
-    assert len(store.get()["ids"]) == n2
+    store = ingest_mod.open_store(settings, fake_embeddings)
+    held = store.collection.count_documents({"content_hash": {"$exists": True}})
+    assert held == n2
 
 
 # --- incremental re-indexing -------------------------------------------------
@@ -336,10 +348,20 @@ def counting_embeddings(fake_embeddings):
 
 
 def sources_in(settings, embeddings) -> set[str]:
-    """Every `source` the persisted collection currently holds chunks for."""
+    """Every `source` the collection currently holds this pipeline's chunks for.
+
+    Reads the raw pymongo collection — MongoDBAtlasVectorSearch has no enumerate
+    — scoped to this pipeline's own documents, and flattened top-level metadata
+    means `source` is a plain field.
+    """
     ingest_mod.reset_store_cache()
     store = ingest_mod.open_store(settings, embeddings)
-    return {meta["source"] for meta in store.get(include=["metadatas"])["metadatas"]}
+    return {
+        doc["source"]
+        for doc in store.collection.find(
+            {"content_hash": {"$exists": True}}, {"source": 1}
+        )
+    }
 
 
 def test_reingest_embeds_nothing_when_no_document_changed(
