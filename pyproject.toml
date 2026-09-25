@@ -20,6 +20,14 @@ dependencies = [
     # inject fakes rather than models.
     "mlx>=0.32.2 ; sys_platform == 'darwin'",
     "mlx-lm>=0.31.3 ; sys_platform == 'darwin'",
+    # The reranker and chat-model adapters are pydantic models, as their
+    # langchain base classes are, and mlx_models.py imports PrivateAttr and
+    # model_validator itself -- at module level, so pydantic is declared
+    # directly, and on every platform, rather than left to langchain-core.
+    # 2.10 is where pydantic stopped reserving the whole `model_` prefix: below
+    # it, the reranker's `model_id` field is a UserWarning on every `rag
+    # ingest`, `rag query` and app start.
+    "pydantic>=2.10",
     # Chroma, the vector store: an in-process PersistentClient under
     # PERSIST_DIR. chromadb is declared directly because ingest.py imports it
     # (the client, its Settings, and chromadb.errors for the RuntimeError
@@ -44,9 +52,9 @@ dependencies = [
     # Phoenix reads. tracing.py builds the provider (the OpenInference one:
     # the SDK's own caps a span at 128 attributes, which a reranker span
     # passes from a FETCH_K of about 37), exports over OTLP/HTTP, and
-    # instruments LangChain. All six are imported directly, so all six are declared. Not
-    # arize-phoenix-otel: its register() cannot bound the exporter's timeout,
-    # and reads PHOENIX_* settings from outside Settings.
+    # instruments LangChain. All six are imported directly, so all six are
+    # declared. Not arize-phoenix-otel: its register() cannot bound the
+    # exporter's timeout, and reads PHOENIX_* settings from outside Settings.
     "opentelemetry-api>=1.44.0",
     "opentelemetry-sdk>=1.44.0",
     "opentelemetry-exporter-otlp-proto-http>=1.44.0",
@@ -67,6 +75,10 @@ packages = ["rag_pipeline"]
 
 [dependency-groups]
 dev = [
+    # ExportTraceServiceRequest: test_tracing.py's stand-in collector decodes
+    # what the exporter posts with OTLP's own protobuf types. The exporter's
+    # floor, since each exporter release pins opentelemetry-proto to its own.
+    "opentelemetry-proto>=1.44.0",
     # reset_trace_globals(): OpenTelemetry lets a process set its tracer
     # provider once, so the tests that record spans reset it between them.
     "opentelemetry-test-utils>=0.65b0",
