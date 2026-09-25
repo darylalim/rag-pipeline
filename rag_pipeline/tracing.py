@@ -31,11 +31,12 @@ from rag_pipeline.config import Settings
 
 # Seconds the exporter may spend on one batch, retries included, when Phoenix
 # is down: a refused connection costs about half of it, a host that never
-# answers about twice it. It is what keeps the flush a finished `rag query`
-# makes at exit short -- that flush first waits out any batch already being
-# sent, so it caps each export rather than the whole wait. A local Phoenix
-# accepts a batch in milliseconds, so this is reached only when something is
-# wrong -- not a tunable.
+# answers all of it (twice it before OpenTelemetry 1.45: the older exporter
+# retried a timed-out connect with a fresh budget). It is what keeps the flush a
+# finished `rag query` makes at exit short -- that flush first waits out any
+# batch already being sent, so it caps each export rather than the whole wait.
+# A local Phoenix accepts a batch in milliseconds, so this is reached only when
+# something is wrong -- not a tunable.
 _EXPORT_TIMEOUT_S = 2.0
 
 # Streamlit runs every session's script on its own thread, and each rerun calls
@@ -100,9 +101,12 @@ def setup_tracing(settings: Settings) -> None:
         # retry budget. The batch goes out on a background thread instead, and
         # whatever is queued at exit is flushed then.
         #
-        # Each of these also reads the standard OTEL_* variables -- limits,
-        # batch sizes, compression -- and a malformed one is a builtins
-        # ValueError that would escape the app's guard. Nothing is installed
+        # Each of these also reads the standard OTEL_* variables. Most
+        # malformed ones are logged and replaced by a default, but a malformed
+        # span limit, or an out-of-range batch setting (zero, or a batch larger
+        # than its queue), is a builtins ValueError that would escape the app's
+        # guard -- as were an unknown compression and an out-of-range sampler
+        # ratio, before OpenTelemetry 1.45. Nothing is installed
         # until all of it is built, so a failure leaves tracing off and the
         # next rerun reports the same error; a provider already built is shut
         # down, which unregisters the exit hook each failed rerun would

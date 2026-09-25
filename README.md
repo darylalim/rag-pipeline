@@ -253,11 +253,12 @@ them in SQLite under `~/.phoenix` (`PHOENIX_WORKING_DIR` moves it).
   one.
 - **If Phoenix is down, answers are unaffected.** Spans are sent from a
   background thread. Each batch that fails is logged on stderr as it fails (a
-  `Transient error ... Connection refused` warning, then `Failed to export span
-  batch ...`), so at a terminal these lines can land in the middle of a
-  streaming answer. Whatever is still queued is tried once more at exit, where
-  a `rag query` waits about a second longer — several, for a remote host that
-  never answers.
+  `Transient error ... Connection refused` warning, then `Failed to export spans
+  batch ...` — `span batch` before OpenTelemetry 1.45), so at a terminal these
+  lines can land in the middle of a streaming answer. Whatever is still queued
+  is tried once more at exit, where a `rag query` waits about a second longer
+  — about two for a remote host that never answers (four before OpenTelemetry
+  1.45).
 - **Only questions are traced.** Nothing in ingest is a LangChain run.
 - **LangSmith is not used — but an old `.env` may still switch it on.**
   langchain-core still acts on `LANGSMITH_TRACING=true` (or

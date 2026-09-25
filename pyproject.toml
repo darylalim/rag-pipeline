@@ -28,8 +28,11 @@ dependencies = [
     "langchain-chroma>=1.1.0",
     # Resolves model ids to their local snapshot with local_files_only=True, so
     # loading a model never reaches the network. Below 2 because transformers
-    # (via mlx-lm) requires it, and an unconstrained resolve backtracks into a
-    # transformers old enough to need a source build.
+    # (via mlx-lm) refuses 2.x, even at import, and so does tokenizers (via
+    # chromadb). On Linux, where transformers is absent, only tokenizers' bound
+    # holds it: anything that wanted hub 2.x would backtrack tokenizers to
+    # 0.13.3, the last release with no hub bound -- which has no wheels past
+    # Python 3.11, so needs a source build.
     "huggingface-hub>=1.24,<2",
     # Serializes ingests across processes: two writers on one persist dir at
     # once silently corrupt it (a CLI `rag ingest` during an app upload).
@@ -69,8 +72,8 @@ dev = [
     "opentelemetry-test-utils>=0.65b0",
     "pytest>=9.1.1",
     "pytest-cov>=7.0",
-    "ruff>=0.15.22",
-    "ty>=0.0.61",
+    "ruff>=0.16.9",
+    "ty>=0.0.84",
 ]
 
 [tool.pytest.ini_options]
@@ -91,8 +94,10 @@ markers = [
 ]
 
 [tool.ruff.lint]
-# Beyond ruff's default (E4/E7/E9 + F): import sorting (I), 3.11+ idioms (UP),
-# likely-bug patterns (B), and pytest style (PT), which is what caught the
+# An explicit list, so it replaces ruff's default set rather than extending it
+# (ruff 0.16 widened that default to ~400 rules; this list does not follow it).
+# On top of pycodestyle and Pyflakes (E, W, F): import sorting (I), 3.11+ idioms
+# (UP), likely-bug patterns (B), and pytest style (PT), which is what caught the
 # over-broad `pytest.raises` in test_ingest.py.
 select = ["E", "W", "F", "I", "UP", "B", "SIM", "C4", "PT", "RUF"]
 # E501 is the formatter's job; leaving it on would double-report every long line

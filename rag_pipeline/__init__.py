@@ -17,12 +17,13 @@ import os
 
 # transformers arrives only as mlx-lm's tokenizer backend, and torch is
 # deliberately absent. LangChain imports transformers opportunistically
-# (langchain_core's language models, langchain_text_splitters) before mlx-lm
-# gets the chance to silence it, as mlx_lm/__init__.py does for itself -- so
-# without this every command and the app on a Mac would open with "PyTorch was
-# not found. Models won't be available", which is false here: every model loads
-# through MLX. Set in the package's __init__, which every entry point imports
-# before anything touches langchain; setdefault, so an explicit value wins.
+# (langchain_text_splitters, and langchain_core's language models before 1.6)
+# before mlx-lm gets the chance to silence it, as mlx_lm/__init__.py does for
+# itself -- so without this every command and the app on a Mac would open with
+# "PyTorch was not found. Models won't be available", which is false here:
+# every model loads through MLX. Set in the package's __init__, which every
+# entry point imports before anything touches langchain; setdefault, so an
+# explicit value wins.
 os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 
 __version__ = "0.1.0"

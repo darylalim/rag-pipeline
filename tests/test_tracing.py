@@ -443,18 +443,23 @@ def test_setup_installs_one_provider_for_the_process(settings, undo_tracing, cap
     assert not caplog.records, [r.getMessage() for r in caplog.records]
 
 
+# Values the SDK refuses rather than logging and falling back to a default: one
+# while the provider is built, one after. An unknown compression was one until
+# OpenTelemetry 1.45, which logs it and sends uncompressed. Not
+# OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT: the SDK also reads that one as it is imported,
+# which chromadb does, so in the app a malformed one fails before tracing is
+# reached.
 @pytest.mark.parametrize(
     ("variable", "value"),
     [
-        ("OTEL_EXPORTER_OTLP_COMPRESSION", "zstd"),
+        ("OTEL_ATTRIBUTE_COUNT_LIMIT", "abc"),
         ("OTEL_BSP_MAX_EXPORT_BATCH_SIZE", "4096"),
-        ("OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT", "abc"),
     ],
 )
 def test_a_malformed_otel_variable_is_a_runtime_error_that_installs_nothing(
     settings, monkeypatch, tracing_left_on, variable, value
 ):
-    """The SDK validates the standard OTEL_* variables itself, with a builtins
+    """The SDK refuses some malformed OTEL_* variables itself, with a builtins
     ValueError -- which, on the app's pipeline-load path, would escape its guard
     as a crash page on every rerun. Translated, and with nothing installed, so
     tracing stays off and the next rerun says the same thing."""
@@ -585,10 +590,12 @@ print(json.dumps({
 def _run_wire_probe(collector: str) -> tuple[dict, str, str]:
     # The developer's own settings must not reach the child: their exporter
     # variables would change what is sent, and a proxy would carry the post to
-    # 127.0.0.1 somewhere else. Scrubbing the environment is not enough on its
-    # own -- config.py's load_dotenv() would read .env straight back in -- so
-    # .env is switched off too. (LangSmith's switches arrive as "false", from
-    # conftest's _no_tracing.)
+    # 127.0.0.1 somewhere else (up to OpenTelemetry 1.44, whose exporter posted
+    # through requests; 1.45's urllib3 transport ignores proxy variables).
+    # Scrubbing the environment is not enough on its own -- config.py's
+    # load_dotenv() would read .env straight back in -- so .env is switched off
+    # too. (LangSmith's switches arrive as "false", from conftest's
+    # _no_tracing.)
     env = {k: v for k, v in os.environ.items() if not k.startswith("OTEL_")}
     env["PYTHON_DOTENV_DISABLED"] = "1"
     env["NO_PROXY"] = env["no_proxy"] = "*"
@@ -635,11 +642,14 @@ def test_with_phoenix_down_questions_do_not_wait_and_exit_waits_briefly():
     hold each of a question's spans for the whole retry budget. And little at
     exit: the exporter retries until its timeout, which at the default (10 s)
     holds a finished `rag query` for about 7 s, and at the one set here for
-    about 1. The failure is still said, on stderr.
+    about 1. The failure is still said, on stderr: the batch's final failure,
+    not only the retry warnings before it.
     """
     report, _stdout, stderr = _run_wire_probe("down")
 
     assert report["received"] == []
     assert report["emit_s"] < 0.5, f"emitting two spans took {report['emit_s']:.1f}s"
     assert report["flush_s"] < 4, f"the exit flush took {report['flush_s']:.1f}s"
-    assert "Failed to export span batch" in stderr
+    # "span batch" up to OpenTelemetry 1.44, "spans batch" from 1.45; a retry
+    # warning never says "Failed to export".
+    assert "Failed to export span" in stderr, stderr

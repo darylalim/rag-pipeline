@@ -37,13 +37,14 @@ Plain `uv run -p 3.11` would recreate `.venv` itself at 3.11, and the next
 ordinary `uv run` would rebuild it at 3.13 — two full environment reinstalls.
 
 More generally: probe uv/tool behaviour in a throwaway project elsewhere, never
-here. This venv is ~125 packages and ~930 MB on a Mac (MLX included; Linux gets
+here. This venv is ~135 packages and ~940 MB on a Mac (MLX included; Linux gets
 ~720 MB without it), and several uv commands rebuild it without asking.
 
 Add dependencies with `uv add` / `uv add --dev` rather than hand-editing
 `pyproject.toml`, so constraints and `uv.lock` stay derived rather than invented.
 `uv add` silently no-ops if the current constraint already allows the resolved
-version — pass an explicit floor (`uv add --dev "ruff>=0.15.22"`) to tighten one.
+version — pass the locked version as an explicit floor
+(`uv add --dev "ruff>=<locked version>"`) to tighten one.
 A macOS-only dependency takes the marker the MLX ones carry:
 `uv add --marker "sys_platform == 'darwin'" <pkg>`.
 
@@ -190,9 +191,11 @@ load the tracing stack and start an idle exporter thread), and `app.py` on every
 rerun, inside the pipeline-load `try`; it is once per process, guarded by the
 instrumentor's own state under a lock (`test_concurrent_first_setups_install_once`).
 Like the adapters, it raises only `RuntimeError`, because of where the app calls
-it: the SDK validates the standard `OTEL_*` variables (limits, batch sizes,
-compression) with builtins `ValueError`s, which it translates, and it installs
-nothing until everything is built. Its imports are lazy, so tracing off loads
+it: the SDK logs most malformed `OTEL_*` variables and falls back to a default,
+but refuses a malformed span limit or an out-of-range batch setting with a
+builtins `ValueError` (before OpenTelemetry 1.45, an unknown compression or an
+out-of-range sampler ratio too), which `setup_tracing` translates, and it
+installs nothing until everything is built. Its imports are lazy, so tracing off loads
 none of the instrumentation or exporter
 (`test_tracing_off_loads_none_of_the_tracing_stack`, which takes the frontends'
 path: import, then `setup_tracing(Settings())`).
@@ -207,8 +210,9 @@ and `.env.phoenix` files that `Settings` does not know about.
 
 Each choice in `setup_tracing` is measured:
 
-- `BatchSpanProcessor`: a simple processor exports inside `span.end()`, about
-  6 s per span with Phoenix down.
+- `BatchSpanProcessor`: a simple processor exports inside `span.end()`, so with
+  Phoenix down each span waits out the exporter's retries: about 7 s at the
+  default timeout, still about 1 s at 2 s.
 - `_EXPORT_TIMEOUT_S = 2`: that timeout is all that bounds the exit flush (about
   7 s at the default 10 s, about 1 s at 2 s). `force_flush(timeout)` and
   `OTEL_BSP_EXPORT_TIMEOUT` are ignored.
@@ -405,8 +409,9 @@ Injection is a convention, so `conftest.py` backs it with autouse guards:
   langsmith ships inside langchain-core and still acts on them). `.env` is loaded
   at import time, and either would otherwise send test traces from a background
   flush that can land after `_offline` is undone. **`_offline` cannot catch an
-  exporter**: the tracing SDK catches the socket block's `RuntimeError` and logs
-  it, so the test passes.
+  exporter**: the socket block's `RuntimeError` is caught inside the tracing
+  stack and only logged — by the exporter's own HTTP transport from
+  OpenTelemetry 1.45, by the batch processor before — so the test passes.
 - `_no_tracer_left_on` is what makes that failure loud: after every test it
   fails one that left a global tracer provider installed or LangChain
   instrumented. A test that runs `setup_tracing` for real takes `undo_tracing`;
@@ -517,7 +522,8 @@ because they are only observable at the frontend:
   `reset_store_cache()` from `load_pipeline` or from `ingest()`, or the ingest
   `FileLock`.
 - On a Mac, LangChain imports transformers (it arrives with mlx-lm, without
-  torch) as soon as the pipeline is imported, and transformers then prints
+  torch) as soon as the pipeline is imported — langchain-text-splitters, through
+  `ingest.py`, and before 1.6 langchain-core too — and transformers then prints
   `PyTorch was not found. Models won't be available` — false here. mlx-lm
   silences that for itself, but too late, so `rag_pipeline/__init__.py` sets
   `TRANSFORMERS_NO_ADVISORY_WARNINGS` first. It must stay in the package

@@ -324,6 +324,18 @@ def sources_in(settings, embeddings) -> set[str]:
     return {str(metadata["source"]) for metadata in metadatas}
 
 
+def search(store: Chroma, query: str, k: int) -> list[Document]:
+    """Search as the pipeline does: a retriever scoped to this pipeline's chunks.
+
+    Not ``similarity_search(filter=OWN_CHUNKS)``: langchain-chroma annotates
+    ``filter`` as ``dict[str, str]``, narrower than the where-filters Chroma
+    accepts, and ``search_kwargs`` is the route the pipeline's own filter takes.
+    """
+    return store.as_retriever(search_kwargs={"k": k, "filter": OWN_CHUNKS}).invoke(
+        query
+    )
+
+
 def test_ingest_empty_dir_raises(tmp_path, fake_embeddings):
     empty = tmp_path / "data"
     empty.mkdir()
@@ -1071,7 +1083,7 @@ def test_a_reset_view_sees_another_processs_ingest(settings, fake_embeddings):
     ingest_mod.ingest(settings, embeddings=fake_embeddings)
     store = ingest_mod.open_store(settings, fake_embeddings, create=False)
     # A search now, so this process holds a vector view from before the write.
-    store.similarity_search("apples", k=1, filter=OWN_CHUNKS)
+    search(store, "apples", k=1)
     before = ingest_mod.index_version(settings)
 
     new_text = "Okapis are forest giraffids from the Congo basin."
@@ -1082,7 +1094,7 @@ def test_a_reset_view_sees_another_processs_ingest(settings, fake_embeddings):
 
     ingest_mod.reset_store_cache()
     fresh = ingest_mod.open_store(settings, fake_embeddings, create=False)
-    hits = fresh.similarity_search(new_text, k=1, filter=OWN_CHUNKS)
+    hits = search(fresh, new_text, k=1)
     assert [doc.metadata["source"] for doc in hits] == ["okapi.md"]
 
 
@@ -1096,11 +1108,11 @@ def test_a_store_held_across_a_reset_keeps_searching(settings, fake_embeddings):
     """
     ingest_mod.ingest(settings, embeddings=fake_embeddings)
     held = ingest_mod.open_store(settings, fake_embeddings, create=False)
-    assert held.similarity_search("apples", k=1, filter=OWN_CHUNKS)
+    assert search(held, "apples", k=1)
 
     ingest_mod.reset_store_cache()
 
-    assert held.similarity_search("apples", k=1, filter=OWN_CHUNKS)
+    assert search(held, "apples", k=1)
 
 
 def test_an_ingest_never_writes_back_a_stale_view_of_the_index(
@@ -1127,7 +1139,7 @@ def test_an_ingest_never_writes_back_a_stale_view_of_the_index(
     # The app's view: opened after a reset, as load_pipeline does, then searched.
     ingest_mod.reset_store_cache()
     app_view = ingest_mod.open_store(settings, fake_embeddings, create=False)
-    app_view.similarity_search("apples", k=1, filter=OWN_CHUNKS)
+    search(app_view, "apples", k=1)
 
     (settings.data_dir / "a.md").write_text("# Alpha\nrewritten.\n", encoding="utf-8")
     (settings.data_dir / "sub" / "b.txt").unlink()
@@ -1138,7 +1150,7 @@ def test_an_ingest_never_writes_back_a_stale_view_of_the_index(
 
     held = own_ids(settings, fake_embeddings)  # resets: a fresh process's view
     fresh = ingest_mod.open_store(settings, fake_embeddings, create=False)
-    hits = fresh.similarity_search("apples", k=20, filter=OWN_CHUNKS)
+    hits = search(fresh, "apples", k=20)
     assert sorted(doc.id or "" for doc in hits) == held
 
 

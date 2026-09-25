@@ -780,11 +780,14 @@ def test_a_tracing_setup_failure_is_reported_below_the_sidebar(
     app, monkeypatch, undo_tracing
 ):
     """Tracing is set up on the pipeline-load path, whose handler catches
-    FileNotFoundError and RuntimeError only. The tracing SDK refuses a
-    malformed OTEL_* variable with a builtins ValueError -- which must arrive
+    FileNotFoundError and RuntimeError only. The tracing SDK refuses some
+    malformed OTEL_* variables with a builtins ValueError -- which must arrive
     translated, as the message the handler shows, with the sidebar above it."""
     monkeypatch.setenv("PHOENIX_COLLECTOR_ENDPOINT", "http://127.0.0.1:9")
-    monkeypatch.setenv("OTEL_EXPORTER_OTLP_COMPRESSION", "zstd")
+    # A batch larger than its queue, refused as setup_tracing builds the
+    # processor. (An unknown compression, the trigger before OpenTelemetry
+    # 1.45, has since only been logged.)
+    monkeypatch.setenv("OTEL_BSP_MAX_EXPORT_BATCH_SIZE", "4096")
 
     at = app.run()
 
