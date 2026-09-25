@@ -19,6 +19,7 @@ can observe that.
 from __future__ import annotations
 
 import gc
+import json
 import tomllib
 from collections.abc import Callable
 from pathlib import Path
@@ -741,6 +742,53 @@ def test_a_malformed_setting_stops_before_the_sidebar(app, monkeypatch, var, val
     )
     assert not at.sidebar.file_uploader, "the app must stop before the sidebar"
     assert not at.chat_input
+
+
+# One run of app.py, reported as JSON: what a first page load shows.
+_FIRST_LOAD = """
+import json, sys
+from streamlit.testing.v1 import AppTest
+at = AppTest.from_file(sys.argv[1], default_timeout=60).run()
+print(json.dumps({
+    "exception": [e.value for e in at.exception],
+    "error": [e.value for e in at.error],
+    "uploader": len(at.sidebar.file_uploader),
+    "chat_input": len(at.chat_input),
+}))
+"""
+
+
+@pytest.mark.parametrize(
+    ("var", "value"),
+    [
+        # Refused by opentelemetry.sdk.trace as it is imported, which chromadb
+        # does -- so with tracing off too.
+        pytest.param("OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT", "abc", id="opentelemetry"),
+        # One of chromadb's own settings, which it validates as it is imported.
+        pytest.param("CHROMA_SERVER_HTTP_PORT", "abc", id="chromadb"),
+    ],
+)
+def test_a_variable_refused_at_import_stops_before_the_sidebar(
+    fresh_interpreter, var, value
+):
+    """The same stop, for a malformed variable a library reads for itself.
+
+    These are read once, as the pipeline's imports first load chromadb, and
+    refused there with a builtins ValueError. Imported above the settings guard,
+    that was a traceback in place of the whole page on every load. In a fresh
+    interpreter, because this one imported everything long ago -- which is also
+    why no test run in-process could see it.
+    """
+    result = fresh_interpreter(_FIRST_LOAD, str(APP), **{var: value})
+    assert result.returncode == 0, result.stderr
+    shown = json.loads(result.stdout.splitlines()[-1])
+
+    assert shown["exception"] == [], shown["exception"]
+    assert any(var.lower() in e.lower() for e in shown["error"]), (
+        f"the error must name {var}: {shown['error']}"
+    )
+    assert shown["uploader"] == 0, "the app must stop before the sidebar"
+    assert shown["chat_input"] == 0
 
 
 def test_an_uploaded_name_cannot_escape_the_data_dir(app, wired_env, tmp_path):

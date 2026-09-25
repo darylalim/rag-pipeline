@@ -24,7 +24,9 @@ silent otherwise:
 
 from __future__ import annotations
 
+import os
 import socket
+import subprocess
 import sys
 from collections.abc import Callable, Iterator
 
@@ -278,6 +280,51 @@ def fail_mid_stream(monkeypatch):
         monkeypatch.setattr(pipeline_mod.RAGPipeline, "_generate", generate)
 
     return arrange
+
+
+@pytest.fixture
+def fresh_interpreter(tmp_path) -> Callable[..., subprocess.CompletedProcess[str]]:
+    """Run ``code`` in a new interpreter, with ``env`` over a scrubbed environment.
+
+    For what only a fresh process can show: some libraries read their settings
+    from the environment once, as they are first imported, and this process
+    imported all of them before the first test ran. Left out of the child are
+    the developer's own settings -- this repo's (config.py's load_dotenv() has
+    put .env's in os.environ), OpenTelemetry's and chromadb's -- and .env is
+    switched off, or config.py would read it straight back in. The working
+    directory is the test's own, because chromadb reads a .env from there for
+    itself. MLX is made unimportable and PERSIST_DIR names an index that does
+    not exist, so the child can load no model and open no store, which is also
+    what keeps it offline: ``_offline`` cannot reach into another process.
+
+    Here rather than in one frontend's test file because both frontends have to
+    survive what it shows.
+    """
+
+    def run(code: str, *args: str, **env: str) -> subprocess.CompletedProcess[str]:
+        child = {
+            name: value
+            for name, value in os.environ.items()
+            if name not in ENV_VARS and not name.startswith(("OTEL_", "CHROMA_"))
+        }
+        child |= {
+            "PYTHON_DOTENV_DISABLED": "1",
+            "PERSIST_DIR": str(tmp_path / "no-index"),
+            "DATA_DIR": str(tmp_path / "data"),
+            **env,
+        }
+        prelude = 'import sys\nsys.modules["mlx"] = sys.modules["mlx_lm"] = None\n'
+        return subprocess.run(
+            [sys.executable, "-c", prelude + code, *args],
+            env=child,
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+
+    return run
 
 
 # --- the guards --------------------------------------------------------------

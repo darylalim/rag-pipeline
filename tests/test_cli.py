@@ -178,6 +178,28 @@ def test_a_malformed_numeric_setting_is_an_error_not_a_traceback(
     assert "Traceback" not in err
 
 
+def test_a_variable_refused_at_import_is_an_error_not_a_traceback(fresh_interpreter):
+    """ValueError again, raised by an import rather than by `from_env`.
+
+    The OpenTelemetry SDK refuses a malformed OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT as
+    it is imported, which chromadb does whether or not tracing is on -- so the
+    command's own imports raise it, and they are inside main()'s try only
+    because they are lazy. In a fresh interpreter, because this one has long
+    since imported the SDK and would never read the variable again.
+    """
+    result = fresh_interpreter(
+        "from rag_pipeline.cli import main\nraise SystemExit(main())",
+        "query",
+        "anything",
+        OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT="abc",
+    )
+
+    assert result.returncode == 1, result.stderr
+    assert result.stderr.startswith("Error: ")
+    assert "OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT" in result.stderr
+    assert "Traceback" not in result.stderr
+
+
 def test_a_failure_partway_through_the_stream_terminates_the_line(
     indexed, capsys, fail_mid_stream, partial_answer
 ):

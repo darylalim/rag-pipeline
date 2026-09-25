@@ -502,7 +502,21 @@ because they are only observable at the frontend:
 - `cli.py` imports `ingest`/`pipeline` lazily inside the command functions. This
   is load-bearing: importing them pulls in chromadb (a multi-second cold import)
   and the langchain stack, so `rag --help` and a usage error stay cheap. Keep
-  those imports local.
+  those imports local — which also keeps them inside `main()`'s `try`, the one
+  place a library's import-time `ValueError` (next) is reported.
+- Some libraries read settings from the environment once, as they are first
+  imported, and refuse a malformed one with a builtins `ValueError` — tracing
+  on or off. chromadb imports the OpenTelemetry SDK, whose
+  `opentelemetry.sdk.trace` validates `OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT`, and
+  builds its own pydantic `Settings()` in its `__init__` (from the
+  environment, and from a `.env` in the working directory); numpy, langsmith
+  and huggingface_hub (through transformers, on a Mac) each `int()` a variable
+  or two of theirs. So `app.py` imports the pipeline inside its `Settings`
+  guard, not at the top of the file, where any of these was a traceback in
+  place of the whole page. Only a fresh interpreter shows it — the suite
+  imports all of it before its first test — so
+  `test_a_variable_refused_at_import_*`, in `test_app.py` and `test_cli.py`,
+  run the frontends through conftest's `fresh_interpreter`.
 - MLX is **macOS-only**: `mlx` and `mlx-lm` are declared
   `; sys_platform == 'darwin'`, so the Linux CI legs never install them. Every
   MLX import is therefore lazy, inside `mlx_models.py`'s functions — a
@@ -617,16 +631,19 @@ stronger than the regex they retired.
 - New failure modes must fit `FileNotFoundError | RuntimeError | ValueError` —
   the union both frontends catch. `cli.py` catches it in one place (`main()`);
   `app.py` splits it across two, because the sidebar has to render in between:
-  `ValueError` from `Settings.from_env()` stops the script above the sidebar,
-  and `FileNotFoundError | RuntimeError` from the pipeline load is caught below
-  it, so the uploader stays reachable when there is no index. Grep
+  `ValueError` from `Settings.from_env()`, or from the pipeline's imports (a
+  malformed variable a library reads as it is imported; see Gotchas), stops
+  the script above the sidebar, and `FileNotFoundError | RuntimeError` from the
+  pipeline load is caught below it, so the uploader stays reachable when there
+  is no index. Grep
   `except (FileNotFoundError` rather than trusting a line number. Don't add a
   fourth type — `_add_documents()` catching `OSError` is not one: it is the
   filesystem's own error on a write, and `FileNotFoundError` is already a
   subclass of it. Nor is `cli.py`'s `KeyboardInterrupt` arm ("Interrupted.",
   exit 130): Ctrl-C is how a slow local answer is abandoned, not a failure.
-- Nothing on the pipeline-load path may raise `ValueError`, or it lands above
-  the sidebar as a configuration error. That is why every adapter's
+- Nothing on the pipeline-load path may raise `ValueError`: its guard catches
+  only the other two, so one escapes as a traceback under the sidebar, every
+  rerun. That is why every adapter's
   *construction* raises only `FileNotFoundError` (model not cached, naming the
   `hf download` command) or `RuntimeError` (MLX missing, a failed load, a model
   of the wrong family, an out-of-range `EMBEDDING_DIMENSIONS`/`MAX_TOKENS`/

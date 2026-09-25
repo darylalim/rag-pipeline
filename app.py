@@ -17,16 +17,6 @@ import streamlit as st
 from streamlit.runtime.uploaded_file_manager import UploadedFile
 
 from rag_pipeline.config import Settings
-from rag_pipeline.ingest import (
-    SUPPORTED_SUFFIXES,
-    index_version,
-    indexed_sources,
-    ingest,
-    reset_store_cache,
-    save_upload,
-)
-from rag_pipeline.pipeline import Excerpt, RAGPipeline, source_excerpts
-from rag_pipeline.tracing import setup_tracing
 
 st.set_page_config(
     page_title="RAG Pipeline", page_icon=":material/search:", layout="centered"
@@ -137,12 +127,30 @@ st.caption(
 # Settings are resolved on their own, ahead of the index, because the sidebar
 # below needs them and has to render even when the index does not load — an app
 # that cannot answer anything is exactly when a user reaches for the uploader
-# that fixes it. A malformed numeric env var (CHUNK_SIZE=abc) is the one setup
-# failure nothing can proceed past, so it alone stops the script here.
+# that fixes it. A malformed setting is the one setup failure nothing can
+# proceed past, so it alone stops the script here: one of ours (CHUNK_SIZE=abc),
+# or one a library reads for itself as the pipeline's imports first load it —
+# chromadb validates its own settings then (CHROMA_SERVER_HTTP_PORT=abc), and
+# the OpenTelemetry SDK it imports refuses OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT=abc,
+# tracing on or off. Hence those imports here, inside the guard, rather than at
+# the top of the file, where either was a traceback in place of the whole page;
+# nothing below works without them, the uploader included. All of these come
+# from the server's environment, fixed when it started (.env is read once, at
+# import), so reloading the page cannot pick up a fix; restarting the app does.
 try:
     cfg = Settings.from_env()
+    from rag_pipeline.ingest import (
+        SUPPORTED_SUFFIXES,
+        index_version,
+        indexed_sources,
+        ingest,
+        reset_store_cache,
+        save_upload,
+    )
+    from rag_pipeline.pipeline import Excerpt, RAGPipeline, source_excerpts
+    from rag_pipeline.tracing import setup_tracing
 except ValueError as exc:
-    st.error(f"{exc}\n\nFix it, then reload this page.", icon=":material/error:")
+    st.error(f"{exc}\n\nFix it, then restart the app.", icon=":material/error:")
     st.stop()
 
 with st.sidebar:
