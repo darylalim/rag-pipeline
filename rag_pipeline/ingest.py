@@ -8,6 +8,7 @@ persisted Chroma collection.
 from __future__ import annotations
 
 import hashlib
+import io
 import sys
 import threading
 from collections import Counter, defaultdict
@@ -337,11 +338,25 @@ def indexed_sources(settings: Settings) -> set[str]:
 
 
 def _read_pdf(path: Path) -> str:
-    """Extract text from every page of a PDF and join it."""
+    """Extract text from every page of a PDF and join it.
+
+    Read and parsed as two steps, because they fail differently. Reading the
+    file is the filesystem's part, and its failure stays the ``OSError`` it is.
+    Parsing is pypdf reading untrusted bytes, and a malformed file makes it
+    raise whatever its parser trips over -- its own ``PdfReadError``, but as
+    readily a builtins ``TypeError`` (for a ``/Font`` resource that is a number,
+    say). So everything it raises is translated here, where it runs, into the
+    ``ValueError`` that ``load_documents`` skips a file for, rather than that
+    loop catching every exception there is, a bug of its own included.
+    """
     from pypdf import PdfReader
 
-    reader = PdfReader(str(path))
-    return "\n".join(page.extract_text() or "" for page in reader.pages)
+    data = path.read_bytes()  # what pypdf does itself when handed a path
+    try:
+        reader = PdfReader(io.BytesIO(data))
+        return "\n".join(page.extract_text() or "" for page in reader.pages)
+    except Exception as exc:
+        raise ValueError(f"{type(exc).__name__}: {exc}") from exc
 
 
 def save_upload(data_dir: Path, filename: str, data: bytes) -> str:
@@ -414,9 +429,11 @@ def load_documents(data_dir: Path) -> list[Document]:
                 text = _read_pdf(path)
             else:
                 text = path.read_text(encoding="utf-8")
-        except Exception as exc:
-            # One unreadable file (bad encoding, corrupt PDF, permissions)
-            # must not abort the whole ingest -- skip it with a warning.
+        except (OSError, ValueError) as exc:
+            # One unreadable file must not abort the whole ingest -- skip it
+            # with a warning. OSError is the file itself (permissions, removed
+            # since the walk); ValueError is its contents: a bad encoding
+            # (UnicodeDecodeError), or a PDF pypdf could not parse.
             print(
                 f"Warning: skipping unreadable file {source!r}: {exc}", file=sys.stderr
             )

@@ -106,12 +106,16 @@ markers = [
 ]
 
 [tool.ruff.lint]
-# An explicit list, so it replaces ruff's default set rather than extending it
-# (ruff 0.16 widened that default to ~400 rules; this list does not follow it).
-# On top of pycodestyle and Pyflakes (E, W, F): import sorting (I), 3.11+ idioms
-# (UP), likely-bug patterns (B), and pytest style (PT), which is what caught the
-# over-broad `pytest.raises` in test_ingest.py.
-select = ["E", "W", "F", "I", "UP", "B", "SIM", "C4", "PT", "RUF"]
+# Ruff's default rule set, extended. `extend-select` rather than `select`,
+# because `select` *replaces* the default: when ruff 0.16 widened it (to 413
+# rules in 0.16.9), the explicit list this file had silently left 219 of them
+# off. Extended, a ruff upgrade that adds default rules reports their findings
+# in that upgrade's own CI run. On top of the default, every stable rule of
+# these families: pycodestyle and Pyflakes (E, W, F), import sorting (I), 3.11+
+# idioms (UP), likely-bug patterns (B), simplifications (SIM), comprehensions
+# (C4), pytest style (PT) -- which is what caught the over-broad
+# `pytest.raises` in test_ingest.py -- and ruff's own rules (RUF).
+extend-select = ["E", "W", "F", "I", "UP", "B", "SIM", "C4", "PT", "RUF"]
 # E501 is the formatter's job; leaving it on would double-report every long line
 # and fight `ruff format` over strings and comments it can't split.
 ignore = ["E501"]

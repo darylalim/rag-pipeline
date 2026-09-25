@@ -27,6 +27,7 @@ import threading
 import time
 import types
 from collections.abc import Generator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -728,22 +729,18 @@ def test_forward_passes_over_one_model_are_serialized(fake_mlx, model_dir, monke
         lambda r=r: r.compress_documents(_docs("alpha"), "q") for r in rerankers
     ]
     start = threading.Barrier(len(calls))
-    errors: list[Exception] = []
 
     def run(call) -> None:
         start.wait()
-        try:
-            call()
-        except Exception as exc:
-            errors.append(exc)
+        call()
 
-    threads = [threading.Thread(target=run, args=(call,)) for call in calls]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=10)
+    # A thread each, or the barrier waits for good; result() raises here what
+    # any of them failed with, traceback and all.
+    with ThreadPoolExecutor(max_workers=len(calls)) as executor:
+        passes = [executor.submit(run, call) for call in calls]
+    for future in passes:
+        future.result()
 
-    assert errors == []
     assert peak == 1
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import io
 import itertools
@@ -11,6 +12,7 @@ import sys
 import textwrap
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 
 import chromadb.api.client
@@ -22,7 +24,7 @@ from filelock import FileLock
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_core.embeddings import DeterministicFakeEmbedding, Embeddings
-from pypdf import PdfWriter
+from pypdf import PageObject, PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
 from rag_pipeline import ingest as ingest_mod
@@ -138,8 +140,8 @@ def test_load_documents_skips_a_corrupt_pdf_without_aborting(tmp_path, capsys):
     """One unreadable PDF must not cost the whole ingest.
 
     The same resilience the encoding case above asserts, through the other
-    loader -- pypdf raises its own exception types, which the loader's broad
-    `except` is there to absorb.
+    loader -- pypdf raises its own exception types, which `_read_pdf` translates
+    into the ValueError the loader skips a file for.
     """
     root = tmp_path / "data"
     root.mkdir()
@@ -150,6 +152,37 @@ def test_load_documents_skips_a_corrupt_pdf_without_aborting(tmp_path, capsys):
 
     assert [d.metadata["source"] for d in docs] == ["fine.md"]
     assert "broken.pdf" in capsys.readouterr().err
+
+
+def test_load_documents_skips_a_pdf_that_pypdf_fails_on_with_a_builtins_error(
+    tmp_path, capsys, monkeypatch
+):
+    """Whatever pypdf raises on a malformed file, that file is skipped.
+
+    Its parser does not keep to its own exception types: a `/Font` resource
+    that is a number makes `extract_text` raise a builtins TypeError. The loader
+    catches only OSError and ValueError, so this rests on `_read_pdf`
+    translating everything pypdf raises -- without that, one such file aborts
+    the whole ingest. Raised through a patch rather than that file, so the test
+    does not depend on pypdf keeping that particular bug.
+    """
+
+    def choke(_page, *_args, **_kwargs):
+        raise TypeError("'NumberObject' object is not iterable")
+
+    monkeypatch.setattr(PageObject, "extract_text", choke)
+    root = tmp_path / "data"
+    root.mkdir()
+    (root / "odd.pdf").write_bytes(minimal_pdf(["never extracted"]))
+    (root / "fine.md").write_text("readable content", encoding="utf-8")
+
+    docs = ingest_mod.load_documents(root)
+
+    assert [d.metadata["source"] for d in docs] == ["fine.md"]
+    err = capsys.readouterr().err
+    assert "odd.pdf" in err
+    # Named, because a builtins error's message rarely says what it is.
+    assert "TypeError" in err
 
 
 # --- accepting an uploaded file ----------------------------------------------
@@ -1177,16 +1210,13 @@ def test_a_store_reset_cannot_break_another_threads_client_open(
 
     monkeypatch.setattr(System, "start", slow_start)
     deadline = time.monotonic() + 0.5
-    escaped: list[BaseException] = []
 
     def hammer(step) -> None:
         while time.monotonic() < deadline:
-            try:
+            # Inside the union is what a frontend reports. Anything else ends
+            # this worker, and result() below raises it here, traceback and all.
+            with contextlib.suppress(FileNotFoundError, RuntimeError):
                 step()
-            except (FileNotFoundError, RuntimeError):
-                pass  # inside the union: what a frontend reports
-            except Exception as exc:
-                escaped.append(exc)
 
     def rebuild() -> None:  # load_pipeline's store half
         ingest_mod.reset_store_cache()
@@ -1195,15 +1225,10 @@ def test_a_store_reset_cannot_break_another_threads_client_open(
     def rerun() -> None:  # what every app rerun reads
         ingest_mod.index_version(settings)
 
-    workers = [
-        threading.Thread(target=hammer, args=(step,)) for step in (rebuild, rerun)
-    ]
-    for worker in workers:
-        worker.start()
-    for worker in workers:
-        worker.join(timeout=30)
-
-    assert escaped == []
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        sessions = [pool.submit(hammer, step) for step in (rebuild, rerun)]
+    for session in sessions:
+        session.result()
 
 
 # --- one writer at a time ----------------------------------------------------
@@ -1227,25 +1252,16 @@ def test_concurrent_ingests_take_turns(settings, fake_embeddings):
         return read(self, *args, **kwargs)
 
     start = threading.Barrier(2)
-    counts: list[int] = []
-    errors: list[Exception] = []
 
-    def run() -> None:
+    def run() -> int:
         start.wait()
-        try:
-            counts.append(ingest_mod.ingest(settings, embeddings=fake_embeddings))
-        except Exception as exc:
-            errors.append(exc)
+        return ingest_mod.ingest(settings, embeddings=fake_embeddings)
 
-    with pytest.MonkeyPatch.context() as mp:
+    with pytest.MonkeyPatch.context() as mp, ThreadPoolExecutor(max_workers=2) as pool:
         mp.setattr(Chroma, "get", slow_read)
-        workers = [threading.Thread(target=run) for _ in range(2)]
-        for worker in workers:
-            worker.start()
-        for worker in workers:
-            worker.join(timeout=60)
+        ingests = [pool.submit(run) for _ in range(2)]
+    counts = [ingest.result() for ingest in ingests]
 
-    assert errors == []
     switches = sum(a != b for a, b in itertools.pairwise(calls))
     assert switches == 1, "the two ingests' store reads interleaved"
     assert counts == [len(own_ids(settings, fake_embeddings))] * 2
@@ -1261,26 +1277,20 @@ def test_ingest_waits_for_a_writer_holding_the_lock(settings, fake_embeddings):
     written until it is released, and the ingest must then complete.
     """
     settings.persist_dir.mkdir(parents=True)
-    errors: list[Exception] = []
 
-    def run() -> None:
-        try:
-            ingest_mod.ingest(settings, embeddings=fake_embeddings)
-        except Exception as exc:
-            errors.append(exc)
-
-    worker = threading.Thread(target=run)
-    with FileLock(str(settings.persist_dir / ".ingest.lock")):
-        worker.start()
-        worker.join(timeout=1)
-        waited = worker.is_alive()
+    # Exited in reverse: the lock is released, then the pool waits for the run.
+    with (
+        ThreadPoolExecutor(max_workers=1) as pool,
+        FileLock(str(settings.persist_dir / ".ingest.lock")),
+    ):
+        run = pool.submit(ingest_mod.ingest, settings, embeddings=fake_embeddings)
+        wait([run], timeout=1)
+        waited = not run.done()
         written_meanwhile = ingest_mod.index_version(settings)
-    worker.join(timeout=60)
+    run.result()  # it completed once released, or raises what it failed with
 
     assert waited, "ingest ran while another writer held the lock"
     assert written_meanwhile == ""
-    assert not worker.is_alive()
-    assert errors == []
     assert ingest_mod.index_version(settings) != ""
 
 
@@ -1295,25 +1305,19 @@ def test_a_run_that_waited_for_the_lock_indexes_data_dir_as_it_is_now(
     user already told it was added. Here a file lands while the run waits.
     """
     settings.persist_dir.mkdir(parents=True)
-    errors: list[Exception] = []
 
-    def run() -> None:
-        try:
-            ingest_mod.ingest(settings, embeddings=fake_embeddings)
-        except Exception as exc:
-            errors.append(exc)
-
-    worker = threading.Thread(target=run)
-    with FileLock(str(settings.persist_dir / ".ingest.lock")):
-        worker.start()
-        worker.join(timeout=1)
-        assert worker.is_alive(), "ingest ran while another writer held the lock"
+    with (
+        ThreadPoolExecutor(max_workers=1) as pool,
+        FileLock(str(settings.persist_dir / ".ingest.lock")),
+    ):
+        run = pool.submit(ingest_mod.ingest, settings, embeddings=fake_embeddings)
+        wait([run], timeout=1)
+        assert not run.done(), "ingest ran while another writer held the lock"
         (settings.data_dir / "late.md").write_text(
             "Written while the ingest waited.\n", encoding="utf-8"
         )
-    worker.join(timeout=60)
+    run.result()
 
-    assert errors == []
     assert "late.md" in sources_in(settings, fake_embeddings)
 
 

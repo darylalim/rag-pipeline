@@ -67,8 +67,10 @@ _FACTS = [
     "The Great Barrier Reef lies off the coast of Queensland in north-eastern Australia.",
     "Berlin is the capital and largest city of Germany by both area and population.",
     "Sourdough bread is leavened with a starter of wild yeast and lactic acid bacteria.",
-    "Chunk overlap repeats the tail of one chunk at the head of the next, so a "
-    "sentence that straddles a boundary is still retrievable in full.",
+    (
+        "Chunk overlap repeats the tail of one chunk at the head of the next, so a "
+        "sentence that straddles a boundary is still retrievable in full."
+    ),
 ]
 
 # Mixed lengths, so a batch holds padding: that is what batching could get wrong.
@@ -216,7 +218,7 @@ def test_the_score_head_reads_a_quantized_embedding():
     """
     pytest.importorskip("mlx.core", reason="MLX needs Apple Silicon macOS")
     import mlx.core as mx
-    import mlx.nn as nn
+    from mlx import nn
 
     mx.random.seed(0)
     plain = nn.Embedding(32, 64)
@@ -269,9 +271,11 @@ _PROMPT = ChatPromptTemplate.from_messages(
     [
         (
             "system",
-            "Answer using only the provided context. If the context does not "
-            "contain the answer, say you don't know based on the provided "
-            "documents. Be concise, and cite the source file in parentheses.",
+            (
+                "Answer using only the provided context. If the context does not "
+                "contain the answer, say you don't know based on the provided "
+                "documents. Be concise, and cite the source file in parentheses."
+            ),
         ),
         ("human", "Context:\n{context}\n\nQuestion: {question}"),
     ]

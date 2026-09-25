@@ -48,13 +48,15 @@ version — pass the locked version as an explicit floor
 A macOS-only dependency takes the marker the MLX ones carry:
 `uv add --marker "sys_platform == 'darwin'" <pkg>`.
 
-The lint select list is broad and the tree is clean against it. **Fix findings
-rather than suppressing them** — no `# noqa`, `# ty: ignore`, `# type: ignore`,
-or any other form ruff or ty honours in source. The README's rule table lists
-them all, and `no-suppressions` rejects them. Prefer `uv run ruff`/`uv run ty`
-over `uvx`, so versions match the lock. Ruff's line length and ty's target
-version are both inherited (from the default and from `requires-python`) — don't
-re-pin them in `pyproject.toml`.
+Lint runs ruff's own default rule set plus the families pyproject's
+`extend-select` adds (a `select` would replace that default rather than extend
+it), and the tree is clean against it. **Fix findings rather than suppressing
+them** — no `# noqa`, `# ty: ignore`, `# type: ignore`, or any other form ruff
+or ty honours in source. The README's rule table lists them all, and
+`no-suppressions` rejects them. Prefer `uv run ruff`/`uv run ty` over `uvx`, so
+versions match the lock. Ruff's line length and ty's target version are both
+inherited (from the default and from `requires-python`) — don't re-pin them in
+`pyproject.toml`.
 
 `README.md` covers setup, configuration variables, usage, performance, and what
 CI runs; `ci.yml`'s own comments cover why its steps are ordered as they are.
@@ -639,12 +641,14 @@ stronger than the regex they retired.
   malformed variable a library reads as it is imported; see Gotchas), stops the
   script above the sidebar, and `FileNotFoundError | RuntimeError` from the
   pipeline load is caught below it, so the uploader stays reachable when there
-  is no index. Grep `except (FileNotFoundError` rather than trusting a line
-  number. Don't add a fourth type — `_add_documents()` catching `OSError` is not
-  one: it is the filesystem's own error on a write, and `FileNotFoundError` is
-  already a subclass of it. Nor is `cli.py`'s `KeyboardInterrupt` arm
-  ("Interrupted.", exit 130): Ctrl-C is how a slow local answer is abandoned,
-  not a failure.
+  is no index. A chat turn catches the union too, then anything else — a bug,
+  not a failure mode — which it shows the same way but also logs with its
+  traceback, since caught it never reaches Streamlit's own log. Grep
+  `except (FileNotFoundError` rather than trusting a line number. Don't add a
+  fourth type — `_add_documents()` catching `OSError` is not one: it is the
+  filesystem's own error on a write, and `FileNotFoundError` is already a
+  subclass of it. Nor is `cli.py`'s `KeyboardInterrupt` arm ("Interrupted.",
+  exit 130): Ctrl-C is how a slow local answer is abandoned, not a failure.
 - Nothing on the pipeline-load path may raise `ValueError`: its guard catches
   only the other two, so one escapes as a traceback under the sidebar, every
   rerun. That is why every adapter's *construction* raises only
@@ -713,6 +717,10 @@ stronger than the regex they retired.
   that behavior for new settings.
 - `load_documents()` warns on stderr for unreadable files and *silently* skips
   whitespace-only ones, rather than aborting the ingest. Preserve that resilience.
+  It catches only `OSError | ValueError`: `_read_pdf` translates whatever pypdf
+  raises on a malformed file — builtins errors included — into `ValueError`
+  where pypdf runs, the adapters' pattern for their models. A new loader does
+  the same for its parser.
 - Document `source` metadata (path relative to `data_dir`, POSIX-style) is what
   citations key off. Any new loader must set it. Chunk metadata is exactly
   `source`, `content_hash` and `ingested_by`, with `str`/`int`/`float`/`bool`

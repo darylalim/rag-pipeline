@@ -383,6 +383,45 @@ def test_a_failure_is_labelled_with_the_phase_that_raised(
     assert reply["content"].startswith(f"{label}: "), reply["content"]
 
 
+@pytest.mark.parametrize(
+    ("exc", "logged"),
+    [
+        pytest.param(
+            RuntimeError("Generation with the chat model failed: out of memory"),
+            False,
+            id="a-failure-mode",
+        ),
+        pytest.param(
+            AttributeError("'NoneType' object has no attribute 'text'"),
+            True,
+            id="a-bug",
+        ),
+    ],
+)
+def test_only_a_failure_outside_the_union_logs_its_traceback(
+    app, fail_mid_stream, caplog, exc: Exception, logged: bool
+):
+    """Either way the failure is shown in the chat and stored as an error turn.
+
+    The union is what every failure mode is translated into, and its message
+    names the fix, so a traceback would only bury it -- the CLI prints one line.
+    Anything else is a bug whose message alone rarely locates it, and catching
+    it to keep the chat usable must not also lose the traceback that Streamlit
+    would have logged for it uncaught.
+    """
+    fail_mid_stream(exc)
+    at = app.run()
+    at.chat_input[0].set_value("Why do chunks overlap?").run()
+    assert not at.exception, [e.value for e in at.exception]
+
+    assert _roles(at) == ["user", "assistant"]
+    reply = at.session_state["messages"][1]
+    assert reply["error"] is True
+    assert reply["content"] == f"Generation failed: {exc}"
+    logged_with_traceback = [r.exc_info[1] for r in caplog.records if r.exc_info]
+    assert logged_with_traceback == ([exc] if logged else [])
+
+
 def test_an_empty_answer_is_not_stored_as_a_grounded_turn(app, monkeypatch):
     """Whitespace-only generation must not look like a cited answer.
 

@@ -278,6 +278,18 @@ def _error_reply(text: str) -> dict:
     return {"role": "assistant", "content": text, "sources": [], "error": True}
 
 
+def _show_failure(phase: str, exc: Exception) -> dict:
+    """Show a failed step in the chat, and return the turn that records it.
+
+    The stored text is kept free of presentation -- the `error` flag carries
+    that -- so the replay loop can route it back through st.error rather than
+    rendering a failure as if it were an answer.
+    """
+    error_msg = f"{phase} failed: {exc}"
+    st.error(error_msg, icon=":material/error:")
+    return _error_reply(error_msg)
+
+
 def _render_sources(excerpts: list[Excerpt]) -> None:
     """Show the passages, not only the names of the files they came from.
 
@@ -387,24 +399,29 @@ if question := st.chat_input(
             # write_stream already rendered this; it is re-read only to store
             # it, and joined because the declared return is list[Any] | str —
             # a str is itself an iterable of str, so one join covers both. Kept
-            # inside the try so a non-str list raises into the handler below
+            # inside the try so a non-str list raises into the handlers below
             # rather than as a crash page.
             text = "".join(answer_text)
             sources = source_excerpts(docs)
             _render_sources(sources)
             reply = {"role": "assistant", "content": text, "sources": sources}
+        except (FileNotFoundError, RuntimeError, ValueError) as exc:
+            # The union every failure mode is translated into -- a model or
+            # store error, an empty response -- whose message names its own
+            # fix. Shown in the chat as it is, as the CLI prints it: one line,
+            # no traceback.
+            reply = _show_failure(phase, exc)
         except Exception as exc:
-            # Any failure (a model or store error, an empty response) — show
-            # it in the chat instead of a raw traceback. The `error` flag keeps
-            # the stored text free of presentation, so the replay above can
-            # route it back through st.error rather than rendering a failure as
-            # if it were an answer.
-            error_msg = f"{phase} failed: {exc}"
-            st.error(error_msg, icon=":material/error:")
-            reply = _error_reply(error_msg)
+            # Anything else is a bug rather than a failure mode, and its message
+            # alone rarely says where it came from. Still shown in the chat, so
+            # the page stays usable and the turn is stored, but its traceback is
+            # logged too: uncaught, Streamlit would have logged it, and the CLI
+            # prints one.
+            logger.exception("%s failed", phase)
+            reply = _show_failure(phase, exc)
         finally:
             # Both halves land together, so no exit path — success, handled
-            # failure, or an interruption that unwinds past the handler — can
+            # failure, or an interruption that unwinds past the handlers — can
             # leave a question in the history with no answer under it. Through
             # `history`, never st.session_state: see where it is bound.
             history.extend([{"role": "user", "content": question}, reply])
