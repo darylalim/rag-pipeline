@@ -4,16 +4,30 @@ from __future__ import annotations
 
 import dataclasses
 import io
+import itertools
+import os
+import subprocess
+import sys
+import textwrap
+import threading
+import time
 from pathlib import Path
 
+import chromadb.api.client
+import chromadb.errors
 import pytest
+from chromadb.api.models.Collection import Collection
+from chromadb.config import System
+from filelock import FileLock
+from langchain_chroma import Chroma
 from langchain_core.documents import Document
-from langchain_core.embeddings import Embeddings
+from langchain_core.embeddings import DeterministicFakeEmbedding, Embeddings
 from pypdf import PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
 from rag_pipeline import ingest as ingest_mod
-from rag_pipeline.config import Settings
+from rag_pipeline.config import ENV_VARS, Settings
+from rag_pipeline.ingest import OWN_CHUNKS
 
 
 def minimal_pdf(pages: list[str]) -> bytes:
@@ -247,39 +261,6 @@ def test_save_upload_writes_bytes_unchanged(tmp_path):
     assert "Uploaded page text" in docs[0].page_content
 
 
-def test_ingest_preserves_foreign_documents_in_a_shared_collection(
-    settings, fake_embeddings
-):
-    """ingest() is a scoped rebuild, never a collection wipe.
-
-    The document-level successor to the old persist-dir guard, and stronger,
-    because Atlas has no separate directory to preserve -- the collection itself
-    may be shared. A document this pipeline did not write (no `content_hash`)
-    must survive a rebuild that *does* delete, however the deletion is written.
-    Proves the {"content_hash": {"$exists": True}} scoping on every read and
-    delete: without it, ingest's deletion set would sweep up foreign documents,
-    which under Chroma's exclusive persist dir could never happen.
-    """
-    ingest_mod.ingest(settings, embeddings=fake_embeddings)
-
-    ingest_mod.reset_store_cache()
-    store = ingest_mod.open_store(settings, fake_embeddings)
-    # No content_hash, no source, no embedding: unrelated application data.
-    store.collection.insert_one({"_id": "external:1", "text": "unrelated app data"})
-
-    # Force a real deletion path: remove a file so the re-ingest runs delete_many.
-    (settings.data_dir / "a.md").unlink()
-    ingest_mod.reset_store_cache()
-    ingest_mod.ingest(settings, embeddings=fake_embeddings)
-
-    ingest_mod.reset_store_cache()
-    store = ingest_mod.open_store(settings, fake_embeddings)
-    assert store.collection.find_one({"_id": "external:1"}) is not None, (
-        "ingest must not delete documents it did not write"
-    )
-    assert "a.md" not in sources_in(settings, fake_embeddings)
-
-
 def test_split_preserves_source_and_bounds_chunk_size(settings):
     long_text = "sentence. " * 400  # ~4000 chars -> many 200-char chunks
     doc = Document(page_content=long_text, metadata={"source": "big.md"})
@@ -291,10 +272,62 @@ def test_split_preserves_source_and_bounds_chunk_size(settings):
     assert all(len(c.page_content) <= settings.chunk_size for c in chunks)
 
 
+# --- building the index ------------------------------------------------------
+
+
+class _CountingEmbeddings(Embeddings):
+    """Records the texts it was asked to embed, so a *skipped* file is visible.
+
+    The whole point of the incremental path is a call that does not happen, and
+    a chunk count cannot see that: the index holds the same vectors either way,
+    whether they were just re-embedded or left alone. Only the embedder knows.
+    Queries are recorded apart from documents, because ingest's one query is
+    the width probe, and a run with nothing to embed should not make even that.
+    """
+
+    def __init__(self, inner: Embeddings) -> None:
+        self.inner = inner
+        self.embedded: list[str] = []
+        self.queried: list[str] = []
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        self.embedded.extend(texts)
+        return self.inner.embed_documents(texts)
+
+    def embed_query(self, text: str) -> list[float]:
+        self.queried.append(text)
+        return self.inner.embed_query(text)
+
+
+@pytest.fixture
+def counting_embeddings(fake_embeddings):
+    return _CountingEmbeddings(fake_embeddings)
+
+
+def own_ids(settings, embeddings) -> list[str]:
+    """The ids of this pipeline's chunks in the collection, sorted.
+
+    Read through the same factory and the same scope ingest uses, from a fresh
+    client -- what a new process would see. ``create=False``, so a check can
+    never conjure the collection it is checking for.
+    """
+    ingest_mod.reset_store_cache()
+    store = ingest_mod.open_store(settings, embeddings, create=False)
+    return sorted(store.get(where=OWN_CHUNKS, include=[])["ids"])
+
+
+def sources_in(settings, embeddings) -> set[str]:
+    """Every `source` the collection currently holds this pipeline's chunks for."""
+    ingest_mod.reset_store_cache()
+    store = ingest_mod.open_store(settings, embeddings, create=False)
+    metadatas = store.get(where=OWN_CHUNKS, include=["metadatas"])["metadatas"]
+    return {str(metadata["source"]) for metadata in metadatas}
+
+
 def test_ingest_empty_dir_raises(tmp_path, fake_embeddings):
     empty = tmp_path / "data"
     empty.mkdir()
-    s = Settings(data_dir=empty)
+    s = Settings(data_dir=empty, persist_dir=tmp_path / "chroma")
 
     # `match` pins this to the empty-corpus ValueError; without it the test
     # would also pass on an unrelated ValueError (e.g. a bad numeric env var).
@@ -304,6 +337,7 @@ def test_ingest_empty_dir_raises(tmp_path, fake_embeddings):
 
 def test_ingest_is_idempotent(settings, fake_embeddings):
     n1 = ingest_mod.ingest(settings, embeddings=fake_embeddings)
+    held = own_ids(settings, fake_embeddings)
 
     # Emulate a fresh CLI process, then re-ingest the same data.
     ingest_mod.reset_store_cache()
@@ -311,57 +345,186 @@ def test_ingest_is_idempotent(settings, fake_embeddings):
 
     assert n1 == n2 >= 2
 
-    # The collection holds n2 chunks, not 2*n2 — deterministic _ids make the
-    # re-add an idempotent upsert-replace, not a duplicating append.
+    # The collection holds n2 chunks, not 2*n2, and the same ones — no
+    # duplicating append.
+    assert own_ids(settings, fake_embeddings) == held
+    assert len(held) == n2
+
+
+def test_chunk_ids_are_derived_from_the_content(settings, fake_embeddings, tmp_path):
+    """The same corpus gets the same ids, whichever index it goes into.
+
+    That is what makes adding a chunk an upsert that replaces it rather than an
+    append that duplicates it: with random ids, any add of a chunk the
+    collection already holds -- by whatever path -- would leave two copies
+    competing for the same retrieval slots. Two independent indexes stand in
+    for "the same chunk added twice", since an ordinary re-ingest never re-adds
+    anything.
+    """
+    elsewhere = dataclasses.replace(settings, persist_dir=tmp_path / "elsewhere")
+
+    ingest_mod.ingest(settings, embeddings=fake_embeddings)
+    ingest_mod.ingest(elsewhere, embeddings=fake_embeddings)
+
+    assert own_ids(settings, fake_embeddings) == own_ids(elsewhere, fake_embeddings)
+
+
+def test_ingest_reports_the_chunks_the_index_holds(settings, counting_embeddings):
+    """Not the number re-embedded: after a one-file edit those differ.
+
+    Both frontends print this as "Indexed N chunks", which describes the index;
+    counting the work instead would report a handful after an edit, and zero
+    for an unchanged corpus that is fully indexed.
+    """
+    ingest_mod.ingest(settings, embeddings=counting_embeddings)
+    (settings.data_dir / "a.md").write_text("# Alpha\nrewritten.\n", encoding="utf-8")
+    counting_embeddings.embedded.clear()
+
+    n = ingest_mod.ingest(settings, embeddings=counting_embeddings)
+
+    assert n == len(own_ids(settings, counting_embeddings))
+    assert n > len(counting_embeddings.embedded), "b.txt kept its chunks"
+
+
+def test_more_chunks_than_one_store_write_holds_are_added_in_slices(
+    settings, fake_embeddings, monkeypatch
+):
+    """Every write fits the store's own cap, however many chunks there are.
+
+    chromadb refuses an upsert larger than ``get_max_batch_size()`` -- 5461
+    records, only a few megabytes of text -- and langchain sends everything it
+    is given as one. Unsliced, a first ingest of a larger corpus could never
+    succeed, and a re-chunk would fail *after* deleting the chunks it was
+    replacing. The cap is shrunk here, and enforced the way the backend does,
+    so a small corpus crosses it.
+    """
+    cap = 3
+    monkeypatch.setattr(
+        chromadb.api.client.Client, "get_max_batch_size", lambda _self: cap
+    )
+    upsert = Collection.upsert
+    sizes: list[int] = []
+
+    def capped_upsert(self, *args, **kwargs):
+        sizes.append(len(kwargs["ids"]))
+        if sizes[-1] > cap:
+            raise chromadb.errors.InternalError(
+                f"Batch size of {sizes[-1]} is greater than max batch size of {cap}"
+            )
+        return upsert(self, *args, **kwargs)
+
+    monkeypatch.setattr(Collection, "upsert", capped_upsert)
+    (settings.data_dir / "a.md").write_text(
+        "\n\n".join(
+            f"Alpha paragraph {i} about apples, at some length." for i in range(12)
+        ),
+        encoding="utf-8",
+    )
+
+    n = ingest_mod.ingest(settings, embeddings=fake_embeddings)
+
+    assert n > cap
+    assert len(sizes) > 1
+    assert max(sizes) <= cap
+    assert len(own_ids(settings, fake_embeddings)) == n
+
+
+# --- never a wipe ------------------------------------------------------------
+
+
+def test_ingest_preserves_unrelated_files_in_persist_dir(settings, fake_embeddings):
+    """ingest() is a scoped collection rebuild, never a directory wipe.
+
+    A surviving neighbour proves the property however the deletion was written
+    -- `unlink` in a loop, `shutil.rmtree` aliased, a Chroma call that resets
+    more than the collection -- where a text rule forbidding one spelling would
+    only ever catch that spelling.
+    """
+    settings.persist_dir.mkdir(parents=True, exist_ok=True)
+    sentinel = settings.persist_dir / "KEEP_ME.txt"
+    sentinel.write_text("do not delete", encoding="utf-8")
+
+    ingest_mod.ingest(settings, embeddings=fake_embeddings)
+
+    assert sentinel.exists(), "ingest must not delete unrelated files in persist_dir"
+
+
+def test_ingest_preserves_other_collections_in_persist_dir(settings, fake_embeddings):
+    """A persist directory holds as many collections as there are names.
+
+    COLLECTION_NAME is also the documented way out of a width change, which
+    leaves the old collection beside the new one -- so a rebuild that deletes
+    must stay inside its own collection, not reset the client's whole store.
+    """
+    neighbour = dataclasses.replace(settings, collection_name="neighbour_docs")
+    ingest_mod.ingest(neighbour, embeddings=fake_embeddings)
+    held = own_ids(neighbour, fake_embeddings)
+
+    ingest_mod.ingest(settings, embeddings=fake_embeddings)
+    (settings.data_dir / "a.md").unlink()
+    ingest_mod.ingest(settings, embeddings=fake_embeddings)
+
+    assert own_ids(neighbour, fake_embeddings) == held
+
+
+def _add_foreign_record(settings, embeddings) -> None:
+    """Another tool's record, sharing the collection: everything but the marker.
+
+    It names a file this pipeline indexes and carries a ``content_hash``, so
+    only the ``ingested_by`` marker tells it apart. That is deliberate: Chroma
+    has no ``$exists``, and the obvious stand-ins -- a ``source`` filter alone,
+    ``{"content_hash": {"$ne": ""}}`` -- all match it. Added through the store
+    so it is embedded by the same (fake) function, never by Chroma's default.
+    """
+    ingest_mod.open_store(settings, embeddings).add_texts(
+        ["Another tool's notes on apples, stored alongside."],
+        metadatas=[{"source": "a.md", "content_hash": "theirs"}],
+        ids=["foreign:1"],
+    )
+
+
+def test_ingest_preserves_foreign_documents_in_a_shared_collection(
+    settings, fake_embeddings
+):
+    """ingest() is a scoped rebuild, never a collection wipe.
+
+    A record this pipeline did not write must survive a rebuild that *does*
+    delete -- here one deleting the very source the record names, which is the
+    case every filter short of the marker gets wrong.
+    """
+    ingest_mod.ingest(settings, embeddings=fake_embeddings)
+    _add_foreign_record(settings, fake_embeddings)
+
+    # Force a real deletion: remove the file, so the re-ingest deletes a.md.
+    (settings.data_dir / "a.md").unlink()
+    ingest_mod.ingest(settings, embeddings=fake_embeddings)
+
     ingest_mod.reset_store_cache()
-    store = ingest_mod.open_store(settings, fake_embeddings)
-    held = store.collection.count_documents({"content_hash": {"$exists": True}})
-    assert held == n2
+    store = ingest_mod.open_store(settings, fake_embeddings, create=False)
+    assert store.get(ids=["foreign:1"])["ids"] == ["foreign:1"], (
+        "ingest must not delete documents it did not write"
+    )
+    assert "a.md" not in sources_in(settings, fake_embeddings)
+
+
+def test_a_foreign_record_does_not_change_what_ingest_decides(
+    settings, counting_embeddings
+):
+    """The read half of the scoping: a foreign record is never taken for ours.
+
+    Read unscoped, its ``content_hash`` would stand in for a.md's, a.md would
+    look changed, and an untouched corpus would be re-embedded on every run.
+    """
+    ingest_mod.ingest(settings, embeddings=counting_embeddings)
+    _add_foreign_record(settings, counting_embeddings)
+    counting_embeddings.embedded.clear()
+
+    ingest_mod.ingest(settings, embeddings=counting_embeddings)
+
+    assert counting_embeddings.embedded == []
 
 
 # --- incremental re-indexing -------------------------------------------------
-
-
-class _CountingEmbeddings(Embeddings):
-    """Records the texts it was asked to embed, so a *skipped* file is visible.
-
-    The whole point of the incremental path is a call that does not happen, and
-    a chunk count cannot see that: the index holds the same vectors either way,
-    whether they were just re-embedded or left alone. Only the embedder knows.
-    """
-
-    def __init__(self, inner: Embeddings) -> None:
-        self.inner = inner
-        self.embedded: list[str] = []
-
-    def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        self.embedded.extend(texts)
-        return self.inner.embed_documents(texts)
-
-    def embed_query(self, text: str) -> list[float]:
-        return self.inner.embed_query(text)
-
-
-@pytest.fixture
-def counting_embeddings(fake_embeddings):
-    return _CountingEmbeddings(fake_embeddings)
-
-
-def sources_in(settings, embeddings) -> set[str]:
-    """Every `source` the collection currently holds this pipeline's chunks for.
-
-    Reads the raw pymongo collection — MongoDBAtlasVectorSearch has no enumerate
-    — scoped to this pipeline's own documents, and flattened top-level metadata
-    means `source` is a plain field.
-    """
-    ingest_mod.reset_store_cache()
-    store = ingest_mod.open_store(settings, embeddings)
-    return {
-        doc["source"]
-        for doc in store.collection.find(
-            {"content_hash": {"$exists": True}}, {"source": 1}
-        )
-    }
 
 
 def test_reingest_embeds_nothing_when_no_document_changed(
@@ -369,18 +532,21 @@ def test_reingest_embeds_nothing_when_no_document_changed(
 ):
     """The saving that justifies the fingerprint at all.
 
-    Embedding is a billed Voyage call, so re-ingesting an unchanged corpus must
-    cost nothing. Asserted on the embedder rather than the returned count, which
-    is deliberately the same both times.
+    Embedding is a forward pass of a local model for every chunk, and the app
+    re-ingests on every upload, so re-ingesting an unchanged corpus must cost
+    nothing -- not even the width probe. Asserted on the embedder rather than
+    the returned count, which is deliberately the same both times.
     """
     ingest_mod.ingest(settings, embeddings=counting_embeddings)
     assert counting_embeddings.embedded, "the first ingest must embed everything"
 
     counting_embeddings.embedded.clear()
+    counting_embeddings.queried.clear()
     ingest_mod.reset_store_cache()
     ingest_mod.ingest(settings, embeddings=counting_embeddings)
 
     assert counting_embeddings.embedded == []
+    assert counting_embeddings.queried == []
 
 
 def test_only_the_edited_document_is_re_embedded(settings, counting_embeddings):
@@ -395,6 +561,36 @@ def test_only_the_edited_document_is_re_embedded(settings, counting_embeddings):
     assert counting_embeddings.embedded, "the edited file must be re-embedded"
     # b.txt's text is untouched, so none of it may appear in what was embedded.
     b_text = (settings.data_dir / "sub" / "b.txt").read_text(encoding="utf-8")
+    assert not any(b_text.strip() in text for text in counting_embeddings.embedded)
+
+
+def test_a_partly_indexed_document_is_re_embedded(settings, counting_embeddings):
+    """An add that died part-way must not be vouched for by its fingerprint.
+
+    Its surviving chunks carry the current fingerprint, so a check on the hash
+    alone reads the source as current and leaves it short of chunks for good.
+    Simulated by deleting one of a source's chunks behind ingest's back, which
+    is the state an interrupted add leaves.
+    """
+    paragraph = "Alpha topic about apples and orchards, at some length. " * 3
+    (settings.data_dir / "a.md").write_text(
+        "# Alpha\n\n" + "\n\n".join([paragraph] * 4), encoding="utf-8"
+    )
+    ingest_mod.ingest(settings, embeddings=counting_embeddings)
+    before = own_ids(settings, counting_embeddings)
+    a_ids = [chunk_id for chunk_id in before if chunk_id.startswith("a.md:")]
+    assert len(a_ids) > 1, "the fixture must split a.md into several chunks"
+
+    ingest_mod.reset_store_cache()
+    ingest_mod.open_store(settings, counting_embeddings).delete(ids=[a_ids[-1]])
+    counting_embeddings.embedded.clear()
+    ingest_mod.reset_store_cache()
+    ingest_mod.ingest(settings, embeddings=counting_embeddings)
+
+    assert own_ids(settings, counting_embeddings) == before
+    # Only the damaged source is redone; the intact one keeps its vectors.
+    b_text = (settings.data_dir / "sub" / "b.txt").read_text(encoding="utf-8")
+    assert counting_embeddings.embedded
     assert not any(b_text.strip() in text for text in counting_embeddings.embedded)
 
 
@@ -416,6 +612,29 @@ def test_a_new_document_joins_the_existing_index(settings, counting_embeddings):
 
     assert sources_in(settings, counting_embeddings) == before | {"c.md"}
     assert all("brand new" in text for text in counting_embeddings.embedded)
+
+
+def test_documents_are_embedded_in_the_same_order_every_run(
+    settings, counting_embeddings
+):
+    """The same corpus reaches the embedder in the same order, run after run.
+
+    The order decides which chunks share a padded batch, and the local model's
+    bf16 arithmetic varies in the last bits with a batch's shape. In a set's
+    order -- which moves with each process's hash seed -- rebuilding the same
+    corpus would not reproduce its own vectors. Ten sources, so an unordered
+    run matching by chance is out of the question.
+    """
+    for i in range(8):
+        (settings.data_dir / f"doc{i}.md").write_text(
+            f"Document number {i}, about topic {i}.\n", encoding="utf-8"
+        )
+
+    ingest_mod.ingest(settings, embeddings=counting_embeddings)
+
+    documents = ingest_mod.load_documents(settings.data_dir)  # sorted by path
+    expected = ingest_mod.split_documents(documents, settings)
+    assert counting_embeddings.embedded == [c.page_content for c in expected]
 
 
 def test_a_removed_document_loses_its_chunks(settings, fake_embeddings):
@@ -446,12 +665,644 @@ def test_changing_the_chunking_re_embeds_everything(settings, counting_embedding
     counting_embeddings.embedded.clear()
 
     ingest_mod.reset_store_cache()
-    ingest_mod.ingest(
+    n = ingest_mod.ingest(
         dataclasses.replace(settings, chunk_size=80, chunk_overlap=10),
         embeddings=counting_embeddings,
     )
 
-    assert counting_embeddings.embedded != []
+    assert len(counting_embeddings.embedded) == n
+
+
+def test_changing_the_embedding_model_re_embeds_everything(
+    settings, counting_embeddings
+):
+    """A vector means nothing except with respect to the model that made it.
+
+    The dangerous case of a stale skip, because nothing looks wrong: same
+    files, same chunks, same width -- a model swap is now just a different repo
+    id -- so every later query would be compared against vectors from a model
+    that is no longer configured. The fake is unchanged on purpose; only the
+    setting moves, which is all a skip would have to go on.
+    """
+    ingest_mod.ingest(settings, embeddings=counting_embeddings)
+    counting_embeddings.embedded.clear()
+
+    ingest_mod.reset_store_cache()
+    n = ingest_mod.ingest(
+        dataclasses.replace(settings, embedding_model="mlx-community/another-embedder"),
+        embeddings=counting_embeddings,
+    )
+
+    assert len(counting_embeddings.embedded) == n
+
+
+# --- the vector width --------------------------------------------------------
+
+
+def test_a_model_that_contradicts_embedding_dimensions_is_refused_first(
+    settings, fake_embeddings
+):
+    """EMBEDDING_DIMENSIONS is checked against the live model before any write.
+
+    The declared width is what every fingerprint records, so vectors of another
+    width must never be stored under it -- and caught only at the add, the
+    mismatch would surface after the delete had already dropped the chunks
+    being replaced. Nothing may change.
+    """
+    ingest_mod.ingest(settings, embeddings=fake_embeddings)
+    held = own_ids(settings, fake_embeddings)
+    (settings.data_dir / "a.md").write_text("# Alpha\nrewritten.\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="EMBEDDING_DIMENSIONS"):
+        ingest_mod.ingest(settings, embeddings=DeterministicFakeEmbedding(size=16))
+
+    assert own_ids(settings, fake_embeddings) == held
+
+
+def test_a_new_width_is_refused_before_anything_is_deleted(settings, fake_embeddings):
+    """A Chroma collection keeps the width of its first vectors.
+
+    A different EMBEDDING_DIMENSIONS changes every fingerprint, so a re-ingest
+    is about to replace every chunk -- and the add would fail, after the delete
+    had emptied the collection. It must be refused up front instead, with the
+    remedy (a new collection), and leave the index exactly as it was. (Were the
+    width not in the fingerprint, nothing would be refused: every chunk would
+    be skipped as current, and the first query would be the one to fail.)
+    """
+    ingest_mod.ingest(settings, embeddings=fake_embeddings)
+    held = own_ids(settings, fake_embeddings)
+    narrower = dataclasses.replace(settings, embedding_dimensions=16)
+
+    with pytest.raises(ValueError, match="COLLECTION_NAME"):
+        ingest_mod.ingest(narrower, embeddings=DeterministicFakeEmbedding(size=16))
+
+    assert own_ids(settings, fake_embeddings) == held
+
+
+def test_a_width_the_collection_cannot_hold_is_a_runtime_error_with_the_fix(
+    settings, fake_embeddings
+):
+    """Chroma's own refusal, reached for real: RuntimeError, never ValueError.
+
+    The collection's width here was set by a record that is not ours, so the
+    pre-write check -- which reads only this pipeline's chunks -- has nothing
+    to compare against, and the add is what fails. That failure is a
+    ``ChromaError``, outside the union both frontends catch; it must arrive as
+    a RuntimeError, which ``app.py`` handles below its sidebar, and still name
+    the remedy.
+    """
+    ingest_mod.open_store(settings, fake_embeddings).add_texts(
+        ["Another tool's record."], metadatas=[{"owner": "another-tool"}]
+    )
+    narrower = dataclasses.replace(settings, embedding_dimensions=16)
+
+    with pytest.raises(RuntimeError, match="set a new COLLECTION_NAME") as excinfo:
+        ingest_mod.ingest(narrower, embeddings=DeterministicFakeEmbedding(size=16))
+
+    assert excinfo.type is RuntimeError
+
+
+def test_an_invalid_collection_name_is_a_runtime_error_without_the_width_hint(
+    settings, fake_embeddings
+):
+    """chromadb rejects a malformed name with the same exception type it uses
+    for a width mismatch, so the hint must key off the message: a name error
+    advising a new COLLECTION_NAME for the wrong reason would send the user
+    after a width problem they do not have.
+    """
+    bad = dataclasses.replace(settings, collection_name="x")
+
+    with pytest.raises(RuntimeError) as excinfo:
+        ingest_mod.ingest(bad, embeddings=fake_embeddings)
+
+    assert excinfo.type is RuntimeError
+    assert "set a new COLLECTION_NAME" not in str(excinfo.value)
+
+
+def _a_file(path: Path) -> Path:
+    path.write_text("not a directory", encoding="utf-8")
+    return path
+
+
+def _under_a_file(path: Path) -> Path:
+    return _a_file(path) / "chroma"
+
+
+def _read_only(path: Path) -> Path:
+    path.mkdir()
+    path.chmod(0o555)
+    return path
+
+
+@pytest.mark.parametrize(
+    "arrange",
+    [
+        pytest.param(_a_file, id="a-file"),
+        pytest.param(_under_a_file, id="under-a-file"),
+        pytest.param(
+            _read_only,
+            id="read-only",
+            marks=pytest.mark.skipif(
+                hasattr(os, "geteuid") and os.geteuid() == 0,
+                reason="root writes through a read-only mode",
+            ),
+        ),
+    ],
+)
+def test_an_unusable_persist_dir_is_a_runtime_error(
+    settings, fake_embeddings, tmp_path, arrange
+):
+    """The filesystem's own errors on PERSIST_DIR stay inside the union.
+
+    Creating the directory and its lock file raises FileExistsError,
+    NotADirectoryError or PermissionError -- OSErrors, but not the
+    FileNotFoundError the union admits -- so untranslated they reach `rag
+    ingest` as a traceback. The read-only case gets past the mkdir (the
+    directory exists) and fails at the lock file instead.
+    """
+    unusable = dataclasses.replace(settings, persist_dir=arrange(tmp_path / "store"))
+    try:
+        with pytest.raises(RuntimeError, match="PERSIST_DIR") as excinfo:
+            ingest_mod.ingest(unusable, embeddings=fake_embeddings)
+    finally:
+        if unusable.persist_dir.is_dir():
+            unusable.persist_dir.chmod(0o755)
+
+    assert excinfo.type is RuntimeError
+
+
+# --- index_version -----------------------------------------------------------
+
+
+def test_index_version_is_empty_before_any_ingest_and_creates_nothing(settings):
+    """A read creates nothing.
+
+    The app calls this on every rerun, a fresh checkout's first included. A
+    store directory appearing there before anything was ingested would pass for
+    an index, and the app would report it empty instead of missing.
+    """
+    assert ingest_mod.index_version(settings) == ""
+    assert not settings.persist_dir.exists()
+
+
+def test_a_persist_dir_holding_no_database_is_no_index_and_is_left_alone(settings):
+    """A directory that exists for another reason is not an index, and reading
+    it must not make one.
+
+    Pre-created, or a PERSIST_DIR pointed at an unrelated folder: opening a
+    client there would write a fresh ``chroma.sqlite3`` into it, and the next
+    check would then report an "empty" index -- pointing at COLLECTION_NAME --
+    rather than a missing one.
+    """
+    settings.persist_dir.mkdir(parents=True)
+    (settings.persist_dir / "unrelated.txt").write_text("not an index\n")
+    before = sorted(path.name for path in settings.persist_dir.iterdir())
+
+    assert ingest_mod.index_version(settings) == ""
+    assert ingest_mod.indexed_sources(settings) == set()
+    with pytest.raises(FileNotFoundError, match="No index found at"):
+        ingest_mod.require_index(settings)
+
+    assert sorted(path.name for path in settings.persist_dir.iterdir()) == before
+
+
+def test_a_failed_store_open_does_not_poison_the_next_one(settings):
+    """Every open of a broken store fails the same way, inside the union.
+
+    chromadb caches a directory's System before starting it, so one that failed
+    to start stayed cached, half-built, and the next open on that path -- the
+    app's next rerun -- died on a builtins AttributeError instead: a crash page
+    on every other rerun, where the store error belongs.
+    """
+    settings.persist_dir.mkdir(parents=True)
+    (settings.persist_dir / "chroma.sqlite3").write_bytes(b"not a database")
+
+    for _ in range(2):  # the second is the open a half-started System broke
+        with pytest.raises(RuntimeError, match="Vector store request failed"):
+            ingest_mod.index_version(settings)
+
+
+def test_index_version_is_empty_for_a_collection_never_ingested_into(
+    settings, fake_embeddings
+):
+    """A mistyped COLLECTION_NAME is "nothing ingested", not an error -- the
+    pipeline's own guard is what names the fix."""
+    ingest_mod.ingest(settings, embeddings=fake_embeddings)
+    other = dataclasses.replace(settings, collection_name="never_ingested")
+
+    assert ingest_mod.index_version(other) == ""
+    assert ingest_mod.indexed_sources(other) == set()
+    # ...and reading it did not create it.
+    with pytest.raises(FileNotFoundError):
+        ingest_mod.open_store(other, fake_embeddings, create=False)
+
+
+def test_index_version_changes_on_exactly_the_corpus_changes(settings, fake_embeddings):
+    """The app's pipeline cache is keyed on this, so it must move on an edit, an
+    add or a removal -- or the app keeps answering from the old corpus -- and on
+    nothing else, or every rerun after an unchanged ingest reloads for nothing.
+    """
+
+    def version_after_ingest() -> str:
+        ingest_mod.ingest(settings, embeddings=fake_embeddings)
+        return ingest_mod.index_version(settings)
+
+    first = version_after_ingest()
+    assert first
+    ingest_mod.reset_store_cache()
+    assert version_after_ingest() == first, "an unchanged re-ingest moved it"
+
+    (settings.data_dir / "a.md").write_text("edited", encoding="utf-8")
+    edited = version_after_ingest()
+    (settings.data_dir / "c.md").write_text("added", encoding="utf-8")
+    added = version_after_ingest()
+    (settings.data_dir / "sub" / "b.txt").unlink()
+    removed = version_after_ingest()
+
+    assert len({first, edited, added, removed}) == 4
+
+
+def test_an_unchanged_reingest_writes_no_version_stamp(
+    settings, fake_embeddings, monkeypatch
+):
+    """The stamp is reconciled on every run, but written only when it differs.
+
+    Rewriting an unchanged digest would be a needless write into a collection
+    another tool may be reading -- and, compared on every run, the digest is
+    what keeps an unchanged re-ingest from making one.
+    """
+    ingest_mod.ingest(settings, embeddings=fake_embeddings)
+    modify = Collection.modify
+    writes: list[object] = []
+
+    def spy(self, *args, **kwargs):
+        writes.append(kwargs)
+        return modify(self, *args, **kwargs)
+
+    monkeypatch.setattr(Collection, "modify", spy)
+    ingest_mod.reset_store_cache()
+    ingest_mod.ingest(settings, embeddings=fake_embeddings)
+
+    assert writes == []
+
+
+def test_a_rerun_repairs_a_version_stamp_a_failed_run_missed(
+    settings, fake_embeddings, monkeypatch, tmp_path
+):
+    """A run whose chunks landed but whose stamp did not must be finished by the
+    next one.
+
+    After such a run every source looks current, so a stamp written only when
+    something changed would never be written: index_version would keep naming
+    the old corpus for good, and the app -- keyed on it -- would keep answering
+    from its stale view until restarted, however often `rag ingest` succeeded.
+    """
+    ingest_mod.ingest(settings, embeddings=fake_embeddings)
+    before = ingest_mod.index_version(settings)
+    (settings.data_dir / "a.md").write_text("# Alpha\nrewritten.\n", encoding="utf-8")
+
+    def fail(*_args, **_kwargs):
+        raise chromadb.errors.InternalError("disk I/O error")
+
+    with monkeypatch.context() as mp:
+        mp.setattr(Collection, "modify", fail)
+        with pytest.raises(RuntimeError, match="disk I/O error"):
+            ingest_mod.ingest(settings, embeddings=fake_embeddings)
+    assert ingest_mod.index_version(settings) == before, "the stamp was not missed"
+
+    ingest_mod.reset_store_cache()
+    ingest_mod.ingest(settings, embeddings=fake_embeddings)
+
+    elsewhere = dataclasses.replace(settings, persist_dir=tmp_path / "elsewhere")
+    ingest_mod.ingest(elsewhere, embeddings=fake_embeddings)
+    assert ingest_mod.index_version(settings) == ingest_mod.index_version(elsewhere)
+
+
+def test_the_version_stamp_keeps_a_shared_collections_metadata(
+    settings, fake_embeddings
+):
+    """The stamp is merged into the collection's metadata, never written over it.
+
+    ``modify`` replaces the whole dict, so another tool's keys survive only
+    because they are carried over -- and a collection created the common
+    LangChain way (``collection_metadata={"hnsw:space": "cosine"}``) holds a
+    key ``modify`` refuses. Carried over too, it would fail the ingest after
+    its chunks were written.
+    """
+    ingest_mod._client(settings).create_collection(
+        settings.collection_name,
+        metadata={"hnsw:space": "cosine", "owner": "another-tool"},
+        embedding_function=None,
+    )
+
+    ingest_mod.ingest(settings, embeddings=fake_embeddings)
+
+    metadata = ingest_mod._collection(settings).metadata or {}
+    assert metadata.get("owner") == "another-tool"
+    assert ingest_mod.index_version(settings)
+
+
+def test_a_version_stamp_that_is_not_a_string_reads_as_no_version(
+    settings, fake_embeddings
+):
+    """Collection metadata is shared with any other tool; a stamp overwritten
+    with a number is "no version", not a cache key of the wrong type."""
+    ingest_mod.ingest(settings, embeddings=fake_embeddings)
+    collection = ingest_mod._collection(settings)
+    kept = {
+        key: value
+        for key, value in (collection.metadata or {}).items()
+        if not key.startswith("hnsw:")
+    }
+    collection.modify(metadata={**kept, ingest_mod._VERSION_KEY: 7})
+
+    assert ingest_mod.index_version(settings) == ""
+
+
+def _ingest_in_another_process(settings: Settings) -> None:
+    """Run `ingest` in a separate interpreter, as a terminal `rag ingest` would.
+
+    Configured the way the CLI is -- through the environment, every variable
+    derived from ENV_VARS so the developer's .env cannot answer one -- and with
+    MLX hidden and a fake injected, since conftest's guards do not reach a
+    child process.
+    """
+    env = {
+        **os.environ,
+        **{var: str(getattr(settings, var.lower())) for var in ENV_VARS},
+    }
+    code = textwrap.dedent(
+        f"""
+        import sys
+        sys.modules["mlx"] = sys.modules["mlx_lm"] = None
+        from langchain_core.embeddings import DeterministicFakeEmbedding
+        from rag_pipeline.config import Settings
+        from rag_pipeline.ingest import ingest
+        ingest(
+            Settings.from_env(),
+            embeddings=DeterministicFakeEmbedding(size={settings.embedding_dimensions}),
+        )
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_a_reset_view_sees_another_processs_ingest(settings, fake_embeddings):
+    """Why ``reset_store_cache()`` exists, and why the app calls it.
+
+    chromadb shares one System per persist directory within a process, and
+    that System's vector search does not see writes another process made after
+    it was opened -- a terminal `rag ingest` while the app is running. Two
+    halves, both load-bearing for the app: the version *is* current without a
+    reset (collection metadata is read fresh), which is how the app notices the
+    ingest at all; and a store reopened *after* a reset searches the new
+    corpus. Without the reset in between, that reopened store reuses the stale
+    System and cannot find the new chunk -- which is what makes this test fail
+    if the reset stops dropping the cache.
+    """
+    ingest_mod.ingest(settings, embeddings=fake_embeddings)
+    store = ingest_mod.open_store(settings, fake_embeddings, create=False)
+    # A search now, so this process holds a vector view from before the write.
+    store.similarity_search("apples", k=1, filter=OWN_CHUNKS)
+    before = ingest_mod.index_version(settings)
+
+    new_text = "Okapis are forest giraffids from the Congo basin."
+    (settings.data_dir / "okapi.md").write_text(f"{new_text}\n", encoding="utf-8")
+    _ingest_in_another_process(settings)
+
+    assert ingest_mod.index_version(settings) != before
+
+    ingest_mod.reset_store_cache()
+    fresh = ingest_mod.open_store(settings, fake_embeddings, create=False)
+    hits = fresh.similarity_search(new_text, k=1, filter=OWN_CHUNKS)
+    assert [doc.metadata["source"] for doc in hits] == ["okapi.md"]
+
+
+def test_a_store_held_across_a_reset_keeps_searching(settings, fake_embeddings):
+    """Why the reset drops chromadb's System rather than closing it.
+
+    The app resets before every rebuild while a session holding the outgoing
+    pipeline may still be answering. Closed, the System would stop under that
+    pipeline, and its next search would raise a builtins AttributeError outside
+    the caught union; dropped, it keeps working on its old view.
+    """
+    ingest_mod.ingest(settings, embeddings=fake_embeddings)
+    held = ingest_mod.open_store(settings, fake_embeddings, create=False)
+    assert held.similarity_search("apples", k=1, filter=OWN_CHUNKS)
+
+    ingest_mod.reset_store_cache()
+
+    assert held.similarity_search("apples", k=1, filter=OWN_CHUNKS)
+
+
+def test_an_ingest_never_writes_back_a_stale_view_of_the_index(
+    settings, fake_embeddings
+):
+    """Why ingest starts its writes from a fresh System.
+
+    The app's upload runs in a process whose System was opened -- and searched
+    -- before a terminal `rag ingest` rewrote the index. Written through, that
+    System's vector index is saved back over the terminal's: the chunks the
+    terminal deleted stay in it for good, and the pipeline's own filtered search
+    fails on them ("Error finding id") until the collection is deleted. The
+    collection persists its index after every couple of writes here (production
+    waits for a thousand), so a corpus this small shows what a large one does.
+    """
+    ingest_mod._client(settings).create_collection(
+        settings.collection_name,
+        configuration={
+            "hnsw": {"space": "cosine", "sync_threshold": 2, "batch_size": 2}
+        },
+        embedding_function=None,
+    )
+    ingest_mod.ingest(settings, embeddings=fake_embeddings)
+    # The app's view: opened after a reset, as load_pipeline does, then searched.
+    ingest_mod.reset_store_cache()
+    app_view = ingest_mod.open_store(settings, fake_embeddings, create=False)
+    app_view.similarity_search("apples", k=1, filter=OWN_CHUNKS)
+
+    (settings.data_dir / "a.md").write_text("# Alpha\nrewritten.\n", encoding="utf-8")
+    (settings.data_dir / "sub" / "b.txt").unlink()
+    _ingest_in_another_process(settings)
+    # An upload in the app, with nothing in between to reset its view.
+    (settings.data_dir / "c.md").write_text("# Gamma\nuploaded.\n", encoding="utf-8")
+    ingest_mod.ingest(settings, embeddings=fake_embeddings)
+
+    held = own_ids(settings, fake_embeddings)  # resets: a fresh process's view
+    fresh = ingest_mod.open_store(settings, fake_embeddings, create=False)
+    hits = fresh.similarity_search("apples", k=20, filter=OWN_CHUNKS)
+    assert sorted(doc.id or "" for doc in hits) == held
+
+
+def test_a_store_reset_cannot_break_another_threads_client_open(
+    settings, fake_embeddings, monkeypatch
+):
+    """Resets and client opens from different threads never interleave.
+
+    Streamlit runs each session in its own thread, and every pipeline rebuild
+    resets chromadb's System cache -- a class-level dict that a client being
+    built inserts its System into, starts, and reads back from. A reset landing
+    in between surfaced in the other session as a builtins KeyError or
+    AttributeError, outside every union a frontend catches. Starting a System
+    is slowed here to widen that window, so an unguarded interleaving shows on
+    nearly every open rather than by luck; the two threads do what the app's
+    rebuild and every rerun do.
+    """
+    ingest_mod.ingest(settings, embeddings=fake_embeddings)
+    start = System.start
+
+    def slow_start(self) -> None:
+        time.sleep(0.02)
+        start(self)
+
+    monkeypatch.setattr(System, "start", slow_start)
+    deadline = time.monotonic() + 0.5
+    escaped: list[BaseException] = []
+
+    def hammer(step) -> None:
+        while time.monotonic() < deadline:
+            try:
+                step()
+            except (FileNotFoundError, RuntimeError):
+                pass  # inside the union: what a frontend reports
+            except Exception as exc:
+                escaped.append(exc)
+
+    def rebuild() -> None:  # load_pipeline's store half
+        ingest_mod.reset_store_cache()
+        ingest_mod.require_index(settings)
+
+    def rerun() -> None:  # what every app rerun reads
+        ingest_mod.index_version(settings)
+
+    workers = [
+        threading.Thread(target=hammer, args=(step,)) for step in (rebuild, rerun)
+    ]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=30)
+
+    assert escaped == []
+
+
+# --- one writer at a time ----------------------------------------------------
+
+
+def test_concurrent_ingests_take_turns(settings, fake_embeddings):
+    """Two ingests at once run one after the other, not interleaved.
+
+    The app re-ingests on upload from whichever session asked, so two can
+    overlap; interleaved, each would decide what to delete and add from a state
+    the other is changing. Every store read is slowed and recorded by thread,
+    so overlapping runs would show up as the threads alternating. The order is
+    the proof; a consistent index afterwards is the point.
+    """
+    calls: list[int] = []
+    read = Chroma.get
+
+    def slow_read(self, *args, **kwargs):
+        calls.append(threading.get_ident())
+        time.sleep(0.2)  # a window wide enough for an unguarded run to enter
+        return read(self, *args, **kwargs)
+
+    start = threading.Barrier(2)
+    counts: list[int] = []
+    errors: list[Exception] = []
+
+    def run() -> None:
+        start.wait()
+        try:
+            counts.append(ingest_mod.ingest(settings, embeddings=fake_embeddings))
+        except Exception as exc:
+            errors.append(exc)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(Chroma, "get", slow_read)
+        workers = [threading.Thread(target=run) for _ in range(2)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=60)
+
+    assert errors == []
+    switches = sum(a != b for a, b in itertools.pairwise(calls))
+    assert switches == 1, "the two ingests' store reads interleaved"
+    assert counts == [len(own_ids(settings, fake_embeddings))] * 2
+
+
+def test_ingest_waits_for_a_writer_holding_the_lock(settings, fake_embeddings):
+    """The lock is a file in the persist directory, so it holds across processes.
+
+    Two processes writing one persist directory at once corrupt it for good --
+    neither writer sees an error, only every later query -- and a terminal
+    `rag ingest` during an upload in the app is exactly that. Held here from
+    outside, the way another process's ingest would hold it: nothing may be
+    written until it is released, and the ingest must then complete.
+    """
+    settings.persist_dir.mkdir(parents=True)
+    errors: list[Exception] = []
+
+    def run() -> None:
+        try:
+            ingest_mod.ingest(settings, embeddings=fake_embeddings)
+        except Exception as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=run)
+    with FileLock(str(settings.persist_dir / ".ingest.lock")):
+        worker.start()
+        worker.join(timeout=1)
+        waited = worker.is_alive()
+        written_meanwhile = ingest_mod.index_version(settings)
+    worker.join(timeout=60)
+
+    assert waited, "ingest ran while another writer held the lock"
+    assert written_meanwhile == ""
+    assert not worker.is_alive()
+    assert errors == []
+    assert ingest_mod.index_version(settings) != ""
+
+
+def test_a_run_that_waited_for_the_lock_indexes_data_dir_as_it_is_now(
+    settings, fake_embeddings
+):
+    """data_dir is read under the lock, not before it.
+
+    A run that read it and then waited would apply that older snapshot after
+    the writer it waited on: anything that writer had just indexed -- another
+    session's upload -- would be taken for a removed file and deleted, with the
+    user already told it was added. Here a file lands while the run waits.
+    """
+    settings.persist_dir.mkdir(parents=True)
+    errors: list[Exception] = []
+
+    def run() -> None:
+        try:
+            ingest_mod.ingest(settings, embeddings=fake_embeddings)
+        except Exception as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=run)
+    with FileLock(str(settings.persist_dir / ".ingest.lock")):
+        worker.start()
+        worker.join(timeout=1)
+        assert worker.is_alive(), "ingest ran while another writer held the lock"
+        (settings.data_dir / "late.md").write_text(
+            "Written while the ingest waited.\n", encoding="utf-8"
+        )
+    worker.join(timeout=60)
+
+    assert errors == []
+    assert "late.md" in sources_in(settings, fake_embeddings)
 
 
 def test_every_source_is_a_relative_posix_path_that_resolves_under_data_dir(tmp_path):

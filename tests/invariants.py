@@ -16,11 +16,15 @@ thought to enumerate. Enforced that way, and deliberately not in ``RULES``:
   ``test_ingest_preserves_foreign_documents_in_a_shared_collection`` notices a
   foreign document being deleted by any means, not only a literal wipe
 - cli.py's lazy imports -- ``test_importing_cli_does_not_load_the_heavy_stack``
-  imports the module in a subprocess and asserts pymongo/langchain never
-  loaded, covering routes no list of import spellings would reach
-- ``build_chat_model`` setting no sampling params --
-  ``test_build_chat_model_sets_no_sampling_params`` reads them back off the
-  constructed model
+  imports the module in a subprocess and asserts chromadb/mlx never loaded,
+  covering routes no list of import spellings would reach
+- the chat model decoding greedily --
+  ``test_generation_is_greedy_with_thinking_off_and_explicit_max_tokens``
+  asserts the exact arguments generation is called with, so no sampler reaches
+  mlx-lm by any route
+- no test loading a real model -- conftest's ``_no_real_models`` makes MLX
+  unimportable, which catches a forgotten ``embeddings=`` that names no banned
+  symbol at all
 
 What remains is the residue: rules about how source is *written*, where there is
 nothing to observe precisely because the point is that a call never happens.
@@ -76,39 +80,47 @@ def _blank(match: re.Match[str]) -> str:
 RULES = [
     Rule(
         name="store-factory",
-        # tests/ is exempt: conftest constructs MongoClient directly to manage the
-        # local Atlas container, which is legitimate. ingest.py is the factory home.
-        applies=lambda p: (
-            p.endswith(".py")
-            and not p.startswith("tests/")
-            and p != "rag_pipeline/ingest.py"
+        # tests/ is covered too, unlike in earlier eras of this rule. open_store()
+        # reaches any collection a test needs to inspect or seed, and a client
+        # of a test's own is the same hazard it is anywhere: chromadb shares one
+        # System per persist directory per process, so a client asking for it
+        # with settings other than _client()'s is a builtins ValueError. The
+        # dotted prefix is allowed because `chromadb.PersistentClient(` is the
+        # ordinary spelling; a bare `Client(` is not matched, since every HTTP
+        # library has one.
+        applies=lambda p: p.endswith(".py") and p != "rag_pipeline/ingest.py",
+        pattern=re.compile(
+            r"(?<![\w.])(?:\w+\.)*(?:Chroma(?:\.from_\w+)?|PersistentClient)\s*\("
+            r"|(?<![\w.])chromadb\.Client\s*\("
         ),
-        pattern=re.compile(r"(?<![\w.])(?:MongoDBAtlasVectorSearch|MongoClient)\s*\("),
         scan_comments=False,
         message=(
-            "Constructing the vector store inline. A collection's identity is "
-            "(connection URI, database, collection, vector index name, embedding "
+            "Constructing the vector store inline (Chroma(...), Chroma.from_*(...), "
+            "chromadb.PersistentClient(...) or chromadb.Client(...)). A "
+            "collection's identity is (persist dir, collection name, embedding "
             "function), so indexing and querying must go through open_store() in "
-            "rag_pipeline/ingest.py -- never MongoDBAtlasVectorSearch(...) or "
-            "MongoClient(...) directly."
+            "rag_pipeline/ingest.py."
         ),
     ),
     Rule(
         name="embeddings-factory",
-        # tests/ is NOT exempt here, unlike Chroma above: test_ingest.py opens a
-        # collection directly on purpose, but nothing in tests should build a
-        # real embedding model. Note the offline guarantee does not rest on this
-        # rule -- conftest's socket-blocking fixture does, because it catches the
-        # realistic version of the mistake (a forgotten `embeddings=` argument,
-        # which names no banned symbol at all). This rule is authoring-time
-        # feedback for the deliberate spelling.
+        # tests/ is covered too: nothing in tests should build a real embedding
+        # model, and the adapter's own tests reach it through build_embeddings()
+        # like everyone else. The offline guarantee does not rest on this rule
+        # -- conftest's `_no_real_models` does, because it catches the realistic
+        # version of the mistake (a forgotten `embeddings=` argument, which
+        # names no banned symbol at all). This rule is authoring-time feedback
+        # for the deliberate spelling. `class QwenVLEmbeddings(` is excluded by
+        # the second lookbehind: the definition in mlx_models.py is where the
+        # name has to appear, and it builds nothing.
         applies=lambda p: p.endswith(".py") and p != "rag_pipeline/ingest.py",
         pattern=re.compile(
-            r"(?<![\w.])(?:VoyageAIEmbeddings|HuggingFaceEmbeddings)\s*\("
+            r"(?<![\w.])(?<!class )(?:\w+\.)*"
+            r"(?:QwenVLEmbeddings|HuggingFaceEmbeddings)\s*\("
         ),
         scan_comments=False,
         message=(
-            "Constructing an embedding model (VoyageAIEmbeddings/"
+            "Constructing an embedding model (QwenVLEmbeddings/"
             "HuggingFaceEmbeddings) inline. Route through build_embeddings() in "
             "rag_pipeline/ingest.py; in tests, inject DeterministicFakeEmbedding "
             "instead."

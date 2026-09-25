@@ -5,9 +5,9 @@ PR from a fork, are covered by these tests and nothing else.
 
 The rules that live in `invariants.py` are only the ones about how source is
 *written*. Their behavioral counterparts are asserted where the behavior is:
-`test_cli.py` proves cli.py's imports stay cheap, `test_pipeline.py` proves
-`build_chat_model` sets no sampling params, and `test_ingest.py` proves ingest
-leaves a shared collection's foreign documents alone.
+`test_cli.py` proves cli.py's imports stay cheap, `test_mlx_models.py` proves
+generation decodes greedily, and `test_ingest.py` proves ingest leaves a shared
+collection's foreign documents alone.
 """
 
 from __future__ import annotations
@@ -84,15 +84,38 @@ def test_the_sweep_actually_covers_the_tree() -> None:
 # --- the rules themselves, in-process ----------------------------------------
 
 VIOLATIONS = [
+    pytest.param("app.py", 'store = Chroma(collection_name="x")', id="inline-chroma"),
     pytest.param(
         "app.py",
-        "store = MongoDBAtlasVectorSearch(collection=c)",
-        id="inline-store",
+        "store = Chroma.from_documents(docs, embedding=e)",
+        id="chroma-classmethod-constructor",
     ),
-    pytest.param("app.py", "e = VoyageAIEmbeddings(model=m)", id="inline-embeddings"),
     pytest.param(
-        # tests/ may open the store directly, but never build a real embedding
-        # model. The rule catches the legacy HuggingFace spelling here too.
+        "rag_pipeline/pipeline.py",
+        "client = chromadb.PersistentClient(path=p)",
+        id="inline-persistent-client",
+    ),
+    pytest.param("app.py", "client = chromadb.Client()", id="inline-chroma-client"),
+    pytest.param(
+        # tests/ is not exempt: a test that needs a collection opens it through
+        # open_store(), so a second, differently configured client never exists.
+        "tests/test_ingest.py",
+        "client = chromadb.PersistentClient(path=str(tmp_path))",
+        id="store-in-tests",
+    ),
+    pytest.param(
+        "app.py", "e = QwenVLEmbeddings(m, dimensions=32)", id="inline-embeddings"
+    ),
+    pytest.param(
+        # Qualified by its module, the construction is still a construction.
+        "rag_pipeline/pipeline.py",
+        "e = mlx_models.QwenVLEmbeddings(m, dimensions=d)",
+        id="qualified-embeddings",
+    ),
+    pytest.param(
+        # Nothing in tests builds a real embedding model -- the adapter's own
+        # tests go through build_embeddings() too. The rule catches the legacy
+        # HuggingFace spelling here as well.
         "tests/test_pipeline.py",
         'emb = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")',
         id="embeddings-in-tests",
@@ -104,19 +127,40 @@ VIOLATIONS = [
 ALLOWED = [
     pytest.param(
         "rag_pipeline/ingest.py",
-        "return MongoDBAtlasVectorSearch(collection=c)",
+        "client = chromadb.PersistentClient(path=p)\nreturn Chroma(client=client)",
         id="ingest-is-the-factory-home",
     ),
     pytest.param(
-        # tests/ construct MongoClient directly to manage the local container.
-        "tests/conftest.py",
-        "client = MongoClient(uri)",
-        id="tests-may-open-the-store",
+        # Only chromadb's Client is the store; a bare `Client(` belongs to every
+        # HTTP library, so the rule names the module rather than guess.
+        "app.py",
+        "http = httpx.Client(timeout=5)",
+        id="another-librarys-client",
+    ),
+    pytest.param(
+        "rag_pipeline/ingest.py",
+        "return QwenVLEmbeddings(m, dimensions=d)",
+        id="ingest-builds-the-embedder",
+    ),
+    pytest.param(
+        # The definition has to spell the name followed by a paren, and builds
+        # nothing -- without the rule's `class ` lookbehind the adapter module
+        # itself would fail the sweep.
+        "rag_pipeline/mlx_models.py",
+        "class QwenVLEmbeddings(Embeddings):",
+        id="the-embedder-class-definition",
+    ),
+    pytest.param(
+        # Naming the class is not building it: the adapter's tests patch its
+        # methods this way.
+        "tests/test_mlx_models.py",
+        'monkeypatch.setattr(mlx_models.QwenVLEmbeddings, "_pool", pool)',
+        id="referencing-the-embedder-class",
     ),
     # Prose describing a rule must not trip it, or the rule cannot be documented.
     pytest.param(
         "app.py",
-        "# Never construct MongoClient(...) inline -- use open_store().",
+        "# Never construct Chroma(...) inline -- use open_store().",
         id="comment-describing-store-rule",
     ),
     pytest.param(
@@ -129,12 +173,10 @@ ALLOWED = [
         # indentation hides it: the case that proves multi-line string masking
         # works, and not merely that the single-line kind above does.
         "app.py",
-        'HELP = """\nMongoClient(uri)\n"""',
+        'HELP = """\nchromadb.PersistentClient(path=p)\n"""',
         id="store-inside-a-docstring",
     ),
-    pytest.param(
-        "README.md", "Never construct MongoClient(...) inline.", id="not-python"
-    ),
+    pytest.param("README.md", "Never construct Chroma(...) inline.", id="not-python"),
 ]
 
 
@@ -161,9 +203,26 @@ def test_masking_is_linear_on_pathological_input() -> None:
 
 
 def test_every_rule_has_a_case_in_both_directions() -> None:
-    """A rule with no test is a rule that can rot unnoticed."""
+    """A rule with no test is a rule that can rot unnoticed.
+
+    Checked per rule, not by counting cases: each rule must be the one reported
+    by some violating case, and must match the raw text of some allowed case --
+    a near miss it has to let through by path, masking or lookbehind. Without
+    the second half, an allowed case no rule could ever match would pass while
+    testing nothing, and a rule's exemptions would go unexercised.
+    """
     assert len(RULES) == 3
     assert len({rule.name for rule in RULES}) == len(RULES)
+
+    reported = [violations(*map(str, case.values)) for case in VIOLATIONS]
+    near_misses = [str(case.values[1]) for case in ALLOWED]
+    for rule in RULES:
+        assert any(rule.message in found for found in reported), (
+            f"{rule.name}: no case in VIOLATIONS is reported by it"
+        )
+        assert any(rule.pattern.search(text) for text in near_misses), (
+            f"{rule.name}: no case in ALLOWED is a near miss for it"
+        )
 
 
 def test_every_rule_is_documented() -> None:
@@ -280,11 +339,7 @@ def test_every_env_var_actually_overrides_its_field(
     default = getattr(Settings, field.name)
     # isinstance, not type(): a Path default is a PosixPath, and bool must be
     # checked before int because bool subclasses it.
-    if var == "ATLAS_SIMILARITY":
-        # A validated field: its override must be a real metric other than the
-        # default, not the generic "sentinel" (which from_env rejects).
-        override = "dotProduct"
-    elif isinstance(default, Path):
+    if isinstance(default, Path):
         override = str(tmp_path)
     elif isinstance(default, bool):
         override = "1"

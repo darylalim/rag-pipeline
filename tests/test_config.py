@@ -2,54 +2,84 @@
 
 from __future__ import annotations
 
+import dataclasses
+import os
+from pathlib import Path
+
 import pytest
 
 from rag_pipeline.config import ENV_VARS, Settings
 
+# The checkout this test file sits in. The path defaults are anchored to the
+# repository, not the working directory, so `rag` behaves the same whichever
+# directory it is run from.
+_ROOT = Path(__file__).resolve().parents[1]
+
+# Every field, so a setting added without a default here fails `test_defaults`
+# rather than going untested.
+_DEFAULTS = {
+    "data_dir": _ROOT / "data",
+    "persist_dir": _ROOT / "chroma_db",
+    "collection_name": "rag_docs",
+    "embedding_model": "mlx-community/Qwen3-VL-Embedding-2B-bf16",
+    "embedding_dimensions": 2048,
+    "chat_model": "mlx-community/Qwen3.8-27B-4bit",
+    "max_tokens": 1024,
+    "chunk_size": 1000,
+    "chunk_overlap": 200,
+    "retrieval_k": 4,
+    "fetch_k": 20,
+    "rerank_model": "mlx-community/Qwen3-VL-Reranker-2B-bf16",
+}
+
 
 def test_defaults():
-    s = Settings()
-    assert s.chat_model == "claude-haiku-4-5"
-    assert s.embedding_model == "voyage-4-lite"
-    assert s.chunk_size == 1000
-    assert s.chunk_overlap == 200
-    assert s.retrieval_k == 4
-    assert s.collection_name == "rag_docs"
-    assert s.data_dir.name == "data"
-    # The Atlas store fields.
-    assert s.mongodb_db == "rag_db"
-    assert s.vector_index_name == "vector_index"
-    assert s.embedding_dimensions == 1024
-    assert s.atlas_similarity == "cosine"
-    assert s.mongodb_timeout_ms == 10000
+    assert dataclasses.asdict(Settings()) == _DEFAULTS
 
 
 def test_from_env_overrides(monkeypatch, tmp_path):
-    monkeypatch.setenv("CHAT_MODEL", "claude-opus-4-8")
+    monkeypatch.setenv("CHAT_MODEL", "mlx-community/Qwen3-8B-4bit")
+    monkeypatch.setenv("RERANK_MODEL", str(tmp_path / "reranker"))
     monkeypatch.setenv("RETRIEVAL_K", "7")
+    monkeypatch.setenv("FETCH_K", "30")
     monkeypatch.setenv("CHUNK_SIZE", "512")
+    monkeypatch.setenv("EMBEDDING_DIMENSIONS", "256")
     monkeypatch.setenv("COLLECTION_NAME", "custom")
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
-    monkeypatch.setenv("ATLAS_SIMILARITY", "dotProduct")
-    monkeypatch.setenv("EMBEDDING_DIMENSIONS", "256")
+    # Relative, so the resolution is observable: a path setting is fixed to an
+    # absolute path when read, not reinterpreted against whatever directory a
+    # later call happens to run in.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PERSIST_DIR", "index")
 
     s = Settings.from_env()
 
-    assert s.chat_model == "claude-opus-4-8"
+    assert s.chat_model == "mlx-community/Qwen3-8B-4bit"
+    # A model setting is a string passed through as-is: a local directory is as
+    # valid as a repo id, and resolving either is the loader's job.
+    assert s.rerank_model == str(tmp_path / "reranker")
     assert s.retrieval_k == 7
     assert isinstance(s.retrieval_k, int)
+    assert s.fetch_k == 30
     assert s.chunk_size == 512
+    assert s.embedding_dimensions == 256
     assert s.collection_name == "custom"
     assert s.data_dir == tmp_path.resolve()
-    assert s.atlas_similarity == "dotProduct"
-    assert s.embedding_dimensions == 256
+    assert s.persist_dir == (tmp_path / "index").resolve()
 
 
-def test_from_env_rejects_an_unknown_similarity(monkeypatch):
-    # An unusable metric must raise the ValueError both frontends catch, rather
-    # than reach Atlas and fail opaquely at index-build time.
-    monkeypatch.setenv("ATLAS_SIMILARITY", "manhattan")
-    with pytest.raises(ValueError, match="ATLAS_SIMILARITY"):
+@pytest.mark.parametrize("var", ["DATA_DIR", "PERSIST_DIR"])
+def test_an_unusable_path_setting_is_a_value_error_naming_it(monkeypatch, var):
+    """pathlib signals a `~user` with no home directory as a RuntimeError.
+
+    Left as that, it would slip past the ValueError guard app.py puts around
+    Settings -- the one that stops above the sidebar with "Fix it" -- and reach
+    the user as a crash page instead. A malformed setting is a ValueError,
+    whichever reader found it.
+    """
+    monkeypatch.setenv(var, "~no_such_user_xyz/somewhere")
+
+    with pytest.raises(ValueError, match=var):
         Settings.from_env()
 
 
@@ -60,21 +90,36 @@ def test_from_env_uses_defaults_when_unset(monkeypatch):
     for var in ENV_VARS:
         monkeypatch.delenv(var, raising=False)
 
-    s = Settings.from_env()
-
-    assert s.chat_model == "claude-haiku-4-5"
-    assert s.retrieval_k == 4
-    assert s.chunk_size == 1000
+    assert dataclasses.asdict(Settings.from_env()) == _DEFAULTS
 
 
 def test_from_env_empty_string_falls_back_to_default(monkeypatch):
-    # A set-but-empty var should fall back to the default, not pass "" through.
-    monkeypatch.setenv("CHAT_MODEL", "")
-    monkeypatch.setenv("COLLECTION_NAME", "")
-    monkeypatch.setenv("EMBEDDING_MODEL", "")
+    # A set-but-empty var should fall back to the default, not pass "" through --
+    # for every setting, so each of the str/int/path readers is covered.
+    for var in ENV_VARS:
+        monkeypatch.setenv(var, "")
 
-    s = Settings.from_env()
+    assert dataclasses.asdict(Settings.from_env()) == _DEFAULTS
 
-    assert s.chat_model == "claude-haiku-4-5"
-    assert s.collection_name == "rag_docs"
-    assert s.embedding_model == "voyage-4-lite"
+
+def test_env_vars_are_exactly_what_from_env_reads(monkeypatch):
+    """ENV_VARS is derived from the fields, so it can only be as right as the
+    reads in `from_env` are.
+
+    Recorded rather than compared by eye: a read of a variable that is no
+    longer a field -- a leftover from a removed store or provider -- would be
+    configuration nothing documents and no test clears, and a field read under
+    a misspelled name would never be overridable at all.
+    """
+    read: list[str] = []
+    getenv = os.getenv
+
+    def recording_getenv(name, default=None):
+        read.append(name)
+        return getenv(name, default)
+
+    monkeypatch.setattr(os, "getenv", recording_getenv)
+
+    Settings.from_env()
+
+    assert sorted(read) == sorted(ENV_VARS)
