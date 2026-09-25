@@ -194,11 +194,16 @@ Like the adapters, it raises only `RuntimeError`, because of where the app calls
 it: the SDK logs most malformed `OTEL_*` variables and falls back to a default,
 but refuses a malformed span limit or an out-of-range batch setting with a
 builtins `ValueError` (before OpenTelemetry 1.45, an unknown compression or an
-out-of-range sampler ratio too), which `setup_tracing` translates, and it
-installs nothing until everything is built. Its imports are lazy, so tracing off loads
-none of the instrumentation or exporter
-(`test_tracing_off_loads_none_of_the_tracing_stack`, which takes the frontends'
-path: import, then `setup_tracing(Settings())`).
+out-of-range sampler ratio too), and the exporter refuses a credential provider
+that is not installed with a `RuntimeError` that names no variable.
+`setup_tracing` catches either and raises, in its place, a `RuntimeError` that
+points at the `OTEL_*` variables. It installs nothing until everything is built,
+and shuts down a provider already built when the failure comes — left
+registered, its exit hook would keep it alive until the process ends, one more
+per failed rerun (`test_a_malformed_otel_variable_is_a_runtime_error_that_installs_nothing`
+watches `atexit` for it). Its imports are lazy, so tracing off loads none of the
+instrumentation or exporter (`test_tracing_off_loads_none_of_the_tracing_stack`,
+which takes the frontends' path: import, then `setup_tracing(Settings())`).
 
 `setup_tracing` assembles the provider from OpenTelemetry's parts, **not
 `phoenix.otel.register()`**, whose shortcuts are traps here. Given a base URL,

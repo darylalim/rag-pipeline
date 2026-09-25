@@ -106,11 +106,14 @@ def setup_tracing(settings: Settings) -> None:
         # span limit, or an out-of-range batch setting (zero, or a batch larger
         # than its queue), is a builtins ValueError that would escape the app's
         # guard -- as were an unknown compression and an out-of-range sampler
-        # ratio, before OpenTelemetry 1.45. Nothing is installed
-        # until all of it is built, so a failure leaves tracing off and the
-        # next rerun reports the same error; a provider already built is shut
-        # down, which unregisters the exit hook each failed rerun would
-        # otherwise add.
+        # ratio, before OpenTelemetry 1.45. The exporter refuses a credential
+        # provider (OTEL_PYTHON_EXPORTER_OTLP_HTTP_CREDENTIAL_PROVIDER) that is
+        # not installed with a RuntimeError, which is caught as well: it comes
+        # after the provider is built, and its message names no variable.
+        # Nothing is installed until all of it is built, so a failure leaves
+        # tracing off and the next rerun reports the same error; a provider
+        # already built is shut down, which unregisters the exit hook each
+        # failed rerun would otherwise add.
         provider = None
         try:
             provider = TracerProvider(
@@ -126,7 +129,7 @@ def setup_tracing(settings: Settings) -> None:
                     )
                 )
             )
-        except ValueError as exc:
+        except (RuntimeError, ValueError) as exc:
             if provider is not None:
                 provider.shutdown()
             raise RuntimeError(

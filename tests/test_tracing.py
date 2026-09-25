@@ -12,6 +12,7 @@ that subprocess: this process still opens no socket.
 
 from __future__ import annotations
 
+import atexit
 import dataclasses
 import json
 import logging
@@ -28,6 +29,7 @@ from openinference.instrumentation import TracerProvider
 from openinference.instrumentation.langchain import LangChainInstrumentor
 from opentelemetry import trace
 from opentelemetry.sdk.trace import ReadableSpan
+from opentelemetry.sdk.trace import TracerProvider as SDKTracerProvider
 from opentelemetry.trace import StatusCode
 
 from rag_pipeline import ingest as ingest_mod
@@ -394,6 +396,34 @@ def test_a_stream_closed_from_another_thread_ends_cleanly(
 # --- installing the provider -------------------------------------------------
 
 
+@pytest.fixture
+def provider_exit_hooks(monkeypatch) -> list[object]:
+    """The exit hooks of tracer providers built during the test, while still
+    registered.
+
+    A provider registers one -- its own shutdown, the exit-time flush -- as it is
+    built, and unregisters it when shut down. One left registered keeps its
+    provider alive, to be flushed at exit, however long ago it was abandoned.
+    `atexit` cannot be asked what it holds, so the calls are watched instead.
+    """
+    hooks: list[object] = []
+    register, unregister = atexit.register, atexit.unregister
+
+    def watched_register(func, /, *args, **kwargs):
+        if isinstance(getattr(func, "__self__", None), SDKTracerProvider):
+            hooks.append(func)
+        return register(func, *args, **kwargs)
+
+    def watched_unregister(func, /) -> None:
+        if func in hooks:
+            hooks.remove(func)
+        unregister(func)
+
+    monkeypatch.setattr(atexit, "register", watched_register)
+    monkeypatch.setattr(atexit, "unregister", watched_unregister)
+    return hooks
+
+
 @pytest.mark.parametrize(
     ("endpoint", "url"),
     [
@@ -417,7 +447,9 @@ def test_with_no_endpoint_tracing_stays_off(settings, tracing_left_on):
     assert tracing_left_on() == []
 
 
-def test_setup_installs_one_provider_for_the_process(settings, undo_tracing, caplog):
+def test_setup_installs_one_provider_for_the_process(
+    settings, undo_tracing, caplog, provider_exit_hooks
+):
     """The app calls setup on every rerun, from every session: the first call
     installs, and every later one is a no-op -- not a second provider, which
     OpenTelemetry would refuse with a warning and leave running beside it."""
@@ -436,6 +468,10 @@ def test_setup_installs_one_provider_for_the_process(settings, undo_tracing, cap
     # OpenInference's provider: the SDK's would cut a reranker span over a
     # large FETCH_K to 128 attributes.
     assert isinstance(provider, TracerProvider)
+    # Its exit flush, and only its -- which also shows `provider_exit_hooks`
+    # seeing the SDK register one, so the empty list a failed setup must leave,
+    # below, cannot come from a watch that sees nothing.
+    assert provider_exit_hooks == [provider.shutdown]
     assert provider.resource.attributes["openinference.project.name"] == (
         "probe-project"
     )
@@ -448,21 +484,26 @@ def test_setup_installs_one_provider_for_the_process(settings, undo_tracing, cap
 # OpenTelemetry 1.45, which logs it and sends uncompressed. Not
 # OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT: the SDK also reads that one as it is imported,
 # which chromadb does, so in the app a malformed one fails before tracing is
-# reached.
+# reached. And the exporter's own refusal, of a credential provider that is not
+# installed: a RuntimeError already, but one that comes after the provider is
+# built, and names no variable.
 @pytest.mark.parametrize(
     ("variable", "value"),
     [
         ("OTEL_ATTRIBUTE_COUNT_LIMIT", "abc"),
         ("OTEL_BSP_MAX_EXPORT_BATCH_SIZE", "4096"),
+        ("OTEL_PYTHON_EXPORTER_OTLP_HTTP_CREDENTIAL_PROVIDER", "no-such-provider"),
     ],
 )
 def test_a_malformed_otel_variable_is_a_runtime_error_that_installs_nothing(
-    settings, monkeypatch, tracing_left_on, variable, value
+    settings, monkeypatch, tracing_left_on, provider_exit_hooks, variable, value
 ):
     """The SDK refuses some malformed OTEL_* variables itself, with a builtins
     ValueError -- which, on the app's pipeline-load path, would escape its guard
     as a crash page on every rerun. Translated, and with nothing installed, so
-    tracing stays off and the next rerun says the same thing."""
+    tracing stays off and the next rerun says the same thing. Nothing left
+    registered to run at exit either, or every failed rerun would strand one
+    more provider, kept alive until the process ends."""
     monkeypatch.setenv(variable, value)
     threads = sum(
         t.name == "OtelBatchSpanRecordProcessor" for t in threading.enumerate()
@@ -479,6 +520,9 @@ def test_a_malformed_otel_variable_is_a_runtime_error_that_installs_nothing(
         sum(t.name == "OtelBatchSpanRecordProcessor" for t in threading.enumerate())
         == threads
     ), "a failed setup left an exporter thread running"
+    assert provider_exit_hooks == [], (
+        "a failed setup left a provider's exit hook registered"
+    )
 
 
 def test_concurrent_first_setups_install_once(settings, undo_tracing, caplog):
