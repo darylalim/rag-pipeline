@@ -179,8 +179,17 @@ def has_table_row(readme_text: str, name: str, default: str | None = None) -> bo
     Not anchored to a particular table, so setting names, rule names and the CI
     job names share one namespace across the file. No collision is possible with
     the current names, and anchoring costs more regex than the risk earns.
+
+    An empty default is the exception: it is an empty cell. Markdown has no
+    empty code span -- a bare pair of backticks renders as two literal
+    backticks -- and a blank cell is what "unset" looks like in a table.
     """
-    cell = rf"\s*`{re.escape(default)}`\s*\|" if default is not None else ""
+    if default is None:
+        cell = ""
+    elif not default:
+        cell = r"[ \t]*\|"  # not \s: a blank cell must not reach into the next line
+    else:
+        cell = rf"\s*`{re.escape(default)}`\s*\|"
     return bool(re.search(rf"^\|\s*`{name}`\s*\|{cell}", readme_text, re.MULTILINE))
 
 
@@ -308,14 +317,25 @@ def settings_problems(root: Path) -> list[str]:
 
     problems = []
     for name, default in defaults.items():
-        shown = f"`{default}`" if default is not None else "<default>"
+        if default is None:
+            shown = "<default>"
+        else:
+            shown = f"`{default}`" if default else "an empty default cell"
         missing = []
         # A commented default line, e.g. "# RETRIEVAL_K=4", stating the value the
         # code actually declares -- a name alone would let `CHAT_MODEL=gpt-4` pass.
         # The trailing group allows the explanatory comments some lines carry.
-        value = rf"{re.escape(default)}\s*(?:#|$)" if default is not None else ""
+        if default is None:
+            value = ""
+        elif not default:
+            # Bare: python-dotenv reads `NAME=   # note` as the value "# note",
+            # so an empty default with a comment after it does not round-trip.
+            value = r"[ \t]*$"
+        else:
+            value = rf"{re.escape(default)}\s*(?:#|$)"
         if not re.search(rf"^#\s*{name}={value}", env_text, re.MULTILINE):
-            missing.append(f".env.example (needs `# {name}={default or '<default>'}`)")
+            documented = "<default>" if default is None else default
+            missing.append(f".env.example (needs `# {name}={documented}`)")
         if not has_table_row(readme_text, name, default):
             missing.append(f"README.md config table (needs a `{name}` row, {shown})")
         if missing:

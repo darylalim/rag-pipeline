@@ -55,7 +55,7 @@ from langchain_core.callbacks import CallbackManagerForLLMRun, Callbacks
 from langchain_core.documents import Document
 from langchain_core.documents.compressor import BaseDocumentCompressor
 from langchain_core.embeddings import Embeddings
-from langchain_core.language_models import BaseChatModel
+from langchain_core.language_models import BaseChatModel, LangSmithParams
 from langchain_core.language_models.chat_models import generate_from_stream
 from langchain_core.messages import (
     AIMessage,
@@ -634,6 +634,17 @@ class MLXChatModel(BaseChatModel):
     @property
     def _identifying_params(self) -> dict[str, Any]:
         return {"model_id": self.model_id, "max_tokens": self.max_tokens}
+
+    def _get_ls_params(
+        self, stop: list[str] | None = None, **kwargs: Any
+    ) -> LangSmithParams:
+        # What a tracer names the model by. LangChain fills it from a field
+        # called `model` or `model_name`, so without this a trace's model span
+        # names no model at all, and the provider is the lower-cased class name.
+        params = super()._get_ls_params(stop=stop, **kwargs)
+        params["ls_provider"] = "mlx"
+        params["ls_model_name"] = self.model_id
+        return params
 
     def _stream(
         self,

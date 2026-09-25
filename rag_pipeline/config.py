@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, fields
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 
@@ -50,6 +51,29 @@ def _env_str(name: str, default: str) -> str:
     # straight through to the model/store.
     value = os.getenv(name)
     return value if value else default
+
+
+def _env_url(name: str, default: str) -> str:
+    # Checked here because nothing downstream checks it: the span exporter
+    # accepts any string, and one it cannot send to fails only when a trace is
+    # sent -- a line in a log, every trace lost -- rather than as a setting the
+    # app stops on and names.
+    value = os.getenv(name)
+    if not value:
+        return default
+    try:
+        url = urlsplit(value)
+        # `.port` raises ValueError for a port that is not a number in range.
+        usable = (
+            url.scheme in ("http", "https") and bool(url.hostname) and url.port != 0
+        )
+    except ValueError as exc:
+        raise ValueError(f"{name}={value!r} is not a usable URL: {exc}") from exc
+    if not usable:
+        raise ValueError(
+            f"{name}={value!r} must be an http(s) URL, such as http://localhost:6006"
+        )
+    return value
 
 
 @dataclass(frozen=True)
@@ -112,6 +136,16 @@ class Settings:
     # tied-embedding checkpoints: the 2B, in any quantization.
     rerank_model: str = "mlx-community/Qwen3-VL-Reranker-2B-bf16"
 
+    # Tracing, off while the endpoint is empty. Set, it is the base URL of a
+    # self-hosted Phoenix (http://localhost:6006 for `phoenix serve`), and each
+    # question is sent there as one trace, over OTLP/HTTP to its /v1/traces,
+    # filed under this project. The names are the ones Phoenix's own clients
+    # read, so its docs on these two apply -- except that unset means off here,
+    # where Phoenix's clients would assume localhost. Its other client
+    # settings (an API key among them) are not read: no credentials are sent.
+    phoenix_collector_endpoint: str = ""
+    phoenix_project: str = "rag-pipeline"
+
     @classmethod
     def from_env(cls) -> Settings:
         """Build settings, letting environment variables override defaults."""
@@ -130,6 +164,10 @@ class Settings:
             retrieval_k=_env_int("RETRIEVAL_K", cls.retrieval_k),
             fetch_k=_env_int("FETCH_K", cls.fetch_k),
             rerank_model=_env_str("RERANK_MODEL", cls.rerank_model),
+            phoenix_collector_endpoint=_env_url(
+                "PHOENIX_COLLECTOR_ENDPOINT", cls.phoenix_collector_endpoint
+            ),
+            phoenix_project=_env_str("PHOENIX_PROJECT", cls.phoenix_project),
         )
 
 

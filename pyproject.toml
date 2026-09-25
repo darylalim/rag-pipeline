@@ -34,6 +34,22 @@ dependencies = [
     # Serializes ingests across processes: two writers on one persist dir at
     # once silently corrupt it (a CLI `rag ingest` during an app upload).
     "filelock>=4.0.3",
+    # Optional tracing to a self-hosted Phoenix (off unless
+    # PHOENIX_COLLECTOR_ENDPOINT is set). pipeline.py opens its spans through
+    # the OpenTelemetry API alone -- a no-op until a provider exists -- and
+    # names their attributes with OpenInference's conventions, which is what
+    # Phoenix reads. tracing.py builds the provider (the OpenInference one:
+    # the SDK's own caps a span at 128 attributes, which a reranker span
+    # passes from a FETCH_K of about 37), exports over OTLP/HTTP, and
+    # instruments LangChain. All six are imported directly, so all six are declared. Not
+    # arize-phoenix-otel: its register() cannot bound the exporter's timeout,
+    # and reads PHOENIX_* settings from outside Settings.
+    "opentelemetry-api>=1.44.0",
+    "opentelemetry-sdk>=1.44.0",
+    "opentelemetry-exporter-otlp-proto-http>=1.44.0",
+    "openinference-semantic-conventions>=0.1.39",
+    "openinference-instrumentation>=0.1.66",
+    "openinference-instrumentation-langchain>=0.1.76",
 ]
 
 [project.scripts]
@@ -48,6 +64,9 @@ packages = ["rag_pipeline"]
 
 [dependency-groups]
 dev = [
+    # reset_trace_globals(): OpenTelemetry lets a process set its tracer
+    # provider once, so the tests that record spans reset it between them.
+    "opentelemetry-test-utils>=0.65b0",
     "pytest>=9.1.1",
     "pytest-cov>=7.0",
     "ruff>=0.15.22",

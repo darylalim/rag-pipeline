@@ -11,7 +11,7 @@ load once per process however often it is rebuilt.
 from __future__ import annotations
 
 import itertools
-from contextlib import closing
+from contextlib import ExitStack, closing
 
 import streamlit as st
 from streamlit.runtime.uploaded_file_manager import UploadedFile
@@ -26,6 +26,7 @@ from rag_pipeline.ingest import (
     save_upload,
 )
 from rag_pipeline.pipeline import Excerpt, RAGPipeline, source_excerpts
+from rag_pipeline.tracing import setup_tracing
 
 st.set_page_config(
     page_title="RAG Pipeline", page_icon=":material/search:", layout="centered"
@@ -212,6 +213,10 @@ with st.sidebar:
 # is read here, after the rebuild bumped it, so the cached pipeline misses and
 # reloads.
 try:
+    # Once per process however often it is called -- a no-op after the first,
+    # and always unless PHOENIX_COLLECTOR_ENDPOINT is set. Here, below the
+    # sidebar, with the pipeline load, since the questions are what it traces.
+    setup_tracing(cfg)
     pipeline = load_pipeline(cfg, index_version(cfg))
 except (FileNotFoundError, RuntimeError) as exc:
     # FileNotFoundError: no/empty index, or a model missing from the Hugging
@@ -313,19 +318,25 @@ if question := st.chat_input(
         # can fail before generation ever starts.
         phase = "Retrieval"
         try:
-            # stream_answer() has finished retrieving when it returns but has
-            # not started generating, so the spinner covers exactly the step
-            # with nothing to show.
-            with st.spinner("Retrieving context..."):
-                docs, chunks = pipeline.stream_answer(question)
-            phase = "Generation"
             # Closed on every way out, not left to the garbage collector. The
             # model holds a process-wide lock while its stream is open, and a
             # Stop (StopException at write_stream's next yield point) or an
             # error would otherwise leave `chunks` suspended -- a global of this
             # script's module, which Streamlit keeps alive after the run -- so
             # the next question, from any session, would wait on it for good.
-            with closing(chunks):
+            with ExitStack() as open_stream:
+                # stream_answer() has finished retrieving when it returns but
+                # has not started generating, so the spinner covers exactly the
+                # step with nothing to show.
+                with st.spinner("Retrieving context..."):
+                    docs, chunks = pipeline.stream_answer(question)
+                    # Registered inside the spinner, not after it: the spinner's
+                    # exit is itself a Streamlit call, so a Stop pressed during
+                    # retrieval is raised there, with the stream returned but
+                    # not yet read. It holds no lock then, but it does hold the
+                    # question's trace, which is sent only once it is closed.
+                    open_stream.enter_context(closing(chunks))
+                phase = "Generation"
                 # The local model reads the whole prompt before its first token
                 # — several seconds, and longest on the first answer after the
                 # models load — and write_stream shows nothing until a token

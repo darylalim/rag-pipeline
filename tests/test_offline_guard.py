@@ -8,12 +8,16 @@ every socket, for whatever still reaches for the network -- a download,
 telemetry, Chroma's default embedder. Either one silently loosening reads as
 green everywhere else, so each route to a real model is tripped here on purpose
 -- every factory, and both entry points that build one when a fake is left out
--- and the socket block is checked on its own.
+-- and the socket block is checked on its own. So is the tracing guard: an
+exporter is the one route out the socket block cannot stop, since the tracing
+SDK catches its error.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import importlib
+import os
 import socket
 import sys
 from types import ModuleType
@@ -24,7 +28,9 @@ from langchain_core.language_models import FakeListChatModel
 
 from rag_pipeline import ingest as ingest_mod
 from rag_pipeline import pipeline as pipeline_mod
+from rag_pipeline.config import Settings
 from rag_pipeline.pipeline import RAGPipeline
+from rag_pipeline.tracing import setup_tracing
 
 
 def _assert_stopped_by_the_mlx_guard(
@@ -165,3 +171,40 @@ def test_a_bare_socket_cannot_connect(method):
             getattr(sock, method)(("127.0.0.1", 9))
     finally:
         sock.close()
+
+
+# --- the tracing guard -------------------------------------------------------
+
+
+def test_tracing_is_off_whatever_the_env_file_says():
+    """`_no_tracing`, seen from inside a test.
+
+    The endpoint both frontends read is gone, so neither installs an exporter,
+    and LangSmith -- which langchain-core still carries, and which still acts
+    on its own switch -- is off.
+    """
+    assert "PHOENIX_COLLECTOR_ENDPOINT" not in os.environ
+    assert Settings.from_env().phoenix_collector_endpoint == ""
+    assert os.environ["LANGSMITH_TRACING"] == "false"
+
+
+def test_every_test_is_checked_for_tracing_left_on(request):
+    """The tripwire must run after every test, not only where requested: a
+    test that forgets to undo tracing does not know it."""
+    assert "_no_tracer_left_on" in request.fixturenames
+
+
+def test_the_tripwire_sees_what_a_real_setup_leaves(
+    settings, undo_tracing, tracing_left_on
+):
+    """Tripped for real: tracing set up with an endpoint leaves a provider and
+    LangChain's hook installed process-wide, and the check reports both. (No
+    span is emitted, so the exporter never reaches for its socket.)"""
+    setup_tracing(
+        dataclasses.replace(settings, phoenix_collector_endpoint="http://127.0.0.1:9")
+    )
+
+    assert tracing_left_on() == [
+        "a tracer provider is installed",
+        "LangChain is instrumented",
+    ]

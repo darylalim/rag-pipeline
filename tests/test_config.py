@@ -30,6 +30,9 @@ _DEFAULTS = {
     "retrieval_k": 4,
     "fetch_k": 20,
     "rerank_model": "mlx-community/Qwen3-VL-Reranker-2B-bf16",
+    # Empty: tracing is off unless asked for, so a fresh checkout sends nothing.
+    "phoenix_collector_endpoint": "",
+    "phoenix_project": "rag-pipeline",
 }
 
 
@@ -46,6 +49,8 @@ def test_from_env_overrides(monkeypatch, tmp_path):
     monkeypatch.setenv("EMBEDDING_DIMENSIONS", "256")
     monkeypatch.setenv("COLLECTION_NAME", "custom")
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("PHOENIX_COLLECTOR_ENDPOINT", "http://phoenix.internal:6006")
+    monkeypatch.setenv("PHOENIX_PROJECT", "docs-qa")
     # Relative, so the resolution is observable: a path setting is fixed to an
     # absolute path when read, not reinterpreted against whatever directory a
     # later call happens to run in.
@@ -66,6 +71,10 @@ def test_from_env_overrides(monkeypatch, tmp_path):
     assert s.collection_name == "custom"
     assert s.data_dir == tmp_path.resolve()
     assert s.persist_dir == (tmp_path / "index").resolve()
+    # Kept as given: the collector path is appended where spans are sent, so a
+    # base URL and one naming a proxy prefix both mean what they say.
+    assert s.phoenix_collector_endpoint == "http://phoenix.internal:6006"
+    assert s.phoenix_project == "docs-qa"
 
 
 @pytest.mark.parametrize("var", ["DATA_DIR", "PERSIST_DIR"])
@@ -81,6 +90,45 @@ def test_an_unusable_path_setting_is_a_value_error_naming_it(monkeypatch, var):
 
     with pytest.raises(ValueError, match=var):
         Settings.from_env()
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "localhost:6006",  # no scheme: urlsplit reads "localhost" as one
+        "grpc://localhost:4317",
+        "http://",
+        "http://localhost:not-a-port",
+        "http://localhost:0",
+    ],
+)
+def test_an_unusable_phoenix_endpoint_is_a_value_error_naming_it(monkeypatch, endpoint):
+    """Refused where it is read, not where spans are sent.
+
+    The exporter takes any string, and one it cannot post to fails only on
+    export, as a log line on a background thread -- every trace lost, and
+    nothing on screen to say why. A ValueError here is what app.py stops on
+    above its sidebar and what the CLI prints as its one-line error.
+    """
+    monkeypatch.setenv("PHOENIX_COLLECTOR_ENDPOINT", endpoint)
+
+    with pytest.raises(ValueError, match="PHOENIX_COLLECTOR_ENDPOINT"):
+        Settings.from_env()
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "http://localhost:6006",
+        "https://phoenix.example.com",
+        "http://127.0.0.1:6006/phoenix/",  # behind a reverse proxy
+        "http://[::1]:6006",
+    ],
+)
+def test_a_usable_phoenix_endpoint_is_accepted(monkeypatch, endpoint):
+    monkeypatch.setenv("PHOENIX_COLLECTOR_ENDPOINT", endpoint)
+
+    assert Settings.from_env().phoenix_collector_endpoint == endpoint
 
 
 def test_from_env_uses_defaults_when_unset(monkeypatch):

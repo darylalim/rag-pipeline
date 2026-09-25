@@ -25,6 +25,7 @@ from pathlib import Path
 
 import pytest
 import streamlit as st
+from langchain_core.documents.compressor import BaseDocumentCompressor
 from langchain_core.language_models import FakeListChatModel
 from langchain_core.runnables import RunnableLambda
 from streamlit.runtime.scriptrunner_utils.exceptions import StopException
@@ -34,6 +35,7 @@ from streamlit.testing.v1 import AppTest
 from rag_pipeline import ingest as ingest_mod
 from rag_pipeline import mlx_models
 from rag_pipeline import pipeline as pipeline_mod
+from rag_pipeline import tracing as tracing_mod
 from rag_pipeline.mlx_models import MLXChatModel
 
 APP = Path(__file__).resolve().parent.parent / "app.py"
@@ -250,6 +252,60 @@ def test_a_real_stop_releases_the_model_and_keeps_the_turn(
     assert not at.exception, [e.value for e in at.exception]
     assert _roles(at) == ["user", "assistant"] * 2
     assert "error" not in at.session_state["messages"][3]
+
+
+class _StopDuringRerank(BaseDocumentCompressor):
+    """A reranker during whose work the user presses Stop."""
+
+    def compress_documents(self, documents, query, callbacks=None):
+        _stop_the_run()
+        return documents[:2]
+
+
+def test_a_stop_during_retrieval_still_sends_the_questions_trace(
+    app, spans, monkeypatch
+):
+    """The one Stop that lands with the answer stream returned but unread.
+
+    The retrieval spinner's exit is itself a Streamlit call, so a Stop pressed
+    while retrieval runs is raised there -- after stream_answer has handed the
+    stream back, before anything reads it. No lock is held yet, but the stream
+    holds the question's root span, which ends when the stream is closed:
+    dropped, the question never reaches Phoenix, and its search and rerank
+    arrive with a parent that never does. The garbage collector is off, as it
+    is free to be, so nothing but an explicit close can end it.
+    """
+    monkeypatch.setattr(pipeline_mod, "build_reranker", lambda _s: _StopDuringRerank())
+    at = app.run()
+
+    gc.disable()
+    try:
+        at.chat_input[0].set_value("Why do chunks overlap?").run()
+    finally:
+        gc.enable()
+
+    assert _roles(at) == ["user", "assistant"], "the stopped turn was not stored"
+    assert "Interrupted" in at.session_state["messages"][1]["content"]
+    roots = [span for span in spans.get_finished_spans() if span.name == "RAGPipeline"]
+    assert len(roots) == 1, "the stopped question's trace was never ended"
+    assert [event.name for event in roots[0].events] == ["stopped"]
+
+
+def test_the_app_sets_up_tracing_from_its_own_settings(app, monkeypatch):
+    """The app is one of the two places a process decides to trace, and it
+    must decide from the Settings it built, like everything else it does."""
+    seen: list[str] = []
+    monkeypatch.setattr(
+        tracing_mod,
+        "setup_tracing",
+        lambda settings: seen.append(settings.phoenix_collector_endpoint),
+    )
+    monkeypatch.setenv("PHOENIX_COLLECTOR_ENDPOINT", "http://phoenix.test:6006")
+
+    at = app.run()
+
+    assert not at.exception, [e.value for e in at.exception]
+    assert seen == ["http://phoenix.test:6006"]
 
 
 def test_every_turn_stays_paired_across_mixed_outcomes(app, fail_mid_stream):
@@ -718,6 +774,24 @@ def test_missing_index_is_reported_not_raised(
     assert not at.exception, [e.value for e in at.exception]
     assert any(message in e.value for e in at.error)
     assert not at.chat_input, "the app must stop before offering an input"
+
+
+def test_a_tracing_setup_failure_is_reported_below_the_sidebar(
+    app, monkeypatch, undo_tracing
+):
+    """Tracing is set up on the pipeline-load path, whose handler catches
+    FileNotFoundError and RuntimeError only. The tracing SDK refuses a
+    malformed OTEL_* variable with a builtins ValueError -- which must arrive
+    translated, as the message the handler shows, with the sidebar above it."""
+    monkeypatch.setenv("PHOENIX_COLLECTOR_ENDPOINT", "http://127.0.0.1:9")
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_COMPRESSION", "zstd")
+
+    at = app.run()
+
+    assert not at.exception, [e.value for e in at.exception]
+    assert any("OTEL_" in e.value for e in at.error)
+    assert at.sidebar.button, "the sidebar must render above the error"
+    assert not at.chat_input
 
 
 def test_looking_for_a_missing_index_creates_nothing(app, settings, monkeypatch):

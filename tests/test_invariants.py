@@ -309,6 +309,70 @@ def test_a_documented_default_that_lies_is_reported(
     assert any("RETRIEVAL_K" in problem for problem in settings_problems(tmp_path))
 
 
+@pytest.mark.parametrize(
+    ("cell", "documented"),
+    [
+        pytest.param(" ", True, id="blank"),
+        pytest.param(" `http://localhost:6006` ", False, id="a-value"),
+        pytest.param(" `` ", False, id="empty-code-span"),
+    ],
+)
+def test_an_empty_default_is_documented_as_a_blank_cell(
+    tmp_path: Path, cell: str, documented: bool
+) -> None:
+    """An empty default has one honest rendering in a table: nothing.
+
+    Checked both ways: a value in that cell would be a default the code does
+    not have, and a pair of backticks is what Markdown shows for an "empty"
+    code span.
+    """
+    (tmp_path / "rag_pipeline").mkdir()
+    (tmp_path / "rag_pipeline" / "config.py").write_text(
+        "from dataclasses import dataclass\n\n\n"
+        "@dataclass(frozen=True)\n"
+        "class Settings:\n"
+        '    phoenix_collector_endpoint: str = ""\n'
+    )
+    (tmp_path / ".env.example").write_text("# PHOENIX_COLLECTOR_ENDPOINT=\n")
+    (tmp_path / "README.md").write_text(
+        f"| `PHOENIX_COLLECTOR_ENDPOINT` |{cell}| Tracing |\n"
+    )
+
+    assert (settings_problems(tmp_path) == []) is documented
+
+
+@pytest.mark.parametrize(
+    ("line", "documented"),
+    [
+        pytest.param("# PHOENIX_COLLECTOR_ENDPOINT=\n", True, id="bare"),
+        pytest.param(
+            "# PHOENIX_COLLECTOR_ENDPOINT=   # e.g. http://localhost:6006\n",
+            False,
+            id="trailing-comment",
+        ),
+    ],
+)
+def test_an_empty_default_is_a_bare_line_in_the_env_example(
+    tmp_path: Path, line: str, documented: bool
+) -> None:
+    """Uncommented, the line must mean the default -- and for an empty one a
+    trailing comment breaks that: python-dotenv takes `# e.g. ...` as the value,
+    which the URL check then refuses, stopping both frontends."""
+    (tmp_path / "rag_pipeline").mkdir()
+    (tmp_path / "rag_pipeline" / "config.py").write_text(
+        "from dataclasses import dataclass\n\n\n"
+        "@dataclass(frozen=True)\n"
+        "class Settings:\n"
+        '    phoenix_collector_endpoint: str = ""\n'
+    )
+    (tmp_path / ".env.example").write_text(line)
+    (tmp_path / "README.md").write_text(
+        "| `PHOENIX_COLLECTOR_ENDPOINT` | | Tracing |\n"
+    )
+
+    assert (settings_problems(tmp_path) == []) is documented
+
+
 def test_settings_extraction_matches_config_env_vars() -> None:
     """The text-level extraction agrees with the imported dataclass.
 
@@ -346,7 +410,9 @@ def test_every_env_var_actually_overrides_its_field(
     elif isinstance(default, int):
         override = "7"
     else:
-        override = "sentinel"
+        # A URL, because one str setting must be one; every other str reader
+        # passes any string through.
+        override = "http://sentinel.invalid"
 
     monkeypatch.setenv(var, override)
     changed = getattr(Settings.from_env(), field.name)

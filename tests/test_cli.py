@@ -33,6 +33,7 @@ import pytest
 from rag_pipeline import cli
 from rag_pipeline import ingest as ingest_mod
 from rag_pipeline import pipeline as pipeline_mod
+from rag_pipeline import tracing as tracing_mod
 
 # The real factories, bound before `wired_env` swaps fakes in on the modules:
 # the tests below that are about the production path put these back.
@@ -301,6 +302,27 @@ def test_settings_come_from_the_environment_not_a_literal(
     assert not wired_env.persist_dir.exists()
 
 
+def test_a_question_sets_up_tracing_and_an_ingest_does_not(indexed, monkeypatch):
+    """From the command's own Settings, and only for `rag query`.
+
+    A question is the one thing traced. An ingest emits no spans, so setting
+    tracing up there would only load the instrumentation and the exporter and
+    start an exporter thread with nothing to send.
+    """
+    seen: list[str] = []
+    monkeypatch.setattr(
+        tracing_mod,
+        "setup_tracing",
+        lambda settings: seen.append(settings.phoenix_collector_endpoint),
+    )
+    monkeypatch.setenv("PHOENIX_COLLECTOR_ENDPOINT", "http://phoenix.test:6006")
+
+    assert cli.main(["ingest"]) == 0
+    assert seen == []
+    assert cli.main(["query", "Why do chunks overlap?"]) == 0
+    assert seen == ["http://phoenix.test:6006"]
+
+
 # --- the cost of `rag --help` ------------------------------------------------
 
 # The heavy half of the dependency tree: the vector store and the model runtime.
@@ -308,6 +330,13 @@ def test_settings_come_from_the_environment_not_a_literal(
 # the module must not pay for a stack the user may never reach, since `rag
 # --help` and a usage error load cli.py and then exit.
 HEAVY = ("chromadb", "langchain_chroma", "mlx", "mlx_lm")
+
+# What tracing loads once it is on: the LangChain instrumentation and the span
+# exporter. Off, the pipeline carries the OpenTelemetry API alone.
+TRACING_STACK = (
+    "openinference.instrumentation",
+    "opentelemetry.exporter.otlp.proto.http",
+)
 
 # Records which HEAVY modules are loaded after importing cli.py, then again after
 # importing the store and query modules -- one interpreter, so the second
@@ -320,6 +349,10 @@ import rag_pipeline.cli
 loaded["cli"] = [m for m in {heavy!r} if m in sys.modules]
 import rag_pipeline.ingest, rag_pipeline.pipeline
 loaded["pipeline"] = [m for m in {heavy!r} if m in sys.modules]
+from rag_pipeline.config import Settings
+from rag_pipeline.tracing import setup_tracing
+setup_tracing(Settings())  # what both frontends do with tracing off
+loaded["tracing"] = [m for m in {tracing!r} if m in sys.modules]
 loaded["transformers"] = "transformers" in sys.modules
 print(json.dumps(loaded))
 """
@@ -336,7 +369,11 @@ def heavy_modules_loaded() -> dict:
     every test that asks, and a fresh interpreter importing chromadb is not free.
     """
     result = subprocess.run(
-        [sys.executable, "-c", _IMPORT_PROBE.format(heavy=HEAVY)],
+        [
+            sys.executable,
+            "-c",
+            _IMPORT_PROBE.format(heavy=HEAVY, tracing=TRACING_STACK),
+        ],
         capture_output=True,
         text=True,
         timeout=120,
@@ -375,6 +412,22 @@ def test_importing_the_pipeline_does_not_load_mlx(heavy_modules_loaded):
     """
     loaded = set(heavy_modules_loaded["pipeline"])
     assert not {"mlx", "mlx_lm"} & loaded, f"importing the pipeline loaded: {loaded}"
+
+
+def test_tracing_off_loads_none_of_the_tracing_stack(heavy_modules_loaded):
+    """Off is the default, and costs nothing: setup_tracing imports the
+    instrumentation and the exporter itself, and only once it has an endpoint.
+
+    The probe takes the frontends' own path -- import everything, then call
+    setup_tracing with the default Settings -- so an import hoisted to the top
+    of tracing.py, or above its endpoint check, shows up here. The control is
+    that every name is a real, installed module: a misspelled one is never
+    loaded, and would pass forever.
+    """
+    assert all(importlib.util.find_spec(name) for name in TRACING_STACK)
+    assert not heavy_modules_loaded["tracing"], (
+        f"tracing off loaded: {heavy_modules_loaded['tracing']}"
+    )
 
 
 @pytest.mark.skipif(

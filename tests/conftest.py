@@ -16,20 +16,31 @@ silent otherwise:
   models cached, no socket is involved, so a network block alone would not
   notice. Tests marked ``models`` (deselected by default) opt out of it.
 - ``_offline`` blocks every socket, so nothing -- a model download, telemetry,
-  Chroma's default ONNX embedder -- reaches the network. ``_no_tracing`` stops
-  the one thing that would otherwise try on every chain: LangSmith tracing
-  switched on by a developer's .env.
+  Chroma's default ONNX embedder -- reaches the network. ``_no_tracing`` keeps
+  tracing off whatever a developer's .env says, and ``_no_tracer_left_on``
+  fails a test that leaves it on: an exporter is the one route out that the
+  socket block cannot stop, because the tracing SDK swallows the error.
 """
 
 from __future__ import annotations
 
 import socket
 import sys
+from collections.abc import Callable, Iterator
 
 import pytest
 from langchain_core.documents.compressor import BaseDocumentCompressor
 from langchain_core.embeddings import DeterministicFakeEmbedding
 from langchain_core.language_models import FakeListChatModel
+from openinference.instrumentation import TracerProvider
+from openinference.instrumentation.langchain import LangChainInstrumentor
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider as SDKTracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+    InMemorySpanExporter,
+)
+from opentelemetry.test.globals_test import reset_trace_globals
 
 from rag_pipeline import ingest as ingest_mod
 from rag_pipeline import mlx_models
@@ -192,6 +203,47 @@ def model_dir(tmp_path) -> str:
 
 
 @pytest.fixture
+def spans() -> Iterator[InMemorySpanExporter]:
+    """Every span the test produces, recorded in memory as tracing-on would.
+
+    The provider production installs -- OpenInference's, whose attribute cap a
+    reranker span over a large FETCH_K needs -- with LangChain instrumented
+    against it, but a synchronous processor into memory in place of the batched
+    exporter, so a span can be asserted on the moment it ends. All of it is
+    undone afterwards: OpenTelemetry allows one provider per process, and
+    LangChain's hook is process-wide, so either left in place would trace every
+    later test.
+    """
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    trace.set_tracer_provider(provider)
+    LangChainInstrumentor().instrument(tracer_provider=provider)
+    try:
+        yield exporter
+    finally:
+        LangChainInstrumentor().uninstrument()
+        provider.shutdown()
+        reset_trace_globals()
+
+
+@pytest.fixture
+def undo_tracing() -> Iterator[None]:
+    """For a test that runs `setup_tracing` for real: switch tracing back off.
+
+    Everything setup installs is process-wide, and `_no_tracer_left_on` fails
+    the test that leaves any of it behind.
+    """
+    yield
+    if LangChainInstrumentor().is_instrumented_by_opentelemetry:
+        LangChainInstrumentor().uninstrument()
+    provider = trace.get_tracer_provider()
+    if isinstance(provider, SDKTracerProvider):
+        provider.shutdown()
+    reset_trace_globals()
+
+
+@pytest.fixture
 def fail_mid_stream(monkeypatch):
     """Make generation emit, then fail -- as a real one would.
 
@@ -264,19 +316,25 @@ def _no_real_models(request, monkeypatch):
 
 @pytest.fixture(autouse=True, scope="session")
 def _no_tracing():
-    """Keep LangSmith tracing off, whatever the developer's .env says.
+    """Keep tracing off, whatever the developer's .env says.
 
-    config.py loads .env at import time, and ``LANGSMITH_TRACING=true`` there
-    makes every chain a test runs queue a trace for a background thread to
-    upload. `_offline` blocks that upload only while a test is running; a flush
-    that lands after its monkeypatch is undone, or at interpreter exit, would
-    send test traces out for real. Session-scoped because langsmith reads these
-    once per process and caches the answer, so they must be in place before the
-    first chain runs. Every spelling is set, because the first one found wins
-    and "false" also keeps langchain-core's legacy ``LANGCHAIN_TRACING`` check
-    quiet.
+    config.py loads .env at import time, so a ``PHOENIX_COLLECTOR_ENDPOINT``
+    there would reach every test that builds its settings from the
+    environment -- both frontends -- and each would install a real exporter.
+    ``_offline`` does not stop one: the tracing SDK catches the socket block's
+    error and logs it, and a batch still queued at exit is sent after the block
+    is undone, into the developer's own Phoenix.
+
+    LangSmith is switched off as well. The pipeline no longer uses it, but
+    langsmith still ships inside langchain-core and still acts on
+    ``LANGSMITH_TRACING=true``, uploading every chain from a background thread.
+    Every spelling is set, because the first one found wins and "false" also
+    keeps langchain-core's legacy ``LANGCHAIN_TRACING`` check quiet.
+    Session-scoped because langsmith reads these once per process and caches
+    the answer, so they must be in place before the first chain runs.
     """
     with pytest.MonkeyPatch.context() as mp:
+        mp.delenv("PHOENIX_COLLECTOR_ENDPOINT", raising=False)
         for var in (
             "LANGSMITH_TRACING_V2",
             "LANGCHAIN_TRACING_V2",
@@ -285,6 +343,37 @@ def _no_tracing():
         ):
             mp.setenv(var, "false")
         yield
+
+
+def _tracing_left_on() -> list[str]:
+    """What of tracing is switched on process-wide right now, if anything."""
+    left = []
+    if not isinstance(trace.get_tracer_provider(), trace.ProxyTracerProvider):
+        left.append("a tracer provider is installed")
+    if LangChainInstrumentor().is_instrumented_by_opentelemetry:
+        left.append("LangChain is instrumented")
+    return left
+
+
+@pytest.fixture
+def tracing_left_on() -> Callable[[], list[str]]:
+    """`_no_tracer_left_on`'s check, callable: test_offline_guard trips it, and
+    test_tracing shows it staying quiet."""
+    return _tracing_left_on
+
+
+@pytest.fixture(autouse=True)
+def _no_tracer_left_on():
+    """Fail a test that leaves tracing switched on behind it.
+
+    `setup_tracing` installs a provider for the life of the process -- that is
+    its job -- so a test that reaches it with an endpoint would trace every test
+    after it, and export them. Checked after the test, and after `spans` has
+    undone its own provider: an autouse fixture is torn down last.
+    """
+    yield
+    left = _tracing_left_on()
+    assert not left, f"the test left tracing on: {', '.join(left)}"
 
 
 @pytest.fixture(autouse=True)

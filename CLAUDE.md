@@ -64,9 +64,10 @@ Two phases with a hard boundary between them, one shared config object, and the
 local models behind LangChain's interfaces:
 
 ```
-ingest (rag_pipeline/ingest.py)      load → split → embed → store (Chroma, under PERSIST_DIR)
-query  (rag_pipeline/pipeline.py)    embed question → search → rerank → stuff prompt → local LLM
-models (rag_pipeline/mlx_models.py)  QwenVLEmbeddings · QwenVLReranker · MLXChatModel, over MLX
+ingest  (rag_pipeline/ingest.py)      load → split → embed → store (Chroma, under PERSIST_DIR)
+query   (rag_pipeline/pipeline.py)    embed question → search → rerank → stuff prompt → local LLM
+models  (rag_pipeline/mlx_models.py)  QwenVLEmbeddings · QwenVLReranker · MLXChatModel, over MLX
+tracing (rag_pipeline/tracing.py)     optional: each question as one trace, to a self-hosted Phoenix
 ```
 
 `Settings` (`config.py`) is a frozen dataclass built via `Settings.from_env()`.
@@ -160,8 +161,9 @@ until the garbage collector finalizes it**, which for one a Streamlit script
 holds as a module global can be never — every later question, from every
 session, then hangs on the lock. So everything between the model and a frontend
 closes rather than drops: `app.py` wraps generation in `closing(chunks)` (the
-Stop button raises inside `st.write_stream` with the stream suspended), and
-`RAGPipeline._generate` closes the chain's stream with its own. That chain is
+Stop button raises inside `st.write_stream` with the stream suspended),
+`stream_answer`'s tracing wrapper (`_traced`) closes `_generate`'s stream with
+its own, and `RAGPipeline._generate` closes the chain's stream with its own. That chain is
 `_PROMPT | llm`, with **no `StrOutputParser`**: closing a parser's stream does
 not stop the model — langchain-core catches the `GeneratorExit` and drains the
 parser's input, i.e. generates on to `MAX_TOKENS` under the lock.
@@ -176,6 +178,72 @@ subtly wrong prompt or pooling step still yields plausible vectors and
 sensible-looking rankings. Only `tests/test_models_live.py` (`-m models`) notices,
 by reproducing the model cards' published scores — run it after touching an
 adapter.
+
+### Tracing is the API in the pipeline, the SDK in the frontends
+
+Off unless `PHOENIX_COLLECTOR_ENDPOINT` is set (empty default; `_env_url` refuses
+a malformed one as `ValueError`). OpenTelemetry's own split: `pipeline.py`
+imports only `opentelemetry-api` and OpenInference's attribute names, which are
+a no-op until a provider exists, and `tracing.setup_tracing()` installs one.
+`cli.py` calls it in `cmd_query` only (ingest emits no spans, so it would only
+load the tracing stack and start an idle exporter thread), and `app.py` on every
+rerun, inside the pipeline-load `try`; it is once per process, guarded by the
+instrumentor's own state under a lock (`test_concurrent_first_setups_install_once`).
+Like the adapters, it raises only `RuntimeError`, because of where the app calls
+it: the SDK validates the standard `OTEL_*` variables (limits, batch sizes,
+compression) with builtins `ValueError`s, which it translates, and it installs
+nothing until everything is built. Its imports are lazy, so tracing off loads
+none of the instrumentation or exporter
+(`test_tracing_off_loads_none_of_the_tracing_stack`, which takes the frontends'
+path: import, then `setup_tracing(Settings())`).
+
+`setup_tracing` assembles the provider from OpenTelemetry's parts, **not
+`phoenix.otel.register()`**, whose shortcuts are traps here. Given a base URL,
+`register()` posts to it as-is, Phoenix answers 405, and `force_flush()` still
+returns True. So `traces_url()` always appends `/v1/traces`. Left to infer a
+protocol, `register()` picks gRPC, which also bypasses `_offline` (grpc's C
+core). It cannot set the exporter timeout. And it reads `PHOENIX_*` variables
+and `.env.phoenix` files that `Settings` does not know about.
+
+Each choice in `setup_tracing` is measured:
+
+- `BatchSpanProcessor`: a simple processor exports inside `span.end()`, about
+  6 s per span with Phoenix down.
+- `_EXPORT_TIMEOUT_S = 2`: that timeout is all that bounds the exit flush (about
+  7 s at the default 10 s, about 1 s at 2 s). `force_flush(timeout)` and
+  `OTEL_BSP_EXPORT_TIMEOUT` are ignored.
+- OpenInference's `TracerProvider`: the SDK's keeps only 128 attributes per span.
+  A reranker span carries three per candidate and four per kept passage (80 at
+  the defaults), so from a `FETCH_K` of about 37 the SDK's would silently cut
+  it.
+
+A question is one trace, and every path out of it ends the root span:
+
+- **The root span.** `stream_answer` opens it (`start_span`, never
+  `start_as_current_span`) and makes it current only around retrieval, a
+  synchronous stretch. The LangChain retriever run and the manual reranker span
+  nest under it there. A compressor is not a Runnable, so without the manual
+  span the rerank would not be traced at all.
+- **Generation is lazy**, so it outlives that call. `_traced` re-attaches the
+  root's context around each `next()` of `_generate` and never across a
+  `yield`. One held across a yield leaks into the consumer between pieces, and
+  logs "Failed to detach context" when the stream is closed from another context
+  or thread.
+- **Primed.** `_traced` yields `""` once, and `stream_answer` consumes it before
+  returning. A generator's `finally` exists only once its body has started, so a
+  stream closed before its first piece would otherwise end nothing.
+- **Status (`_finish`).** An `Exception` is ERROR with the exception recorded. A
+  `BaseException` (GeneratorExit, KeyboardInterrupt, Streamlit's StopException)
+  leaves the status unset, adds a `stopped` event, and keeps the partial answer
+  as the output.
+
+The model's own span still shows ERROR on a Stop: LangChain reports a closed
+stream to its tracer as an error. `_tracer()` is looked up per question, not
+held at import, because a tracer keeps the provider it first resolved and tests
+reset it. `MLXChatModel._get_ls_params` sets `ls_model_name`, since LangChain
+fills it only from a `model`/`model_name` field; without it the LLM span names no
+model. `tests/test_tracing.py` asserts the trace in-process and the wire format
+in a subprocess, against a stand-in collector that runs inside the subprocess.
 
 ### Chroma's per-process System (the stale-view hazard)
 
@@ -332,9 +400,20 @@ Injection is a convention, so `conftest.py` backs it with autouse guards:
 - `_offline` blocks every socket, to any host: Chroma is in-process and the
   models are local files, so a connection means something is downloading (a
   model, Chroma's default ONNX embedder) or phoning home.
-- `_no_tracing` (session-scoped) forces LangSmith tracing off. `.env` is loaded
-  at import time, and a developer's `LANGSMITH_TRACING=true` would otherwise queue
-  test traces for a background flush that can land after `_offline` is undone.
+- `_no_tracing` (session-scoped) deletes `PHOENIX_COLLECTOR_ENDPOINT` and forces
+  LangSmith's switches to `false` (the pipeline no longer uses LangSmith, but
+  langsmith ships inside langchain-core and still acts on them). `.env` is loaded
+  at import time, and either would otherwise send test traces from a background
+  flush that can land after `_offline` is undone. **`_offline` cannot catch an
+  exporter**: the tracing SDK catches the socket block's `RuntimeError` and logs
+  it, so the test passes.
+- `_no_tracer_left_on` is what makes that failure loud: after every test it
+  fails one that left a global tracer provider installed or LangChain
+  instrumented. A test that runs `setup_tracing` for real takes `undo_tracing`;
+  one that asserts on spans takes `spans`, which records them in memory
+  (OpenInference's provider, a synchronous processor, LangChain instrumented)
+  and undoes all of it — OpenTelemetry allows one global provider per process,
+  and `opentelemetry-test-utils`' `reset_trace_globals()` is what undoes it.
 
 `tests/test_offline_guard.py` trips every route to a real model on purpose —
 each factory, an ingest and a pipeline left without a fake — and checks the
@@ -371,6 +450,11 @@ because they are only observable at the frontend:
   from inside generation and cannot show that; the real-Stop test calls
   `script_requests.request_stop()`, as the button does.)
 - A stopped answer releases the model: see the concurrency paragraph above.
+- A Stop during *retrieval* still closes the stream. It is raised at the
+  retrieval spinner's exit (a Streamlit call), after `stream_answer` returned
+  and before generation starts, so `app.py` registers `closing(chunks)` inside
+  the spinner through an `ExitStack`. No lock is held then, but the stream holds
+  the question's root span, and a dropped stream means a trace never sent.
 - An upload is reported as added only if it reached the index
   (`indexed_sources()`): ingest skips a textless file — a scanned PDF — without
   failing.
@@ -439,6 +523,18 @@ because they are only observable at the frontend:
   `TRANSFORMERS_NO_ADVISORY_WARNINGS` first. It must stay in the package
   `__init__`, the earliest import on every entry point;
   `test_importing_the_pipeline_prints_no_pytorch_warning` checks it.
+- Phoenix's own clients read `PHOENIX_COLLECTOR_ENDPOINT` too, with different
+  semantics: unset means `localhost:6006` to them and *off* here, and given no
+  protocol they infer gRPC. The name is shared so Phoenix's docs on it apply;
+  the behavior is this repo's, from `Settings`, over HTTP. Phoenix's other
+  client variables (`PHOENIX_API_KEY`, its headers variable, `PHOENIX_GRPC_PORT`)
+  are not read, so the pipeline sends no credentials and needs a Phoenix with
+  authentication off — its default; the README keeps it private with
+  `PHOENIX_HOST=127.0.0.1` instead.
+- langsmith still ships inside langchain-core and acts on `LANGSMITH_TRACING`
+  by itself, uploading every run to LangSmith's cloud. The pipeline does not
+  use it, and `_no_tracing` switches it off for tests only; the README and
+  `.env.example` tell users with an old `.env` to delete it.
 - `.streamlit/config.toml` turns off Streamlit's usage statistics (its front end
   would report to Streamlit) and its file watcher (which walks every loaded
   module on every run and logs a traceback for each of transformers' lazy ones —
@@ -482,6 +578,8 @@ behavior is:
 | `ingest()` never deletes documents it did not write | `test_ingest_preserves_foreign_documents_in_a_shared_collection` — a foreign doc survives a rebuild that deletes |
 | a stopped answer releases the generation lock, and its turn is still stored | `test_a_real_stop_releases_the_model_and_keeps_the_turn` — Stop as Streamlit delivers it, garbage collector off, real `MLXChatModel` over a fake MLX |
 | no test loads a real model | conftest's `_no_real_models`, pinned by `tests/test_offline_guard.py` |
+| a question is one trace, ended however the question ends (answered, failed, stopped, closed unread) | `tests/test_tracing.py`, plus `test_a_stop_during_retrieval_still_sends_the_questions_trace` in `test_app.py` |
+| no test leaves tracing on | conftest's `_no_tracer_left_on`, after every test |
 | the adapters implement their models' official recipes | `tests/test_models_live.py` (`-m models`, by hand on a Mac) — reproduces the model cards' published scores |
 
 The cheap-imports, greedy-decoding and foreign-document rows replaced text rules

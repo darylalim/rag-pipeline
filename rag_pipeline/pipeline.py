@@ -7,6 +7,7 @@ build a single pipeline and reuse it across queries.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Generator
 from contextlib import closing
 from dataclasses import dataclass
@@ -18,6 +19,17 @@ from langchain_core.embeddings import Embeddings
 from langchain_core.language_models import BaseChatModel
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import Runnable
+from openinference.semconv.trace import (
+    DocumentAttributes,
+    OpenInferenceMimeTypeValues,
+    OpenInferenceSpanKindValues,
+    RerankerAttributes,
+    SpanAttributes,
+)
+from opentelemetry import context as otel_context
+from opentelemetry import trace
+from opentelemetry.trace import Span, Status, StatusCode
+from opentelemetry.util.types import AttributeValue
 
 from rag_pipeline.config import Settings
 from rag_pipeline.ingest import (
@@ -105,6 +117,128 @@ def source_excerpts(docs: list[Document]) -> list[Excerpt]:
     return [Excerpt(source=_source_of(doc), text=doc.page_content) for doc in docs]
 
 
+# --- tracing -----------------------------------------------------------------
+#
+# Through the OpenTelemetry API only, so all of this is a no-op until a frontend
+# installs a provider (rag_pipeline.tracing); the attribute names are
+# OpenInference's, which is what Phoenix renders a trace from.
+
+# The metadata key a LangChain reranker scores its documents under -- the
+# convention QwenVLReranker follows too.
+_SCORE_KEY = "relevance_score"
+
+_TEXT = OpenInferenceMimeTypeValues.TEXT.value
+
+
+def _tracer() -> trace.Tracer:
+    """This module's tracer, looked up per question rather than held.
+
+    A tracer resolves against the provider installed when it is first used,
+    and keeps that answer: held at import, it would keep the first one for good,
+    and the tests install a fresh provider for each test that records spans.
+    """
+    return trace.get_tracer(__name__)
+
+
+def _span_kind(kind: OpenInferenceSpanKindValues) -> dict[str, AttributeValue]:
+    # Upper case, as the enum's values are: Phoenix's span filters are written
+    # that way.
+    return {SpanAttributes.OPENINFERENCE_SPAN_KIND: kind.value}
+
+
+def _documents(key: str, docs: list[Document]) -> dict[str, AttributeValue]:
+    """``docs`` as OpenInference's flattened document list under ``key``."""
+    attributes: dict[str, AttributeValue] = {}
+    for index, doc in enumerate(docs):
+        prefix = f"{key}.{index}."
+        attributes[prefix + DocumentAttributes.DOCUMENT_CONTENT] = doc.page_content
+        attributes[prefix + DocumentAttributes.DOCUMENT_METADATA] = json.dumps(
+            doc.metadata, default=str
+        )
+        if doc.id is not None:
+            attributes[prefix + DocumentAttributes.DOCUMENT_ID] = doc.id
+        score = doc.metadata.get(_SCORE_KEY)
+        if isinstance(score, float):
+            attributes[prefix + DocumentAttributes.DOCUMENT_SCORE] = score
+    return attributes
+
+
+def _finish(span: Span, error: BaseException | None) -> None:
+    """End a question's root span with the status its outcome earned.
+
+    A failure is an error, with the exception recorded. A question stopped
+    part-way -- the app's Stop, Ctrl-C at the terminal, a caller that closes the
+    stream early -- is not, so its status is left unset and the stop is an event
+    instead; otherwise Phoenix would count every Stop as a failed question. (The
+    model's own span still ends in error on a Stop: LangChain reports a closed
+    stream to its tracer as one, and nothing here sees it first.)
+    """
+    if isinstance(error, Exception):
+        span.record_exception(error)
+        span.set_status(Status(StatusCode.ERROR, f"{type(error).__name__}: {error}"))
+    elif error is not None:
+        span.add_event("stopped", {"reason": type(error).__name__})
+    else:
+        span.set_status(Status(StatusCode.OK))
+    span.end()
+
+
+def _traced(
+    span: Span, pieces: Generator[str, None, None]
+) -> Generator[str, None, None]:
+    """``pieces``, generated inside ``span``, which ends when the stream does.
+
+    The span is made current around each step rather than across a yield.
+    OpenTelemetry keeps the current span in a context variable, and one held
+    across a yield leaks into whatever the consumer does between pieces -- and
+    fails to detach ("Failed to detach context") when the stream is closed from
+    another context, as a Stop in the app can close it. One step is one
+    synchronous frame, so attach and detach always pair. The first step is the
+    one that counts: LangChain parents its run to whichever span is current
+    when the chain starts, and the chain starts on the first pull.
+
+    Primed: the first ``yield`` gives nothing, comes before any generation, and
+    is consumed by ``stream_answer``. A generator's ``finally`` exists only once
+    its body has started, so unprimed, a stream closed before its first piece --
+    a Stop that lands between retrieval and generation -- would end nothing,
+    and that question's trace would never be exported. The model still does not
+    start until the caller asks for a piece.
+    """
+    context = trace.set_span_in_context(span)
+    answer: list[str] = []
+    error: BaseException | None = None
+    try:
+        yield ""
+        while True:
+            token = otel_context.attach(context)
+            try:
+                piece = next(pieces, None)
+            finally:
+                otel_context.detach(token)
+            if piece is None:
+                break
+            answer.append(piece)
+            yield piece
+    except BaseException as exc:
+        error = exc
+        raise
+    finally:
+        try:
+            # Closed at once, not left to the garbage collector: this is what
+            # stops the model when the caller closes the stream early.
+            pieces.close()
+        finally:
+            # What was generated, however it ended: the partial answer is the
+            # useful part of a stopped or failed question's trace.
+            span.set_attributes(
+                {
+                    SpanAttributes.OUTPUT_VALUE: "".join(answer),
+                    SpanAttributes.OUTPUT_MIME_TYPE: _TEXT,
+                }
+            )
+            _finish(span, error)
+
+
 def build_chat_model(settings: Settings) -> BaseChatModel:
     """Construct the local chat model used for generation.
 
@@ -187,10 +321,43 @@ class RAGPipeline:
         RuntimeError both frontends catch rather than a raw chromadb exception.
         The models need no wrapping: their adapters already raise inside the
         union.
+
+        The search is traced by LangChain's instrumentation, as a retriever run;
+        the rerank is not -- a compressor is not a Runnable -- so it gets a span
+        of its own here. That span is where a trace shows what the reranker was
+        given and what it kept, with their scores: the step whose choices
+        decide what the model is shown.
         """
         with store_errors_as_runtime():
             candidates = self._retriever.invoke(question)
-            return list(self._reranker.compress_documents(candidates, question))
+            with _tracer().start_as_current_span(
+                type(self._reranker).__name__,
+                attributes=_span_kind(OpenInferenceSpanKindValues.RERANKER),
+            ) as span:
+                # Guarded: with tracing off, nothing is serialized for a span
+                # that records nothing.
+                if span.is_recording():
+                    span.set_attributes(
+                        {
+                            RerankerAttributes.RERANKER_QUERY: question,
+                            RerankerAttributes.RERANKER_MODEL_NAME: (
+                                self.settings.rerank_model
+                            ),
+                            RerankerAttributes.RERANKER_TOP_K: self.settings.retrieval_k,
+                            **_documents(
+                                RerankerAttributes.RERANKER_INPUT_DOCUMENTS, candidates
+                            ),
+                        }
+                    )
+                ranked = list(self._reranker.compress_documents(candidates, question))
+                if span.is_recording():
+                    span.set_attributes(
+                        _documents(RerankerAttributes.RERANKER_OUTPUT_DOCUMENTS, ranked)
+                    )
+                # OK, as LangChain's own spans end: left unset, it is the one
+                # step in a successful trace that does not read as a success.
+                span.set_status(Status(StatusCode.OK))
+            return ranked
 
     def _generate(
         self, question: str, docs: list[Document]
@@ -215,7 +382,11 @@ class RAGPipeline:
         # the cast is what lets it be closed explicitly.
         stream = cast(
             Generator[Any, None, None],
-            self._chain.stream({"context": format_docs(docs), "question": question}),
+            self._chain.stream(
+                {"context": format_docs(docs), "question": question},
+                # How the step reads in a trace; otherwise "RunnableSequence".
+                config={"run_name": "generate"},
+            ),
         )
         with closing(stream):
             for message in stream:
@@ -266,9 +437,34 @@ class RAGPipeline:
         stream is open, and a dropped one is freed only when the garbage
         collector gets to it -- which, for a stream a Streamlit script holds in
         a global, can be never: every later answer would wait on that lock.
+
+        With tracing on, the question is one trace: a root span opened here,
+        current while retrieval runs so the search and rerank nest under it,
+        and ended by the stream -- however the stream ends (see `_traced`).
+        Its end is why a stream that is never read should still be closed:
+        until it is, the trace is not sent.
         """
-        docs = self.retrieve(question)
-        return docs, self._generate(question, docs)
+        span = _tracer().start_span(
+            "RAGPipeline",
+            attributes={
+                **_span_kind(OpenInferenceSpanKindValues.CHAIN),
+                SpanAttributes.INPUT_VALUE: question,
+                SpanAttributes.INPUT_MIME_TYPE: _TEXT,
+            },
+        )
+        try:
+            # Made current only for this synchronous stretch. Statuses are left
+            # to _finish, which tells a failure from a stop.
+            with trace.use_span(
+                span, record_exception=False, set_status_on_exception=False
+            ):
+                docs = self.retrieve(question)
+        except BaseException as exc:
+            _finish(span, exc)
+            raise
+        answer = _traced(span, self._generate(question, docs))
+        next(answer)  # primes it; see _traced
+        return docs, answer
 
     def answer(self, question: str) -> Answer:
         """Retrieve context, then generate a grounded answer with sources.

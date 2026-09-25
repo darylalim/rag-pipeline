@@ -18,10 +18,14 @@ Hugging Face cache, and Chroma runs in-process against a directory on disk. The
 one network step is downloading the models, once, during setup. There are no API
 keys and no accounts. The chat app keeps to that too: Streamlit's own usage
 statistics, which its browser front end would otherwise send to Streamlit, are
-switched off in `.streamlit/config.toml`.
+switched off in `.streamlit/config.toml`. So does tracing, which is off unless
+you turn it on and then goes to a [Phoenix](#tracing-with-phoenix) server you run
+yourself. (LangSmith is no longer used — but see
+[below](#tracing-with-phoenix) if an old `.env` still switches it on.)
 
 **Contents** — [Prerequisites](#prerequisites) · [Setup](#setup) ·
 [Usage](#usage) · [Add your own documents](#add-your-own-documents) ·
+[Tracing with Phoenix](#tracing-with-phoenix) ·
 [Configuration](#configuration) · [Development](#development) ·
 [Project structure](#project-structure) · [How it works](#how-it-works) ·
 [Invariants](#invariants)
@@ -192,6 +196,76 @@ to its final path component and rejects unsupported suffixes before writing, so
 an upload cannot choose its own directory. Its docstring covers the details,
 including where that boundary deliberately stops.
 
+## Tracing with Phoenix
+
+Optional, and off unless you set it up. With it on, every question — from the
+terminal or the app — is recorded as one trace in
+[Arize Phoenix](https://github.com/Arize-ai/phoenix), an open-source LLM
+observability server that you run on your own machine:
+
+```
+RAGPipeline                 CHAIN      the question, and the answer
+├─ VectorStoreRetriever     RETRIEVER  the FETCH_K candidates the vector search returned
+├─ QwenVLReranker           RERANKER   those candidates in; the RETRIEVAL_K kept, with scores, out
+└─ generate                 CHAIN
+   ├─ ChatPromptTemplate    PROMPT     the prompt, with the passages filled in
+   └─ MLXChatModel          LLM        the messages, the answer, token counts, finish reason
+```
+
+Start the server (no Docker: `uvx` fetches it into uv's cache on the first run,
+about 670 MB and a minute or so), leaving it running in its own terminal:
+
+```bash
+PHOENIX_HOST=127.0.0.1 PHOENIX_ALLOW_EXTERNAL_RESOURCES=false \
+  uvx --from arize-phoenix phoenix serve
+```
+
+Then point the pipeline at it in `.env`:
+
+```bash
+PHOENIX_COLLECTOR_ENDPOINT=http://localhost:6006
+```
+
+and open <http://localhost:6006>. Traces are filed under the `rag-pipeline`
+project (`PHOENIX_PROJECT`), which the first one creates, and Phoenix keeps
+them in SQLite under `~/.phoenix` (`PHOENIX_WORKING_DIR` moves it).
+
+- **A trace holds everything:** the question, every retrieved passage in full,
+  the prompt and the answer. Phoenix has no login by default, and it listens
+  on every network interface, which would open all of that to your local
+  network. `PHOENIX_HOST=127.0.0.1` keeps it to this machine. Keep it private
+  that way rather than with Phoenix's own authentication: the pipeline sends no
+  credentials, so an authenticated Phoenix refuses every trace (a `401` on
+  stderr). Its gRPC collector (port 4317) listens on every interface regardless.
+  The pipeline sends over HTTP and never uses it, but it will accept spans from
+  the network.
+- **What still leaves the machine:** `PHOENIX_ALLOW_EXTERNAL_RESOURCES=false`
+  turns off the server's usage telemetry and its docs-assistant connection. It
+  cannot stop two things. On its first start in a working directory, the server
+  downloads a 26 MB WebAssembly runtime from GitHub. And while the UI is open,
+  the browser asks PyPI for the latest release and GitHub for the star count.
+  Neither carries trace data.
+- **Stopping an answer is not a failure:** a Stop in the app, or Ctrl-C at the
+  terminal, gives the root span a `stopped` event and the partial answer, and
+  leaves its status unset. LangChain's own spans for the generation do show an
+  error — the model's always, and on Ctrl-C the `generate` chain's too —
+  because LangChain reports a closed or interrupted stream to its tracer as
+  one.
+- **If Phoenix is down, answers are unaffected.** Spans are sent from a
+  background thread. Each batch that fails is logged on stderr as it fails (a
+  `Transient error ... Connection refused` warning, then `Failed to export span
+  batch ...`), so at a terminal these lines can land in the middle of a
+  streaming answer. Whatever is still queued is tried once more at exit, where
+  a `rag query` waits about a second longer — several, for a remote host that
+  never answers.
+- **Only questions are traced.** Nothing in ingest is a LangChain run.
+- **LangSmith is not used — but an old `.env` may still switch it on.**
+  langchain-core still acts on `LANGSMITH_TRACING=true` (or
+  `LANGCHAIN_TRACING_V2=true`) by itself, and while either is set it uploads
+  every question — the prompt, every retrieved passage and the answer — to
+  LangSmith's cloud, whether or not Phoenix is on. Earlier versions of
+  `.env.example` suggested them, so delete them from your `.env`.
+
 ## Configuration
 
 Nothing is required. Every setting has a default and can be overridden in `.env`
@@ -211,18 +285,15 @@ Nothing is required. Every setting has a default and can be overridden in `.env`
 | `DATA_DIR`          | `./data`           | Source documents |
 | `PERSIST_DIR`       | `./chroma_db`      | Where Chroma keeps the index on disk |
 | `COLLECTION_NAME`   | `rag_docs`         | Chroma collection holding the vectors — must match between ingest and query |
+| `PHOENIX_COLLECTOR_ENDPOINT` |           | Base URL of the Phoenix server to trace questions to — `http://localhost:6006` for a local `phoenix serve`. Unset, tracing is off (see [Tracing with Phoenix](#tracing-with-phoenix)) |
+| `PHOENIX_PROJECT`   | `rag-pipeline`     | Phoenix project the traces are filed under; the first trace creates it |
 
 Each model setting is a Hugging Face repo id, resolved from the local cache, or a
 path to a model directory.
 
-Optional LangSmith tracing (`LANGSMITH_TRACING=true` + `LANGSMITH_API_KEY`, with
-`LANGSMITH_PROJECT` naming the project) is picked up automatically if set — see
-`.env.example`. It is the one setting that sends anything off the machine: when
-it is on, every traced run — the prompt, the retrieved passages and the answer —
-is uploaded to LangSmith's cloud. It is off unless you set it. (Streamlit run
-headless — `--server.headless true` — also looks up the machine's external IP
-address, to print it; setting `server.address` in `.streamlit/config.toml`
-skips that.)
+Streamlit run headless (`--server.headless true`) looks up the machine's
+external IP address, in order to print it. Setting `server.address` in
+`.streamlit/config.toml` skips that.
 
 ## Development
 
@@ -255,11 +326,21 @@ uv run pytest
 The suite needs **no models, no MLX, no network and no Docker**. It injects a
 deterministic fake embedding model, a fake reranker and a fake chat model, and
 runs a real Chroma store in-process under a per-test temp directory. Three
-guards keep it that way: MLX is made unimportable, so a test that forgets to
-inject a fake fails instead of quietly loading gigabytes of weights from the
-Hugging Face cache; every socket is blocked; and LangSmith tracing is forced off,
-whatever `.env` says. It runs the same on a Mac with MLX installed as on Linux
-without it.
+guards keep it that way:
+
+- MLX is made unimportable, so a test that forgets to inject a fake fails
+  instead of quietly loading gigabytes of weights from the Hugging Face cache.
+- Every socket is blocked.
+- Tracing is forced off, whatever `.env` says. That covers Phoenix, and also
+  LangSmith, which still ships inside langchain-core. A test that leaves a
+  tracer switched on fails, because the tracing SDK swallows the socket block's
+  error and the block alone would not notice.
+
+Most of the tests that check traces record spans in memory. The two that check
+what reaches a collector run the real exporter in a subprocess, against a
+stand-in collector inside that subprocess, so the test process itself still
+opens no socket. The suite runs the same on a Mac with MLX installed as on
+Linux without it.
 
 It covers the configuration, the loader and splitter, ingest idempotency and
 scoping, upload handling, an ingest→retrieve→generate round trip, the CLI as a
@@ -342,6 +423,7 @@ rag_pipeline/
   ingest.py      load → split → embed → store (build_embeddings and open_store live here)
   pipeline.py    RAGPipeline: load index + local models, stream_answer(...) / answer(...)
   mlx_models.py  the three local models behind LangChain's interfaces, loaded once per process
+  tracing.py     optional tracing to a self-hosted Phoenix (setup_tracing)
   cli.py         rag ingest | rag query "..."
 app.py           Streamlit chat UI
 .streamlit/      config.toml: usage statistics and the file watcher off
