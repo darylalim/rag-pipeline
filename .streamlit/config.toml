@@ -15,3 +15,11 @@ gatherUsageStats = false
 # that editing app.py no longer reruns it; pass
 # `--server.fileWatcherType auto` while developing the app itself.
 fileWatcherType = "none"
+
+# Loopback only. Unset, Streamlit listens on every network interface, and the
+# app has no login: anyone on the local network could ask about the documents,
+# or upload into data/ and have it indexed. Set, it also skips a request a
+# headless start makes to checkip.amazonaws.com, for the machine's external IP
+# address to print. Pass `--server.address 0.0.0.0` to open the app to your
+# network deliberately.
+address = "127.0.0.1"

@@ -837,16 +837,21 @@ def test_a_broken_store_is_reported_on_every_rerun(app, monkeypatch, tmp_path):
 
 
 def test_the_app_config_keeps_streamlit_local_and_quiet():
-    """`.streamlit/config.toml` carries two settings the app depends on.
+    """`.streamlit/config.toml` carries three settings the app depends on.
 
     Usage statistics off: Streamlit's front end otherwise reports to Streamlit's
     servers, and nothing about this app is meant to leave the machine. The file
     watcher off: it walks every loaded module on every run, and transformers'
     lazy modules (loaded with the tokenizers) make it log a traceback for each
-    -- over a hundred per chat turn. Neither is visible to a headless test run,
-    so the file itself is what is checked.
+    -- over a hundred per chat turn. The server on loopback: Streamlit otherwise
+    listens on every interface, which puts the app -- no login, and an uploader
+    that writes into data/ -- on the local network; and started headless with
+    no address, it asks checkip.amazonaws.com for the machine's external IP
+    address, to print it. None of the three is visible to a test run, which
+    starts no server, so the file itself is what is checked.
     """
     config = tomllib.loads((APP.parent / ".streamlit" / "config.toml").read_text())
 
     assert config["browser"]["gatherUsageStats"] is False
     assert config["server"]["fileWatcherType"] == "none"
+    assert config["server"]["address"] == "127.0.0.1"

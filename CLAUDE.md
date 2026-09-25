@@ -558,8 +558,11 @@ because they are only observable at the frontend:
 - `.streamlit/config.toml` turns off Streamlit's usage statistics (its front end
   would report to Streamlit) and its file watcher (which walks every loaded
   module on every run and logs a traceback for each of transformers' lazy ones —
-  over a hundred a turn). `test_the_app_config_keeps_streamlit_local_and_quiet`
-  pins both.
+  over a hundred a turn), and sets `server.address` to `127.0.0.1`. Unset,
+  Streamlit listens on every interface, putting the uploader — which writes into
+  `data/` — on the local network with no login; and a headless start then asks
+  checkip.amazonaws.com for the machine's external IP, to print it.
+  `test_the_app_config_keeps_streamlit_local_and_quiet` pins all three.
 
 ## Enforcing the invariants
 

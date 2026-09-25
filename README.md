@@ -16,10 +16,11 @@ Query (per Q):   question ──embed──▶ search ──rerank──▶ [top
 No step of either phase touches the network: the models load from the local
 Hugging Face cache, and Chroma runs in-process against a directory on disk. The
 one network step is downloading the models, once, during setup. There are no API
-keys and no accounts. The chat app keeps to that too: Streamlit's own usage
-statistics, which its browser front end would otherwise send to Streamlit, are
-switched off in `.streamlit/config.toml`. So does tracing, which is off unless
-you turn it on and then goes to a [Phoenix](#tracing-with-phoenix) server you run
+keys and no accounts. The chat app keeps to that too: `.streamlit/config.toml`
+switches off Streamlit's usage statistics, which its browser front end would
+otherwise send to Streamlit, and keeps the app to this machine (see
+[below](#3-or-use-the-chat-app)). So does tracing, which is off unless you turn
+it on and then goes to a [Phoenix](#tracing-with-phoenix) server you run
 yourself. (LangSmith is no longer used — but see
 [below](#tracing-with-phoenix) if an old `.env` still switches it on.)
 
@@ -133,6 +134,16 @@ A browser chat UI over the same pipeline, streaming each answer token by token,
 with a sidebar showing the active configuration and a per-answer panel of the
 retrieved passages themselves — so a claim can be checked against the text it
 was generated from, not just against a filename.
+
+Only this machine can reach it. Streamlit otherwise listens on every network
+interface, and the app has no login: anyone on your network could ask it about
+your documents, read the passages it retrieves, or upload files into `data/` to
+be indexed. So `.streamlit/config.toml` sets `server.address` to `127.0.0.1`,
+the address Streamlit then prints and opens. That also skips a request Streamlit
+otherwise makes at startup when run headless (`--server.headless true`): it asks
+checkip.amazonaws.com for the machine's external IP address, to print it. To
+open the app to your network deliberately, pass `--server.address 0.0.0.0` —
+which, headless, brings that request back.
 
 Opening the app loads the three models, behind a spinner; after that they stay
 in memory for the life of the server, including across the index rebuilds an
@@ -292,9 +303,9 @@ Nothing is required. Every setting has a default and can be overridden in `.env`
 Each model setting is a Hugging Face repo id, resolved from the local cache, or a
 path to a model directory.
 
-Streamlit run headless (`--server.headless true`) looks up the machine's
-external IP address, in order to print it. Setting `server.address` in
-`.streamlit/config.toml` skips that.
+The chat app's own Streamlit settings — usage statistics, the file watcher, the
+address it listens on — are in `.streamlit/config.toml`; see
+[the chat app](#3-or-use-the-chat-app).
 
 ## Development
 
@@ -427,7 +438,7 @@ rag_pipeline/
   tracing.py     optional tracing to a self-hosted Phoenix (setup_tracing)
   cli.py         rag ingest | rag query "..."
 app.py           Streamlit chat UI
-.streamlit/      config.toml: usage statistics and the file watcher off
+.streamlit/      config.toml: usage statistics and the file watcher off, loopback only
 data/            sample documents (swap in your own)
 chroma_db/       the index, created by rag ingest (git-ignored)
 ```
