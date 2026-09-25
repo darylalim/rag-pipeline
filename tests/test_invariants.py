@@ -142,7 +142,18 @@ VIOLATIONS = [
         "rag_pipeline/config.py", "# flake8: noqa\nimport os", id="flake8-file-noqa"
     ),
     pytest.param(
+        # Spaces are optional on both sides of the prefix's colon.
+        "rag_pipeline/config.py",
+        "#flake8:noqa\nimport os",
+        id="file-noqa-unspaced",
+    ),
+    pytest.param(
         "rag_pipeline/config.py", "import os  # ruff: ignore[F401]", id="ruff-ignore"
+    ),
+    pytest.param(
+        "rag_pipeline/config.py",
+        "import os  #ruff:ignore[F401]",
+        id="ruff-ignore-unspaced",
     ),
     pytest.param(
         "rag_pipeline/config.py",
@@ -169,6 +180,9 @@ VIOLATIONS = [
         id="isort-skip-behind-prose",
     ),
     pytest.param(
+        "app.py", "import sys  #isort:skip\nimport os", id="isort-skip-unspaced"
+    ),
+    pytest.param(
         # Each block is sorted on its own, so an import split off by itself
         # passes out of order.
         "app.py",
@@ -182,6 +196,18 @@ VIOLATIONS = [
         id="ty-ignore-with-a-rule",
     ),
     pytest.param("rag_pipeline/config.py", "x = y  # type: ignore", id="type-ignore"),
+    pytest.param(
+        # ty allows a space before the colon, in its own form and in this one.
+        "rag_pipeline/config.py",
+        "x = y  # type : ignore",
+        id="type-ignore-spaced-colon",
+    ),
+    pytest.param(
+        # A tab or a no-break space separates a directive as well as a space.
+        "rag_pipeline/config.py",
+        "x = y  #\ttype:\u00a0ignore",
+        id="type-ignore-spaced-otherwise",
+    ),
     pytest.param(
         "rag_pipeline/config.py",
         "x = y  # type: ignore[ty:unresolved-reference]",
@@ -276,6 +302,30 @@ ALLOWED = [
         id="noqa-starting-a-longer-word",
     ),
     pytest.param("app.py", "x = []  # type: list[int]", id="a-type-comment"),
+    pytest.param(
+        # ty rejects ignore starting a longer word, as ruff does noqa.
+        "app.py",
+        "x = y  # ty: ignored",
+        id="ty-ignore-starting-a-longer-word",
+    ),
+    pytest.param(
+        # ruff's ignore needs codes; bare, it suppresses nothing.
+        "app.py",
+        "import os  # ruff: ignore",
+        id="ruff-ignore-without-codes",
+    ),
+    pytest.param(
+        # An isort: on only ends an off; alone, it suppresses nothing.
+        "app.py",
+        "# isort: on\nimport os",
+        id="isort-on-alone",
+    ),
+    pytest.param(
+        # A directive ends with its comment's line: this noqa is a name.
+        "app.py",
+        "x = 1  #\nnoqa = 2",
+        id="noqa-on-the-line-after-a-comment",
+    ),
     pytest.param(
         "app.py", "x = y  # pyright: ignore[reportAssignmentType]", id="another-checker"
     ),

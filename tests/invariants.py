@@ -90,6 +90,13 @@ def _blank_strings(match: re.Match[str]) -> str:
     return match.group(0) if match.group(0).startswith("#") else _blank(match)
 
 
+# The suppression rule's whitespace: any but a newline. A directive ends with
+# its comment's line, so `\s` over-reached, from an empty `#` to a name such as
+# `noqa` opening the next line. A plain space would under-reach: noqa and the
+# ignore comments accept a tab or a no-break space too.
+_GAP = r"[^\S\n]*"
+
+
 RULES = [
     Rule(
         name="store-factory",
@@ -143,8 +150,9 @@ RULES = [
         name="no-suppressions",
         applies=lambda p: p.endswith(".py"),
         # Every form that ruff 0.16.9 or ty 0.0.84 honours, each tried against a
-        # real finding; pyright's, mypy's and pylint's comments, which neither
-        # reads, are not matched. Like the tools, it reads a directive after any
+        # real finding; pyright's, pylint's and `# mypy:` comments, which neither
+        # reads, are not matched (a `type: ignore` is matched whatever its
+        # codes, mypy's included). Like the tools, it reads a directive after any
         # hash in a comment, behind prose or in a URL fragment, and isort's
         # where ruff does, with no hash before it at all:
         # - noqa, in any case, bare or behind ruff's or flake8's file-level
@@ -160,10 +168,10 @@ RULES = [
         # under them. The pattern is a string, masked like any other, so it can
         # spell every form plainly.
         pattern=re.compile(
-            r"#\s*(?:(?:ruff|flake8)\s*:\s*)?(?i:noqa)(?=[\s:#]|$)"
-            r"|#\s*ruff\s*:\s*(?:ignore|file-ignore|disable)\s*\["
-            r"|isort:\s*(?:skip|off|split)"
-            r"|#\s*(?:ty|type)\s*:\s*ignore(?=[\s\[]|$)"
+            rf"#{_GAP}(?:(?:ruff|flake8){_GAP}:{_GAP})?(?i:noqa)(?=[\s:#]|$)"
+            rf"|#{_GAP}ruff{_GAP}:{_GAP}(?:ignore|file-ignore|disable){_GAP}\["
+            rf"|isort:{_GAP}(?:skip|off|split)"
+            rf"|#{_GAP}(?:ty|type){_GAP}:{_GAP}ignore(?=[\s\[]|$)"
             r"|^[^#\n]*\bno_type_check\b",
             re.MULTILINE,
         ),
