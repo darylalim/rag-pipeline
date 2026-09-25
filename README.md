@@ -18,7 +18,8 @@ Hugging Face cache, and Chroma runs in-process against a directory on disk. The
 one network step is downloading the models, once, during setup. There are no API
 keys and no accounts. The chat app keeps to that too: `.streamlit/config.toml`
 switches off Streamlit's usage statistics, which its browser front end would
-otherwise send to Streamlit, and keeps the app to this machine (see
+otherwise send to Streamlit, and keeps the app to this machine — though
+Streamlit can still look up the machine's external IP address (see
 [below](#3-or-use-the-chat-app)). So does tracing, which is off unless you turn
 it on and then goes to a [Phoenix](#tracing-with-phoenix) server you run
 yourself. (LangSmith is no longer used — but see
@@ -143,7 +144,11 @@ the address Streamlit then prints and opens. That also skips a request Streamlit
 otherwise makes at startup when run headless (`--server.headless true`): it asks
 checkip.amazonaws.com for the machine's external IP address, to print it. To
 open the app to your network deliberately, pass `--server.address 0.0.0.0` —
-which, headless, brings that request back.
+which, headless, brings that request back. One case makes that request
+whatever the address: a connection to the app from another origin — a page on
+another website, say. Streamlit refuses it, but first looks up the external IP
+address, since a page served from that address is one it would allow. The
+request carries nothing about the app.
 
 Opening the app loads the three models, behind a spinner; after that they stay
 in memory for the life of the server, including across the index rebuilds an
@@ -303,9 +308,9 @@ Nothing is required. Every setting has a default and can be overridden in `.env`
 Each model setting is a Hugging Face repo id, resolved from the local cache, or a
 path to a model directory.
 
-The chat app's own Streamlit settings — usage statistics, the file watcher, the
-address it listens on — are in `.streamlit/config.toml`; see
-[the chat app](#3-or-use-the-chat-app).
+The chat app's own Streamlit settings are in `.streamlit/config.toml`, each with
+a comment on why: usage statistics off ([above](#rag-pipeline)), and the file
+watcher off and the server on loopback ([the chat app](#3-or-use-the-chat-app)).
 
 ## Development
 
