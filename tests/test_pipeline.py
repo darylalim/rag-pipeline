@@ -702,7 +702,7 @@ def _fail_ingest_invalid_collection_name(
 ):
     # Chroma rejects the name when the collection is created. The translation
     # must make that a RuntimeError -- never chromadb's own type, and never a
-    # ValueError, which app.py handles above its sidebar as a bad setting.
+    # ValueError, which app.py's pipeline-load guard does not catch.
     ingest_mod.ingest(
         dataclasses.replace(settings, collection_name="x"), embeddings=fake_embeddings
     )
@@ -1042,8 +1042,8 @@ def test_failure_modes_stay_inside_the_frontend_exception_union(
     which would drag that library into both frontends) fails here rather than
     at a user's terminal. `expected_type` is checked exactly, so a path can't
     drift to a different member of the union unnoticed -- and nothing on the
-    pipeline-load path may become a ValueError, which app.py treats as a bad
-    setting and stops on above its sidebar, taking the uploader with it.
+    pipeline-load path may become a ValueError, which app.py's guard there does
+    not catch: a traceback under the sidebar, on every rerun.
     """
     with pytest.raises(_FRONTEND_EXCEPTIONS, match=expected_message) as excinfo:
         failing_call(settings, fake_embeddings, fake_reranker, monkeypatch, tmp_path)

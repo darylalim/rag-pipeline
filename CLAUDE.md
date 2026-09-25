@@ -505,18 +505,22 @@ because they are only observable at the frontend:
   those imports local — which also keeps them inside `main()`'s `try`, the one
   place a library's import-time `ValueError` (next) is reported.
 - Some libraries read settings from the environment once, as they are first
-  imported, and refuse a malformed one with a builtins `ValueError` — tracing
-  on or off. chromadb imports the OpenTelemetry SDK, whose
-  `opentelemetry.sdk.trace` validates `OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT`, and
-  builds its own pydantic `Settings()` in its `__init__` (from the
-  environment, and from a `.env` in the working directory); numpy, langsmith
-  and huggingface_hub (through transformers, on a Mac) each `int()` a variable
-  or two of theirs. So `app.py` imports the pipeline inside its `Settings`
-  guard, not at the top of the file, where any of these was a traceback in
-  place of the whole page. Only a fresh interpreter shows it — the suite
+  imported, and refuse a malformed one with a `ValueError` (for chromadb,
+  pydantic's subclass of it) — tracing on or off. chromadb imports the
+  OpenTelemetry SDK, whose `opentelemetry.sdk.trace` validates
+  `OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT`, and builds its own pydantic `Settings()` in
+  its `__init__` (from the environment, and from a `.env` in the working
+  directory); numpy, langsmith and huggingface_hub (through transformers, on a
+  Mac) each `int()` a variable or two of theirs. So `app.py` imports the
+  pipeline inside its `Settings` guard, not at the top of the file, where any of
+  these was a traceback in place of the whole page. It does so once per process,
+  through the cached `_import_failure()`, which keeps a failure as surely as a
+  success and logs its traceback: a failed import is not safely repeatable —
+  numpy's second attempt is a `RecursionError` — and a library's message need
+  not name its variable. Only a fresh interpreter shows any of this — the suite
   imports all of it before its first test — so
-  `test_a_variable_refused_at_import_*`, in `test_app.py` and `test_cli.py`,
-  run the frontends through conftest's `fresh_interpreter`.
+  `test_a_variable_refused_at_import_*`, in `test_app.py` and `test_cli.py`, run
+  the frontends through conftest's `fresh_interpreter`.
 - MLX is **macOS-only**: `mlx` and `mlx-lm` are declared
   `; sys_platform == 'darwin'`, so the Linux CI legs never install them. Every
   MLX import is therefore lazy, inside `mlx_models.py`'s functions — a
@@ -632,26 +636,26 @@ stronger than the regex they retired.
   the union both frontends catch. `cli.py` catches it in one place (`main()`);
   `app.py` splits it across two, because the sidebar has to render in between:
   `ValueError` from `Settings.from_env()`, or from the pipeline's imports (a
-  malformed variable a library reads as it is imported; see Gotchas), stops
-  the script above the sidebar, and `FileNotFoundError | RuntimeError` from the
+  malformed variable a library reads as it is imported; see Gotchas), stops the
+  script above the sidebar, and `FileNotFoundError | RuntimeError` from the
   pipeline load is caught below it, so the uploader stays reachable when there
-  is no index. Grep
-  `except (FileNotFoundError` rather than trusting a line number. Don't add a
-  fourth type — `_add_documents()` catching `OSError` is not one: it is the
-  filesystem's own error on a write, and `FileNotFoundError` is already a
-  subclass of it. Nor is `cli.py`'s `KeyboardInterrupt` arm ("Interrupted.",
-  exit 130): Ctrl-C is how a slow local answer is abandoned, not a failure.
+  is no index. Grep `except (FileNotFoundError` rather than trusting a line
+  number. Don't add a fourth type — `_add_documents()` catching `OSError` is not
+  one: it is the filesystem's own error on a write, and `FileNotFoundError` is
+  already a subclass of it. Nor is `cli.py`'s `KeyboardInterrupt` arm
+  ("Interrupted.", exit 130): Ctrl-C is how a slow local answer is abandoned,
+  not a failure.
 - Nothing on the pipeline-load path may raise `ValueError`: its guard catches
   only the other two, so one escapes as a traceback under the sidebar, every
-  rerun. That is why every adapter's
-  *construction* raises only `FileNotFoundError` (model not cached, naming the
-  `hf download` command) or `RuntimeError` (MLX missing, a failed load, a model
-  of the wrong family, an out-of-range `EMBEDDING_DIMENSIONS`/`MAX_TOKENS`/
-  `top_n`) — mlx-lm's own `ValueError` for an unsupported model type and
-  huggingface_hub's `HFValidationError` are translated. The pydantic adapters load
-  in a `model_validator(mode="after")` (langchain reserves `model_post_init`),
-  and raise `RuntimeError` there deliberately: pydantic would wrap a
-  `ValueError` in a `ValidationError`.
+  rerun. That is why every adapter's *construction* raises only
+  `FileNotFoundError` (model not cached, naming the `hf download` command) or
+  `RuntimeError` (MLX missing, a failed load, a model of the wrong family, an
+  out-of-range `EMBEDDING_DIMENSIONS`/`MAX_TOKENS`/`top_n`) — mlx-lm's own
+  `ValueError` for an unsupported model type and huggingface_hub's
+  `HFValidationError` are translated. The pydantic adapters load in a
+  `model_validator(mode="after")` (langchain reserves `model_post_init`), and
+  raise `RuntimeError` there deliberately: pydantic would wrap a `ValueError` in
+  a `ValidationError`.
 - Model failures are translated where the model runs — in the adapters in
   `mlx_models.py`. Embedding and reranking failures become `RuntimeError`.
   `MLXChatModel._stream` passes `RuntimeError`/`ValueError` through, wraps

@@ -744,51 +744,70 @@ def test_a_malformed_setting_stops_before_the_sidebar(app, monkeypatch, var, val
     assert not at.chat_input
 
 
-# One run of app.py, reported as JSON: what a first page load shows.
-_FIRST_LOAD = """
+# Two loads of app.py, reported as JSON: what the first page load shows, and
+# what a reload after it does.
+_TWO_LOADS = """
 import json, sys
 from streamlit.testing.v1 import AppTest
-at = AppTest.from_file(sys.argv[1], default_timeout=60).run()
-print(json.dumps({
-    "exception": [e.value for e in at.exception],
-    "error": [e.value for e in at.error],
-    "uploader": len(at.sidebar.file_uploader),
-    "chat_input": len(at.chat_input),
-}))
+loads = []
+for _ in range(2):
+    at = AppTest.from_file(sys.argv[1], default_timeout=60).run()
+    loads.append({
+        "exception": [e.value for e in at.exception],
+        "error": [e.value for e in at.error],
+        "uploader": len(at.sidebar.file_uploader),
+        "chat_input": len(at.chat_input),
+    })
+print(json.dumps(loads))
 """
 
 
 @pytest.mark.parametrize(
-    ("var", "value"),
+    ("var", "value", "message"),
     [
         # Refused by opentelemetry.sdk.trace as it is imported, which chromadb
         # does -- so with tracing off too.
-        pytest.param("OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT", "abc", id="opentelemetry"),
-        # One of chromadb's own settings, which it validates as it is imported.
-        pytest.param("CHROMA_SERVER_HTTP_PORT", "abc", id="chromadb"),
+        pytest.param(
+            "OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT",
+            "abc",
+            "OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT",
+            id="opentelemetry",
+        ),
+        # One of chromadb's own settings, which it validates as it is imported,
+        # and names by its field.
+        pytest.param(
+            "CHROMA_SERVER_HTTP_PORT", "abc", "chroma_server_http_port", id="chromadb"
+        ),
+        # numpy's message is int()'s own, naming only the value -- and a failed
+        # numpy import cannot be repeated, which is what the reload checks.
+        pytest.param("NUMPY_MADVISE_HUGEPAGE", "abc", "'abc'", id="numpy"),
     ],
 )
 def test_a_variable_refused_at_import_stops_before_the_sidebar(
-    fresh_interpreter, var, value
+    fresh_interpreter, var, value, message
 ):
     """The same stop, for a malformed variable a library reads for itself.
 
     These are read once, as the pipeline's imports first load chromadb, and
-    refused there with a builtins ValueError. Imported above the settings guard,
-    that was a traceback in place of the whole page on every load. In a fresh
+    refused there with a ValueError. Imported above the settings guard, that
+    was a traceback in place of the whole page on every load. Reloaded, it must
+    stay the same message: the import is not tried again. The traceback is kept
+    in the server's log, where the page no longer shows it. In a fresh
     interpreter, because this one imported everything long ago -- which is also
     why no test run in-process could see it.
     """
-    result = fresh_interpreter(_FIRST_LOAD, str(APP), **{var: value})
+    result = fresh_interpreter(_TWO_LOADS, str(APP), **{var: value})
     assert result.returncode == 0, result.stderr
-    shown = json.loads(result.stdout.splitlines()[-1])
+    loads = json.loads(result.stdout.splitlines()[-1])
 
-    assert shown["exception"] == [], shown["exception"]
-    assert any(var.lower() in e.lower() for e in shown["error"]), (
-        f"the error must name {var}: {shown['error']}"
-    )
-    assert shown["uploader"] == 0, "the app must stop before the sidebar"
-    assert shown["chat_input"] == 0
+    for load, shown in zip(("first load", "reload"), loads, strict=True):
+        assert shown["exception"] == [], (load, shown["exception"])
+        assert any(message in e for e in shown["error"]), (
+            f"the {load} must show the refusal ({message}): {shown['error']}"
+        )
+        assert shown["uploader"] == 0, f"the {load} must stop before the sidebar"
+        assert shown["chat_input"] == 0, load
+    assert "Traceback" in result.stderr, "the server's log must keep the traceback"
 
 
 def test_an_uploaded_name_cannot_escape_the_data_dir(app, wired_env, tmp_path):

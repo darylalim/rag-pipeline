@@ -10,13 +10,17 @@ load once per process however often it is rebuilt.
 
 from __future__ import annotations
 
+import importlib
 import itertools
+import logging
 from contextlib import ExitStack, closing
 
 import streamlit as st
 from streamlit.runtime.uploaded_file_manager import UploadedFile
 
 from rag_pipeline.config import Settings
+
+logger = logging.getLogger(__name__)
 
 st.set_page_config(
     page_title="RAG Pipeline", page_icon=":material/search:", layout="centered"
@@ -124,6 +128,29 @@ st.caption(
     "retrieved context, and each one shows the passages it was generated from."
 )
 
+
+@st.cache_resource(show_spinner=False)
+def _import_failure() -> str:
+    """Import the pipeline once per process, and return why it failed, if it did.
+
+    Its first import reads settings that libraries keep for themselves (see
+    the guard below), and that outcome is kept for the life of the process -- a
+    failure as surely as a success. Kept rather than retried on the next load,
+    because a failed import is not safely repeatable: numpy, having refused
+    NUMPY_MADVISE_HUGEPAGE=abc once, answers the next import of it with a
+    RecursionError, a traceback on every later load. The traceback is logged,
+    since the page shows only the message and a library's message need not
+    name its variable (numpy's is int()'s own).
+    """
+    try:
+        for module in ("ingest", "pipeline", "tracing"):
+            importlib.import_module(f"rag_pipeline.{module}")
+    except ValueError as exc:
+        logger.exception("Importing the pipeline failed")
+        return str(exc)
+    return ""
+
+
 # Settings are resolved on their own, ahead of the index, because the sidebar
 # below needs them and has to render even when the index does not load — an app
 # that cannot answer anything is exactly when a user reaches for the uploader
@@ -134,11 +161,14 @@ st.caption(
 # the OpenTelemetry SDK it imports refuses OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT=abc,
 # tracing on or off. Hence those imports here, inside the guard, rather than at
 # the top of the file, where either was a traceback in place of the whole page;
-# nothing below works without them, the uploader included. All of these come
-# from the server's environment, fixed when it started (.env is read once, at
-# import), so reloading the page cannot pick up a fix; restarting the app does.
+# nothing below works without them, the uploader included. The advice is to
+# restart, which picks up any fix: nearly all of these come from the server's
+# environment, fixed when it started (.env is read once, at import), and an
+# import that failed is not tried again, so for those a reload changes nothing.
 try:
     cfg = Settings.from_env()
+    if failure := _import_failure():
+        raise ValueError(failure)
     from rag_pipeline.ingest import (
         SUPPORTED_SUFFIXES,
         index_version,

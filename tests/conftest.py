@@ -31,6 +31,7 @@ import sys
 from collections.abc import Callable, Iterator
 
 import pytest
+from chromadb.config import Settings as ChromaSettings
 from langchain_core.documents.compressor import BaseDocumentCompressor
 from langchain_core.embeddings import DeterministicFakeEmbedding
 from langchain_core.language_models import FakeListChatModel
@@ -290,12 +291,14 @@ def fresh_interpreter(tmp_path) -> Callable[..., subprocess.CompletedProcess[str
     from the environment once, as they are first imported, and this process
     imported all of them before the first test ran. Left out of the child are
     the developer's own settings -- this repo's (config.py's load_dotenv() has
-    put .env's in os.environ), OpenTelemetry's and chromadb's -- and .env is
-    switched off, or config.py would read it straight back in. The working
-    directory is the test's own, because chromadb reads a .env from there for
-    itself. MLX is made unimportable and PERSIST_DIR names an index that does
-    not exist, so the child can load no model and open no store, which is also
-    what keeps it offline: ``_offline`` cannot reach into another process.
+    put .env's in os.environ), OpenTelemetry's, and chromadb's, which it reads
+    under its field names, not all of them CHROMA_ ones (ALLOW_RESET) -- and
+    .env is switched off, or config.py would read it straight back in. The
+    working directory is the test's own, because chromadb reads a .env from
+    there for itself. MLX is made unimportable and PERSIST_DIR names an index
+    that does not exist, so the child can load no model and open no store,
+    which is also what keeps it offline: ``_offline`` cannot reach into another
+    process.
 
     Here rather than in one frontend's test file because both frontends have to
     survive what it shows.
@@ -305,7 +308,9 @@ def fresh_interpreter(tmp_path) -> Callable[..., subprocess.CompletedProcess[str
         child = {
             name: value
             for name, value in os.environ.items()
-            if name not in ENV_VARS and not name.startswith(("OTEL_", "CHROMA_"))
+            if name not in ENV_VARS
+            and not name.startswith(("OTEL_", "CHROMA_"))
+            and name.lower() not in ChromaSettings.model_fields
         }
         child |= {
             "PYTHON_DOTENV_DISABLED": "1",

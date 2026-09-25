@@ -114,9 +114,10 @@ def _missing_files(path: Path) -> list[str]:
     index = path / "model.safetensors.index.json"
     if index.is_file():
         # Every way a cut-off or malformed index can fail is a RuntimeError --
-        # a JSONDecodeError is a ValueError, which app.py would read as a bad
-        # setting and stop on above its sidebar. A shard name that is not a
-        # string is checked here too, or it would fail below, outside the try.
+        # a JSONDecodeError is a ValueError, which app.py's pipeline-load guard
+        # does not catch: a traceback under its sidebar. A shard name that is
+        # not a string is checked here too, or it would fail below, outside the
+        # try.
         try:
             shards = sorted(set(json.loads(index.read_text())["weight_map"].values()))
             if not all(isinstance(name, str) for name in shards):
@@ -161,7 +162,7 @@ def resolve_model_path(model_id: str) -> Path:
         raise _not_cached(model_id) from exc
     except Exception as exc:
         # HFValidationError, for an id that is not a repo id, is a ValueError --
-        # which app.py would take for a configuration error above its sidebar.
+        # which app.py's pipeline-load guard does not catch: a traceback.
         raise RuntimeError(
             f"Model {model_id!r} is neither a model directory nor a cached "
             f"Hugging Face repo: {exc}"
