@@ -63,7 +63,7 @@ jobs:
 
       # ruff is a standalone binary and needs none of the project's dependencies,
       # so install just the dev group first — seconds, versus longer for the full
-      # project (pymongo, langchain, streamlit). A ruff failure then costs
+      # project (chromadb, langchain, streamlit). A ruff failure then costs
       # nothing further.
       #
       # --locked installs from uv.lock *and* asserts the lock is up to date with
@@ -82,6 +82,10 @@ jobs:
 
       # ty, unlike ruff, needs the real dependencies installed — it resolves
       # imports through them, and reports unresolved-import without them.
+      # The one exception is MLX: it is declared `; sys_platform == 'darwin'`,
+      # so this Linux runner never installs it, and pyproject's
+      # `replace-imports-with-any` types it as Any on every platform — which is
+      # what makes this check give the same answer as `uv run ty check` on a Mac.
       - name: Install project dependencies
         run: uv sync --locked
 
@@ -110,14 +114,18 @@ jobs:
 
       # --locked installs exactly what's in uv.lock and fails if the lock has
       # drifted from pyproject.toml (see the lint job for why not --frozen).
-      # The dev group (pytest) is included by default.
+      # The dev group (pytest) is included by default. MLX is macOS-only, so
+      # it is the one part of the lock this never installs.
       - name: Install dependencies
         run: uv sync --locked
 
-      # Tests inject fake embedding + chat models and reach only a local
-      # mongodb-atlas-local container over loopback — started by testcontainers,
-      # torn down with the session. So no ANTHROPIC_API_KEY / VOYAGE_API_KEY /
-      # MONGODB_URI cloud secret is needed; the one requirement is Docker, which
-      # ubuntu-latest provides. First run pulls the image (~minutes), then cached.
+      # Tests inject fake embedding, reranker and chat models, and run Chroma
+      # in-process under a per-test temp directory — so no secret, no model, no
+      # container and no network (conftest blocks every socket). They never
+      # import MLX either: conftest makes it unimportable even on a Mac where it
+      # is installed, so this Linux runner, which lacks it, sees the same suite.
+      # The `models` tests load the real checkpoints and need Apple Silicon;
+      # pyproject's addopts deselects them, and they run only by hand on a Mac
+      # (`uv run pytest -m models`).
       - name: Run tests
         run: uv run pytest
