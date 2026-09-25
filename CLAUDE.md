@@ -424,6 +424,13 @@ Injection is a convention, so `conftest.py` backs it with autouse guards:
   (OpenInference's provider, a synchronous processor, LangChain instrumented)
   and undoes all of it — OpenTelemetry allows one global provider per process,
   and `opentelemetry-test-utils`' `reset_trace_globals()` is what undoes it.
+  The guard switches a leak off before failing, through the same
+  `_switch_tracing_off()` as `undo_tracing`, so the failure stays with the test
+  that leaked. Left on, it would fail the tests after it too: each would trip
+  the check again until one undid tracing, and one that sets tracing up would
+  find it done and return early, installing and raising nothing.
+  `test_a_leak_fails_only_the_test_that_left_tracing_on` runs such a session
+  in a pytest subprocess.
 
 `tests/test_offline_guard.py` trips every route to a real model on purpose —
 each factory, an ingest and a pipeline left without a fake — and checks the

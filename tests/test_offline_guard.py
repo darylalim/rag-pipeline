@@ -10,7 +10,8 @@ green everywhere else, so each route to a real model is tripped here on purpose
 -- every factory, and both entry points that build one when a fake is left out
 -- and the socket block is checked on its own. So is the tracing guard: an
 exporter is the one route out the socket block cannot stop, since the tracing
-SDK catches its error.
+SDK catches its error. And a leak it catches must fail only the test that left
+it, not every test after.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ import importlib
 import os
 import socket
 import sys
+from pathlib import Path
 from types import ModuleType
 from typing import Any
 
@@ -208,3 +210,67 @@ def test_the_tripwire_sees_what_a_real_setup_leaves(
         "a tracer provider is installed",
         "LangChain is instrumented",
     ]
+
+
+# A session whose first test leaks tracing. Left on, the leak would fail both
+# tests after it: the one that ignores tracing, by tripping the same teardown
+# check, and the one that sets tracing up under its own project, because setup,
+# finding it done, returns without building a provider.
+_LEAK_THEN_CARRY_ON = """
+import dataclasses
+
+from opentelemetry import trace
+
+from rag_pipeline.tracing import setup_tracing
+
+
+def traced(settings, project):
+    return dataclasses.replace(
+        settings,
+        phoenix_collector_endpoint="http://127.0.0.1:9",
+        phoenix_project=project,
+    )
+
+
+def test_leaks(settings):
+    setup_tracing(traced(settings, "leaked"))
+
+
+def test_ignores_tracing():
+    pass
+
+
+def test_sets_up(settings, undo_tracing):
+    setup_tracing(traced(settings, "own"))
+
+    resource = trace.get_tracer_provider().resource
+    assert resource.attributes["openinference.project.name"] == "own"
+"""
+
+
+def test_a_leak_fails_only_the_test_that_left_tracing_on(pytester, monkeypatch):
+    """The tripwire switches a leak off before failing the test that left it,
+    so the tests after it run as if it had never happened.
+
+    A pytest process of its own, with this conftest as its plugin: a provider
+    is process-wide, so a session run in this process would leak into this
+    run's tests instead. This checkout goes on the path ahead of the one the
+    environment has installed, so the session loads the conftest under test.
+    """
+    monkeypatch.setenv(
+        "PYTHONPATH", str(Path(__file__).resolve().parents[1]), prepend=os.pathsep
+    )
+    pytester.makepyfile(_LEAK_THEN_CARRY_ON)
+    pytester.plugins.append("tests.conftest")
+
+    result = pytester.runpytest_subprocess("-p", "no:cacheprovider", timeout=60)
+
+    # The guard fails from its teardown, which pytest reports as an error of the
+    # leaking test, whose body passed; the other two pass whole.
+    result.assert_outcomes(passed=3, errors=1)
+    result.stdout.fnmatch_lines(
+        [
+            "*ERROR at teardown of test_leaks*",
+            "E *AssertionError: the test left tracing on: *",
+        ]
+    )

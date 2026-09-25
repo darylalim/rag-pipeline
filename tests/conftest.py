@@ -50,6 +50,10 @@ from rag_pipeline.ingest import reset_store_cache
 from tests.fake_mlx import FakeMLX, write_model
 from tests.fake_mlx import modules as fake_mlx_modules
 
+# pytest's own harness for running a pytest session inside a test: how
+# test_offline_guard shows what the tracing guard leaves for the test after it.
+pytest_plugins = ("pytester",)
+
 # The fake embedding width. The `settings` fixture pins EMBEDDING_DIMENSIONS to
 # it, or ingest's probe-vs-declared-width check would raise on every run.
 _EMBED_SIZE = 32
@@ -227,6 +231,21 @@ def spans() -> Iterator[InMemorySpanExporter]:
         reset_trace_globals()
 
 
+def _switch_tracing_off() -> None:
+    """Undo whatever of tracing is on: LangChain's hook, then the provider.
+
+    One undo for both callers -- `undo_tracing` after a test that set tracing
+    up on purpose, `_no_tracer_left_on` after one that left it on by mistake --
+    so the two cannot drift apart as setup comes to install more.
+    """
+    if LangChainInstrumentor().is_instrumented_by_opentelemetry:
+        LangChainInstrumentor().uninstrument()
+    provider = trace.get_tracer_provider()
+    if isinstance(provider, SDKTracerProvider):
+        provider.shutdown()
+    reset_trace_globals()
+
+
 @pytest.fixture
 def undo_tracing() -> Iterator[None]:
     """For a test that runs `setup_tracing` for real: switch tracing back off.
@@ -235,12 +254,7 @@ def undo_tracing() -> Iterator[None]:
     the test that leaves any of it behind.
     """
     yield
-    if LangChainInstrumentor().is_instrumented_by_opentelemetry:
-        LangChainInstrumentor().uninstrument()
-    provider = trace.get_tracer_provider()
-    if isinstance(provider, SDKTracerProvider):
-        provider.shutdown()
-    reset_trace_globals()
+    _switch_tracing_off()
 
 
 @pytest.fixture
@@ -370,9 +384,17 @@ def _no_tracer_left_on():
     its job -- so a test that reaches it with an endpoint would trace every test
     after it, and export them. Checked after the test, and after `spans` has
     undone its own provider: an autouse fixture is torn down last.
+
+    Switched off before failing, so the failure is that test's alone. Left on,
+    the tests after it would fail for it too, far from the cause: each trips
+    this check again until one happens to undo tracing, and one that sets
+    tracing up finds it already done -- setup returns early, installing and
+    raising nothing.
     """
     yield
     left = _tracing_left_on()
+    if left:
+        _switch_tracing_off()
     assert not left, f"the test left tracing on: {', '.join(left)}"
 
 
