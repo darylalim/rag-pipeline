@@ -16,3 +16,6 @@ htmlcov/
 
 # OS
 .DS_Store
+
+# Local Chroma index (PERSIST_DIR)
+chroma_db/

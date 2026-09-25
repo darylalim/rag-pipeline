@@ -1,7 +1,7 @@
 [project]
 name = "rag-pipeline"
 version = "0.1.0"
-description = "A RAG pipeline built with LangChain, Voyage AI embeddings, and Claude"
+description = "A local RAG pipeline built with LangChain, Chroma, and MLX models"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -9,29 +9,31 @@ requires-python = ">=3.11"
 dependencies = [
     "langchain-core>=1.2.5",
     "langchain-text-splitters>=1.0",
-    "langchain-anthropic>=1.0",
-    # Imported directly by pipeline.py, which catches anthropic.APIError to
-    # translate provider failures into RuntimeError. Declared rather than left
-    # transitive through langchain-anthropic: an import we name ourselves is an
-    # import we must depend on ourselves, or a repin upstream breaks `rag query`
-    # with nothing in CI predicting it.
-    "anthropic>=0.117.0",
-    # Voyage AI embeddings, used by build_embeddings() at both ingest and query.
-    # The voyageai SDK it wraps is a thin HTTP client (no torch), so there is no
-    # local model to download and nothing platform-specific to pin.
-    "langchain-voyageai>=0.2",
-    # MongoDB Atlas Vector Search — the vector store (build_embeddings + open_store
-    # live in ingest.py). langchain-mongodb wraps pymongo; pymongo is declared
-    # directly because ingest.py/pipeline.py import it themselves — for
-    # SearchIndexModel at ingest, and to translate pymongo/bson errors into the
-    # FileNotFoundError | RuntimeError | ValueError union both frontends catch.
-    # dnspython (an unconditional pymongo dep) makes mongodb+srv:// work with no
-    # [srv] extra.
-    "langchain-mongodb>=0.11.0",
-    "pymongo>=4.7",
     "streamlit>=1.59",
     "python-dotenv>=1.0",
     "pypdf>=5.0",
+    # The local models: mlx-lm loads all three checkpoints (text-only) and runs
+    # generation; mlx is declared too because mlx_models.py imports mlx.core
+    # itself. The models target Apple Silicon (MLX's Metal backend), so both are
+    # declared macOS-only: the Linux CI legs never install them, which is why
+    # every MLX import is lazy (inside mlx_models.py's loaders) and why the tests
+    # inject fakes rather than models.
+    "mlx>=0.32.2 ; sys_platform == 'darwin'",
+    "mlx-lm>=0.31.3 ; sys_platform == 'darwin'",
+    # Chroma, the vector store: an in-process PersistentClient under
+    # PERSIST_DIR. chromadb is declared directly because ingest.py imports it
+    # (the client, its Settings, and chromadb.errors for the RuntimeError
+    # translation), not only through langchain-chroma.
+    "chromadb>=1.5.9",
+    "langchain-chroma>=1.1.0",
+    # Resolves model ids to their local snapshot with local_files_only=True, so
+    # loading a model never reaches the network. Below 2 because transformers
+    # (via mlx-lm) requires it, and an unconstrained resolve backtracks into a
+    # transformers old enough to need a source build.
+    "huggingface-hub>=1.24,<2",
+    # Serializes ingests across processes: two writers on one persist dir at
+    # once silently corrupt it (a CLI `rag ingest` during an app upload).
+    "filelock>=4.0.3",
 ]
 
 [project.scripts]
@@ -49,7 +51,6 @@ dev = [
     "pytest>=9.1.1",
     "pytest-cov>=7.0",
     "ruff>=0.15.22",
-    "testcontainers[mongodb]>=4.0",
     "ty>=0.0.61",
 ]
 
@@ -60,6 +61,15 @@ testpaths = ["tests"]
 # -2, which prints nothing at all for a run that collected nothing (`-k` typo,
 # exit 5) — indistinguishable on screen from a pass — and `-v` only reaches 0,
 # pytest's default. Terseness is not worth a green-looking empty run.
+#
+# The one default flag is `-m "not models"`: tests marked `models` load the real
+# MLX checkpoints (about 22 GB of weights, from the local Hugging Face cache), so
+# a plain `uv run pytest` must never reach them. A later `-m` replaces this one,
+# which is how they are opted into: `uv run pytest -m models`.
+addopts = ["-m", "not models"]
+markers = [
+    "models: loads the real local MLX models (opt in with `-m models`; needs Apple Silicon and the models in the HF cache)",
+]
 
 [tool.ruff.lint]
 # Beyond ruff's default (E4/E7/E9 + F): import sorting (I), 3.11+ idioms (UP),
@@ -72,3 +82,12 @@ ignore = ["E501"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["rag_pipeline"]
+
+[tool.ty.analysis]
+# The MLX stack is declared `; sys_platform == 'darwin'`, so it is absent from
+# the Linux environment CI type-checks in. Treating its modules as Any on every
+# platform keeps `uv run ty check` giving the same answer on a Mac as in CI —
+# the alternative (allowing them unresolved) type-checks MLX call sites on a Mac
+# only, where CI can never reproduce a finding. The cost is that MLX calls are
+# untyped, which is why mlx_models.py keeps them thin.
+replace-imports-with-any = ["mlx.**", "mlx_lm.**"]
