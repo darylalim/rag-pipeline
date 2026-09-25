@@ -249,10 +249,16 @@ def _render_sources(excerpts: list[Excerpt]) -> None:
     lets a half-open fence swallow the rest of the very panel that exists to
     audit the answer. `st.code` would wrap nothing by default, which turns a
     PDF page -- extracted as one long line -- into a horizontal scrollbar.
+
+    Labelled for what the passages are -- what retrieval handed the model -- not
+    "Sources", which claims the answer drew on them. It often did not: under an
+    "I don't know based on the provided documents" the same panel is the
+    evidence that the documents really lack the answer, and telling a refusal
+    apart from an answer would take a guess at the model's wording.
     """
     if excerpts:
         with st.expander(
-            f"Sources ({len(excerpts)} retrieved passages)",
+            f"Retrieved passages ({len(excerpts)})",
             icon=":material/description:",
         ):
             for rank, excerpt in enumerate(excerpts, start=1):

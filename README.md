@@ -126,9 +126,9 @@ uv run streamlit run app.py
 ```
 
 A browser chat UI over the same pipeline, streaming each answer token by token,
-with a sidebar showing the active configuration and a per-answer Sources panel
-holding the retrieved passages themselves — so a claim can be checked against
-the text it was generated from, not just against a filename.
+with a sidebar showing the active configuration and a per-answer panel of the
+retrieved passages themselves — so a claim can be checked against the text it
+was generated from, not just against a filename.
 
 Opening the app loads the three models, behind a spinner; after that they stay
 in memory for the life of the server, including across the index rebuilds an

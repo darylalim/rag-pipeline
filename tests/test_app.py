@@ -115,6 +115,30 @@ def test_a_retrieved_passage_is_shown_unparsed(app):
     assert "# Alpha" in passages[0], "the heading was parsed instead of shown"
 
 
+def test_the_passages_are_labelled_as_retrieved_not_as_sources(app, monkeypatch):
+    """The panel says what the passages are, not that the answer used them.
+
+    Asserted under a refusal, the case the label exists for: the passages are
+    still shown -- they are how a reader checks that the documents really lack
+    the answer -- but a panel titled "Sources" would credit them with grounding
+    an answer that declined to use them.
+    """
+    monkeypatch.setattr(
+        pipeline_mod,
+        "build_chat_model",
+        lambda _s: FakeListChatModel(
+            responses=["I don't know based on the provided documents."]
+        ),
+    )
+    at = app.run()
+    at.chat_input[0].set_value("What is the capital of Australia?").run()
+    assert not at.exception, [e.value for e in at.exception]
+
+    _, assistant = at.session_state["messages"]
+    labels = [panel.label for panel in at.get("status")]
+    assert labels == [f"Retrieved passages ({len(assistant['sources'])})"]
+
+
 def test_user_turn_is_echoed_unparsed(app):
     """A question containing Markdown must come back as typed, not rendered."""
     at = app.run()
@@ -306,7 +330,7 @@ def test_an_empty_answer_is_not_stored_as_a_grounded_turn(app, monkeypatch):
     """Whitespace-only generation must not look like a cited answer.
 
     Stored as-is it would render a blank assistant bubble above a populated
-    Sources expander — the strongest possible claim of grounding attached to no
+    panel of passages — the strongest possible claim of grounding attached to no
     content at all. The model is faked rather than `_generate`, so the guard
     under test is the real one in the pipeline.
     """

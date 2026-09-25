@@ -234,7 +234,7 @@ class RAGPipeline:
                     yield piece
         if not produced_content:
             # Otherwise each frontend presents nothing as a cited answer — a
-            # blank chat bubble above a full Sources expander, or the CLI's
+            # blank chat bubble above a full panel of passages, or the CLI's
             # "Sources:" block under an empty line — claiming the strongest
             # possible grounding for no content at all.
             raise RuntimeError("The chat model returned an empty answer")
