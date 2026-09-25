@@ -49,7 +49,9 @@ A macOS-only dependency takes the marker the MLX ones carry:
 `uv add --marker "sys_platform == 'darwin'" <pkg>`.
 
 The lint select list is broad and the tree is clean against it. **Fix findings
-rather than adding `# noqa` / `# ty: ignore`.** Prefer `uv run ruff`/`uv run ty`
+rather than suppressing them** — no `# noqa`, `# ty: ignore`, `# type: ignore`,
+or any other form ruff or ty honours in source. The README's rule table lists
+them all, and `no-suppressions` rejects them. Prefer `uv run ruff`/`uv run ty`
 over `uvx`, so versions match the lock. Ruff's line length and ty's target
 version are both inherited (from the default and from `requires-python`) — don't
 re-pin them in `pyproject.toml`.
@@ -575,7 +577,10 @@ whole suite green. Two properties are load-bearing and easy to break:
 
 - Rules match a **masked** copy of the text: string literals are blanked for
   every rule, comments too for all but the suppression rule. Without that, a
-  comment describing a rule is blocked by the rule it describes.
+  comment describing a rule is blocked by the rule it describes. Strings and
+  comments are found in one pass, so a quote inside a comment opens no string:
+  masking strings first let an apostrophe and a later quote in one comment
+  hide the text between them, suppressions included.
 - The masking alternation must stay **linear**. An earlier form let two branches
   both match a backslash, and an unterminated quote took 6.5s at 8 lines and
   never finished at 12 — the sweep hanging rather than failing.

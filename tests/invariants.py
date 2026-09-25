@@ -45,9 +45,9 @@ class Rule(NamedTuple):
     name: str
     applies: Callable[[str], bool]
     pattern: re.Pattern[str]
-    # True for rules that must see comments (finding a lint suppression in one
-    # is the whole job). False for rules that must not, so that prose
-    # describing a rule is not blocked by the rule it describes.
+    # True for rules that must see comments (nearly every suppression is one).
+    # False for rules that must not, so that prose describing a rule is not
+    # blocked by the rule it describes.
     scan_comments: bool
     message: str
 
@@ -70,11 +70,24 @@ STRING = re.compile(
     re.DOTALL,
 )
 COMMENT = re.compile(r"#[^\n]*")
+# Strings and comments in one pass, so whichever opens first owns the text: a
+# hash inside a string starts no comment, and a quote inside a comment starts no
+# string. Masking strings on their own got the second wrong: an apostrophe in a
+# comment paired with a later quote blanked everything between the two -- a
+# suppression in the same comment, or, from a triple quote, the code below it.
+# The comment branch opens with a character no string branch does, so this is
+# as linear as STRING.
+LEXEME = re.compile(f"{STRING.pattern}|{COMMENT.pattern}", re.DOTALL)
 
 
 def _blank(match: re.Match[str]) -> str:
     """Replace a span with just its newlines, so `^` anchors keep their lines."""
     return "\n" * match.group(0).count("\n")
+
+
+def _blank_strings(match: re.Match[str]) -> str:
+    """Blank a string but keep a comment, which the suppression rule reads."""
+    return match.group(0) if match.group(0).startswith("#") else _blank(match)
 
 
 RULES = [
@@ -129,11 +142,37 @@ RULES = [
     Rule(
         name="no-suppressions",
         applies=lambda p: p.endswith(".py"),
-        # Spelled indirectly so this module does not match itself; the docstring
-        # above may spell it, because string literals are masked.
-        pattern=re.compile(r"#\s*(?:n[o]qa|ty:\s*ignore)"),
+        # Every form that ruff 0.16.9 or ty 0.0.84 honours, each tried against a
+        # real finding; pyright's, mypy's and pylint's comments, which neither
+        # reads, are not matched. Like the tools, it reads a directive after any
+        # hash in a comment, behind prose or in a URL fragment, and isort's
+        # where ruff does, with no hash before it at all:
+        # - noqa, in any case, bare or behind ruff's or flake8's file-level
+        #   prefix -- but not starting a longer word, which ruff rejects.
+        # - ruff's own ignore, file-ignore and disable, which all take codes.
+        # - isort's skip, skip_file, off and split: each can make an
+        #   import-sorting finding disappear with no import moved.
+        # - ty's ignore and PEP 484's type ignore, with or without codes.
+        # - typing's no_type_check, the one form that is code: ty skips the
+        #   function it decorates, under any alias. Matched only ahead of any
+        #   hash on its line, so a comment can still name it.
+        # Formatter directives are allowed: the linter still reports everything
+        # under them. The pattern is a string, masked like any other, so it can
+        # spell every form plainly.
+        pattern=re.compile(
+            r"#\s*(?:(?:ruff|flake8)\s*:\s*)?(?i:noqa)(?=[\s:#]|$)"
+            r"|#\s*ruff\s*:\s*(?:ignore|file-ignore|disable)\s*\["
+            r"|isort:\s*(?:skip|off|split)"
+            r"|#\s*(?:ty|type)\s*:\s*ignore(?=[\s\[]|$)"
+            r"|^[^#\n]*\bno_type_check\b",
+            re.MULTILINE,
+        ),
         scan_comments=True,
-        message="Adding a lint/type suppression. CLAUDE.md: fix the finding instead.",
+        message=(
+            "Adding a lint/type suppression: a noqa, ruff: ignore/file-ignore/"
+            "disable, isort: skip/off/split, ty: ignore or type: ignore comment, "
+            "or no_type_check. CLAUDE.md: fix the finding instead."
+        ),
     ),
 ]
 
@@ -151,7 +190,7 @@ def violations(relpath: str, text: str) -> list[str]:
         # non-Python write is the only real work here.
         return []
 
-    with_comments = STRING.sub(_blank, text)
+    with_comments = LEXEME.sub(_blank_strings, text)
     code_only = COMMENT.sub(_blank, with_comments)
 
     return [

@@ -120,8 +120,91 @@ VIOLATIONS = [
         'emb = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")',
         id="embeddings-in-tests",
     ),
+    pytest.param(
+        # A quote in a comment opens no string. Masked as one, this triple
+        # quote blanked everything up to the next, the construction included.
+        "app.py",
+        '# a """ in a comment\nstore = Chroma(collection_name="x")\n# and """',
+        id="store-after-a-comment-that-quotes",
+    ),
     pytest.param("rag_pipeline/config.py", "import os  # noqa: F401", id="suppression"),
+    pytest.param("rag_pipeline/config.py", "import os  # NOQA", id="noqa-any-case"),
+    pytest.param(
+        # ruff reads noqa after any hash in a comment, a URL's included.
+        "rag_pipeline/config.py",
+        "import os  # see https://example.com/#noqa",
+        id="noqa-in-a-url-fragment",
+    ),
+    pytest.param(
+        "rag_pipeline/config.py", "# ruff: noqa: F401\nimport os", id="ruff-file-noqa"
+    ),
+    pytest.param(
+        "rag_pipeline/config.py", "# flake8: noqa\nimport os", id="flake8-file-noqa"
+    ),
+    pytest.param(
+        "rag_pipeline/config.py", "import os  # ruff: ignore[F401]", id="ruff-ignore"
+    ),
+    pytest.param(
+        "rag_pipeline/config.py",
+        "# ruff: file-ignore[F401]\nimport os",
+        id="ruff-file-ignore",
+    ),
+    pytest.param(
+        "rag_pipeline/config.py",
+        "# ruff: disable[F401]\nimport os\n# ruff: enable[F401]",
+        id="ruff-disable-range",
+    ),
+    pytest.param(
+        "app.py", "# isort: skip_file\nimport sys\nimport os", id="isort-skip-file"
+    ),
+    pytest.param(
+        "app.py",
+        "# isort: off\nimport sys\nimport os\n# isort: on",
+        id="isort-off",
+    ),
+    pytest.param(
+        # ruff honours this one with no hash in front of it.
+        "app.py",
+        "import sys  # keep first, isort: skip\nimport os",
+        id="isort-skip-behind-prose",
+    ),
+    pytest.param(
+        # Each block is sorted on its own, so an import split off by itself
+        # passes out of order.
+        "app.py",
+        "import sys\n\n# isort: split\n\nimport os",
+        id="isort-split",
+    ),
     pytest.param("rag_pipeline/config.py", "x = y  # ty: ignore", id="ty-ignore"),
+    pytest.param(
+        "rag_pipeline/config.py",
+        "x = y  # ty: ignore[unresolved-reference]",
+        id="ty-ignore-with-a-rule",
+    ),
+    pytest.param("rag_pipeline/config.py", "x = y  # type: ignore", id="type-ignore"),
+    pytest.param(
+        "rag_pipeline/config.py",
+        "x = y  # type: ignore[ty:unresolved-reference]",
+        id="type-ignore-with-a-rule",
+    ),
+    pytest.param(
+        # The apostrophe and the closing quote once masked the directive
+        # between them, which ty still reads.
+        "rag_pipeline/config.py",
+        "x = f()  # can't be typed yet # type: ignore -- see 'f'",
+        id="type-ignore-between-quotes-in-a-comment",
+    ),
+    pytest.param(
+        "rag_pipeline/pipeline.py",
+        "@typing.no_type_check\ndef f(): ...",
+        id="no-type-check-decorator",
+    ),
+    pytest.param(
+        # ty honours it under any alias, so the import is where the name shows.
+        "rag_pipeline/pipeline.py",
+        "from typing import no_type_check as unchecked",
+        id="no-type-check-under-an-alias",
+    ),
 ]
 
 ALLOWED = [
@@ -177,6 +260,37 @@ ALLOWED = [
         id="store-inside-a-docstring",
     ),
     pytest.param("README.md", "Never construct Chroma(...) inline.", id="not-python"),
+    # Near misses for the suppression rule: none silences a ruff or ty finding.
+    pytest.param(
+        "app.py", "# a type ignore would only hide the finding", id="prose-about-it"
+    ),
+    pytest.param(
+        "app.py",
+        "# https://docs.astral.sh/ty/suppression/#type-ignore-comments",
+        id="a-url-fragment",
+    ),
+    pytest.param(
+        # ruff rejects noqa that starts a longer word, so this suppresses nothing.
+        "app.py",
+        "# https://example.com/#noqa-directives",
+        id="noqa-starting-a-longer-word",
+    ),
+    pytest.param("app.py", "x = []  # type: list[int]", id="a-type-comment"),
+    pytest.param(
+        "app.py", "x = y  # pyright: ignore[reportAssignmentType]", id="another-checker"
+    ),
+    pytest.param(
+        # The formatter keeps the hand layout; the linter still reports under it.
+        "app.py",
+        "# fmt: off\nGRID = [\n    1, 0,\n    0, 1,\n]\n# fmt: on\nx = 1  # fmt: skip",
+        id="formatter-directives",
+    ),
+    pytest.param(
+        # The decorator is code, so a comment may name it.
+        "app.py",
+        "# typing's no_type_check would hide this function from ty",
+        id="naming-the-decorator-in-a-comment",
+    ),
 ]
 
 

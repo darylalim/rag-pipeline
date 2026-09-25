@@ -492,7 +492,7 @@ enforces them across every tracked `.py` file:
 | -------------------- | -------------------------------------------------------------- | --- |
 | `store-factory`      | constructing the vector store (`Chroma(...)`, `Chroma.from_*(...)`, `chromadb.PersistentClient(...)` or `chromadb.Client(...)`) outside `ingest.py`, `tests/` included | a collection's identity is (persist dir, collection name, embedding function); ingest and query must open it the same way, and chromadb rejects a second client on the same directory with different settings |
 | `embeddings-factory` | constructing an embedding model (`QwenVLEmbeddings(...)` or `HuggingFaceEmbeddings(...)`) outside `ingest.py`, `tests/` included — the class definition itself excepted | the same model must embed documents and questions; in tests, inject a fake instead |
-| `no-suppressions`    | lint/type suppression comments                                   | fix the finding instead |
+| `no-suppressions`    | a suppression in source that ruff or ty honours: `noqa` (in any case, and in ruff's and flake8's file-level forms), ruff's `ignore[…]`, `file-ignore[…]` and `disable[…]`, isort's `skip`, `skip_file`, `off` and `split`, `ty: ignore` and `type: ignore` (with or without codes), and `@no_type_check` — though not `# fmt:` directives, under which the linter still reports everything | fix the finding instead |
 
 Two documentation rules ride along: every `Settings` field must appear in both
 `.env.example` and the configuration table above, and every rule in the table
