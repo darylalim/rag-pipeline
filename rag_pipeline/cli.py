@@ -18,8 +18,8 @@ def cmd_ingest(settings: Settings) -> int:
     print(f"Ingesting documents from {settings.data_dir} ...")
     n_chunks = ingest(settings)
     print(
-        f"Indexed {n_chunks} chunks into "
-        f"{settings.mongodb_db}.{settings.collection_name}"
+        f"Indexed {n_chunks} chunks into collection "
+        f"'{settings.collection_name}' at {settings.persist_dir}"
     )
     print('Ready. Ask a question with:  rag query "..."')
     return 0
@@ -33,10 +33,10 @@ def cmd_query(settings: Settings, question: str) -> int:
 
     print(f"\nQ: {question}\n")
     # Printed as it arrives rather than after the full generation, so a long
-    # answer starts appearing immediately. stream_answer() translates provider
-    # errors to RuntimeError, which main() reports — note that a mid-stream
-    # failure leaves the partial answer on screen above the error, which is the
-    # cost of streaming at all.
+    # answer starts appearing immediately. A model failure arrives as a
+    # RuntimeError, which main() reports — note that a mid-stream failure leaves
+    # the partial answer on screen above the error, which is the cost of
+    # streaming at all.
     try:
         for chunk in chunks:
             print(chunk, end="", flush=True)
@@ -55,7 +55,7 @@ def cmd_query(settings: Settings, question: str) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="rag",
-        description="A RAG pipeline built with LangChain, Voyage AI embeddings, and Claude.",
+        description="A local RAG pipeline built with LangChain, Chroma, and MLX models.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -80,6 +80,13 @@ def main(argv: list[str] | None = None) -> int:
     except (FileNotFoundError, RuntimeError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
+    except KeyboardInterrupt:
+        # Ctrl-C is how a slow local answer gets abandoned -- the model reads
+        # the prompt for several seconds before it writes -- so it is an
+        # ordinary way out, not a crash: one line and the shell's usual status
+        # for SIGINT, not a traceback through the model's generation loop.
+        print("Interrupted.", file=sys.stderr)
+        return 130
 
 
 if __name__ == "__main__":

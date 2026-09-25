@@ -1,0 +1,17 @@
+# Streamlit settings for `uv run streamlit run app.py`, read from the repo root
+# (and from beside app.py, which is the same directory).
+
+[browser]
+# Streamlit's browser front end sends usage statistics to Streamlit's servers
+# unless told not to. This app is meant to run entirely on this machine, so
+# they are off.
+gatherUsageStats = false
+
+[server]
+# No file watcher. On every script run the watcher walks sys.modules, and
+# transformers' lazy submodules -- imported with mlx-lm's tokenizers -- raise
+# ModuleNotFoundError (no torch) when it looks at them, which it logs as a
+# traceback: over a hundred per chat turn in the server's terminal. The cost is
+# that editing app.py no longer reruns it; pass
+# `--server.fileWatcherType auto` while developing the app itself.
+fileWatcherType = "none"

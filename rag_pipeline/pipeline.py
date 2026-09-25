@@ -1,29 +1,32 @@
 """Query phase: embed question -> search -> rerank -> generate a grounded answer.
 
-``RAGPipeline`` opens the Atlas Vector Search collection and a Claude chat model
-once, then answers questions against it. Both the CLI and the Streamlit app build
-a single pipeline and reuse it across queries.
+``RAGPipeline`` opens the persisted Chroma collection and the local models
+once, then answers questions against them. Both the CLI and the Streamlit app
+build a single pipeline and reuse it across queries.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Generator
+from contextlib import closing
 from dataclasses import dataclass
-from typing import TypedDict
+from typing import Any, TypedDict, cast
 
-import anthropic
-from langchain_anthropic import ChatAnthropic
 from langchain_core.documents import Document
 from langchain_core.documents.compressor import BaseDocumentCompressor
 from langchain_core.embeddings import Embeddings
 from langchain_core.language_models import BaseChatModel
-from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import Runnable
-from langchain_voyageai import VoyageAIRerank
 
-from rag_pipeline.config import Settings, require_env_key
-from rag_pipeline.ingest import open_store, provider_errors_as_runtime
+from rag_pipeline.config import Settings
+from rag_pipeline.ingest import (
+    OWN_CHUNKS,
+    open_store,
+    require_index,
+    store_errors_as_runtime,
+)
+from rag_pipeline.mlx_models import MLXChatModel, QwenVLReranker
 
 # Grounding prompt: the model must answer from the retrieved context only, and
 # admit when the context does not contain the answer. This is what turns a
@@ -103,31 +106,29 @@ def source_excerpts(docs: list[Document]) -> list[Excerpt]:
 
 
 def build_chat_model(settings: Settings) -> BaseChatModel:
-    """Construct the Claude chat model used for generation.
+    """Construct the local chat model used for generation.
 
-    No temperature/top_p: grounding comes from the retrieved context, and
-    omitting sampling params keeps this safe across models — Opus 4.8, for
-    instance, rejects them outright. Reads ANTHROPIC_API_KEY from the
-    environment.
+    No temperature/top_p/top_k: the model decodes greedily, so the same question
+    over the same retrieved context gets the same answer — grounding comes from
+    the context, and an answer that changes from one run to the next is harder to
+    check against it. ``max_tokens`` is passed through because mlx-lm's own
+    default (256) would cut a cited answer short. Cheap to call again: the
+    weights load once per process, so the app's rebuild after every ingest wraps
+    the model it already holds rather than loading a second copy.
     """
-    return ChatAnthropic(model=settings.chat_model, max_tokens=settings.max_tokens)
+    return MLXChatModel(model_id=settings.chat_model, max_tokens=settings.max_tokens)
 
 
 def build_reranker(settings: Settings) -> BaseDocumentCompressor:
-    """Construct the Voyage AI reranker.
+    """Construct the local reranker.
 
     Here, not in ingest.py: reranking is a query-only stage with no ingest-side
     counterpart, so the shared-factory reason that keeps build_embeddings in
     ingest.py doesn't apply — it sits beside build_chat_model, both query-time
-    model factories. ``top_k`` is the reranker's own cap, so it returns exactly
+    model factories. ``top_n`` is the reranker's own cap, so it returns exactly
     retrieval_k docs and ``retrieve()`` needs no manual slice.
-
-    Guards VOYAGE_API_KEY up front like build_embeddings, so a missing key fails
-    fast inside the caught union rather than as a raw validation error escaping to
-    a frontend.
     """
-    require_env_key("VOYAGE_API_KEY", "Reranking uses Voyage AI")
-    return VoyageAIRerank(model=settings.rerank_model, top_k=settings.retrieval_k)
+    return QwenVLReranker(model_id=settings.rerank_model, top_n=settings.retrieval_k)
 
 
 class RAGPipeline:
@@ -140,109 +141,114 @@ class RAGPipeline:
         llm: Runnable | None = None,
         reranker: BaseDocumentCompressor | None = None,
     ) -> None:
-        # Fast-fail on a missing key *before* loading the embedding model — but
-        # only when we're going to build the real Claude client (an injected
-        # `llm`, as in tests, needs no key).
-        if llm is None:
-            require_env_key("ANTHROPIC_API_KEY", "Generation uses Claude")
+        # Chroma refuses a search for fewer than one result with a builtins
+        # TypeError -- outside the union, and only on the first question, after
+        # every model had loaded. RuntimeError, not ValueError: this runs on the
+        # app's pipeline-load path, whose handler sits below the sidebar.
+        if settings.fetch_k < 1:
+            raise RuntimeError(f"FETCH_K must be at least 1, not {settings.fetch_k}.")
+        # Before any model is built: a missing, misnamed or empty index is
+        # reported without first loading ~22 GB of weights to find out.
+        require_index(settings)
 
         self.settings = settings
 
         # Reopen the existing store via the shared factory, so the same
         # embedding model that indexed the documents also embeds queries.
         # `embeddings` and `llm` are injectable for tests; production leaves
-        # both as None and gets the embedding model + ChatAnthropic. Opening
-        # the store pings the cluster, so an unreachable/paused one fails here.
-        vectorstore = open_store(settings, embeddings)
-        collection = vectorstore.collection
-        with provider_errors_as_runtime():
-            index_info = list(
-                collection.list_search_indexes(settings.vector_index_name)
-            )
-            has_documents = collection.count_documents(
-                {"content_hash": {"$exists": True}}, limit=1
-            )
-
-        # Two distinct failures, checked in order. A full collection with no
-        # (or a not-yet-built) vector index answers every question "I don't know"
-        # off zero rows — and the empty-collection guard below would not catch
-        # it, because the documents are there. Unlike Chroma, Atlas builds no
-        # index implicitly on write, so this is the query-side half of what
-        # `rag ingest` promises.
-        if not index_info or not index_info[0].get("queryable"):
-            raise FileNotFoundError(
-                f"No queryable vector index '{settings.vector_index_name}' on "
-                f"{settings.mongodb_db}.{settings.collection_name}. Run `rag ingest` "
-                "first (index builds are asynchronous)."
-            )
-        # An empty (or wrong) namespace yields a silently-empty result set —
-        # Mongo creates a namespace implicitly on first write and returns zero
-        # documents, with no error, for one that was never ingested into. Scoped
-        # to this pipeline's own chunks, so a collection holding only unrelated
-        # documents (or only the version marker) reads as empty-for-this-pipeline.
-        if has_documents == 0:
-            raise FileNotFoundError(
-                f"Namespace {settings.mongodb_db}.{settings.collection_name} is "
-                "empty. Run `rag ingest` first, and check MONGODB_DB/COLLECTION_NAME "
-                "match the ones used to ingest."
-            )
+        # both as None and gets the local models. `create=False`, so the query
+        # path never creates a collection, even if one vanished since the check.
+        vectorstore = open_store(settings, embeddings, create=False)
         # Retrieve a wide candidate set (fetch_k); the reranker below narrows it
-        # to retrieval_k. `exact` runs exact (ENN) search, correct for a corpus
-        # under ~10k chunks and free of numCandidates tuning. `reranker` is
-        # injectable for tests alongside `embeddings`/`llm`; production leaves it
-        # None and builds the real one.
+        # to retrieval_k. Filtered to this pipeline's own chunks, like every
+        # read at ingest, so a foreign record sharing the collection is never
+        # retrieved or cited. `reranker` is injectable for tests alongside
+        # `embeddings`/`llm`; production leaves it None and builds the real one.
         self._retriever = vectorstore.as_retriever(
-            search_kwargs={"k": settings.fetch_k, "exact": True}
+            search_kwargs={"k": settings.fetch_k, "filter": OWN_CHUNKS}
         )
         self._reranker = reranker or build_reranker(settings)
 
-        # StrOutputParser extracts plain text whether the model returns a string
-        # or structured content blocks.
-        self._chain = _PROMPT | (llm or build_chat_model(settings)) | StrOutputParser()
+        # The model's own message chunks, not a StrOutputParser's strings:
+        # closing a parser's stream does not stop the model -- langchain-core
+        # catches the GeneratorExit and drains the parser's input to the end --
+        # so a Stop in the app would keep generating, under the process-wide
+        # generation lock, until MAX_TOKENS. _generate() extracts the text
+        # itself instead.
+        self._chain = _PROMPT | (llm or build_chat_model(settings))
 
     def retrieve(self, question: str) -> list[Document]:
         """Return the reranked top chunks for the question.
 
-        Vector search casts a wide net (fetch_k); the Voyage reranker — a
-        cross-encoder scoring each candidate against the question jointly —
-        narrows it to retrieval_k. Both calls are wrapped so a Voyage provider
-        error (embedding *or* reranking), or a query-time dimension mismatch
-        against a stale index, surfaces as the RuntimeError both frontends catch
-        rather than a raw voyageai/pymongo/bson exception.
+        Vector search casts a wide net (fetch_k); the reranker — scoring each
+        candidate against the question jointly — narrows it to retrieval_k. Both
+        calls are wrapped so a store failure, such as a query-time dimension
+        mismatch against a collection built with another model, surfaces as the
+        RuntimeError both frontends catch rather than a raw chromadb exception.
+        The models need no wrapping: their adapters already raise inside the
+        union.
         """
-        with provider_errors_as_runtime():
+        with store_errors_as_runtime():
             candidates = self._retriever.invoke(question)
             return list(self._reranker.compress_documents(candidates, question))
 
-    def _generate(self, question: str, docs: list[Document]) -> Iterator[str]:
+    def _generate(
+        self, question: str, docs: list[Document]
+    ) -> Generator[str, None, None]:
         """Yield the grounded answer in pieces, as the model produces them.
 
-        The single generation path, so every generation-level failure is raised
-        here rather than in each frontend: a provider error, and a response that
-        arrives empty. The provider translation must wrap the *iteration* —
-        `.stream()` is lazy, so a failed request surfaces while the generator is
-        being consumed, not when it is created.
+        The single generation path, so a generation-level check lives here once
+        rather than in each frontend. A model failure already arrives as a
+        RuntimeError — the adapter translates it where the model runs — so the
+        checks left for this layer are about the response: one that arrives
+        empty, and one the model cut off at MAX_TOKENS. Both surface while the
+        generator is being consumed, not when it is created: `.stream()` is
+        lazy, and the model does not start until the first piece is pulled.
+
+        Closing this generator closes the model's stream at once (see
+        `stream_answer`), because the chain's stream is closed with it rather
+        than left for the garbage collector.
         """
         produced_content = False
-        try:
-            for chunk in self._chain.stream(
-                {"context": format_docs(docs), "question": question}
-            ):
-                produced_content = produced_content or bool(chunk.strip())
-                yield chunk
-        except anthropic.APIError as exc:
-            # Translate provider errors (bad/expired key, rate limit, network)
-            # into a generic RuntimeError, so frontends handle a failed
-            # generation uniformly without depending on the Anthropic SDK.
-            raise RuntimeError(f"Claude API request failed: {exc}") from exc
+        truncated = False
+        # A RunnableSequence's stream is a generator, typed only as an Iterator;
+        # the cast is what lets it be closed explicitly.
+        stream = cast(
+            Generator[Any, None, None],
+            self._chain.stream({"context": format_docs(docs), "question": question}),
+        )
+        with closing(stream):
+            for message in stream:
+                # A str from a plain runnable, else a message chunk: `.text`
+                # joins structured content blocks as well as a plain string.
+                if isinstance(message, str):
+                    piece = message
+                else:
+                    piece = str(message.text)
+                    finish = message.response_metadata.get("finish_reason")
+                    truncated = truncated or finish == "length"
+                # Skipped when empty: the model's closing chunks carry only
+                # metadata, and the app's first-token spinner must wait for text.
+                if piece:
+                    produced_content = produced_content or bool(piece.strip())
+                    yield piece
         if not produced_content:
             # Otherwise each frontend presents nothing as a cited answer — a
             # blank chat bubble above a full Sources expander, or the CLI's
             # "Sources:" block under an empty line — claiming the strongest
             # possible grounding for no content at all.
-            raise RuntimeError("Claude returned an empty answer")
+            raise RuntimeError("The chat model returned an empty answer")
+        if truncated:
+            # Said in the answer itself, the one channel both frontends show:
+            # otherwise an answer cut off mid-sentence reads as a complete one.
+            yield (
+                f"\n\n[Answer cut off at MAX_TOKENS={self.settings.max_tokens}; "
+                "raise it for a longer one.]"
+            )
 
-    def stream_answer(self, question: str) -> tuple[list[Document], Iterator[str]]:
+    def stream_answer(
+        self, question: str
+    ) -> tuple[list[Document], Generator[str, None, None]]:
         """Search, then hand back the sources and a lazy stream of the answer.
 
         Both halves in one call because every frontend needs both, and splitting
@@ -254,6 +260,12 @@ class RAGPipeline:
         run when this returns (so a caller can put a spinner around just this
         call), while generation has not started and will not until the iterator
         is consumed.
+
+        A caller that stops reading early must `close()` the stream rather than
+        drop it. The local model holds a process-wide lock for as long as its
+        stream is open, and a dropped one is freed only when the garbage
+        collector gets to it -- which, for a stream a Streamlit script holds in
+        a global, can be never: every later answer would wait on that lock.
         """
         docs = self.retrieve(question)
         return docs, self._generate(question, docs)
