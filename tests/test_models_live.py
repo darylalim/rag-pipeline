@@ -13,7 +13,7 @@ still produces unit vectors and plausible rankings. Reproducing the model cards'
 published scores is what pins the recipe down. The rest checks the properties
 the pipeline relies on: batching changes no result, a narrower embedding is the
 normalized prefix of the full one, and the chat model streams a grounded answer
-with no reasoning in it.
+with no reasoning in it and reports why it stopped.
 
 The models load once per process (``load_mlx_model`` memoizes them), so the
 fixtures below are cheap after the first test that needs each one, and every

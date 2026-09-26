@@ -186,7 +186,9 @@ locking and error translation are all unit-tested in CI with a fake `mlx_lm`
 subtly wrong prompt or pooling step still yields plausible vectors and
 sensible-looking rankings. Only `tests/test_models_live.py` (`-m models`) notices,
 by reproducing the model cards' published scores — run it after touching an
-adapter.
+adapter, after a `uv.lock` change that moves `mlx`, `mlx-lm`, `mlx-metal`,
+`transformers`, `tokenizers` or `huggingface-hub`, and after re-downloading a
+model: the fakes stay put while all of those move. Skipped is not passed.
 
 ### Tracing is the API in the pipeline, the SDK in the frontends
 

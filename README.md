@@ -381,13 +381,17 @@ These tests load the real checkpoints (an Apple Silicon Mac with the three
 models downloaded and the memory to hold them; about a minute on an M2 Max). They reproduce the embedding and
 reranker model cards' published scores — a subtly wrong prompt format or pooling
 step still produces plausible vectors and sensible-looking rankings, so this is
-the only check that notices — confirm that batching does not change a result,
+the only check that notices — confirm that batching does not change a result
+and that the chat model reports why it stopped (the `MAX_TOKENS` note reads it),
 and run an ingest-and-answer pass over `data/`. They skip, rather than fail,
 when MLX or a model is missing — and the ingest-and-answer pass skips when the
 sample document its question is about is no longer in `data/`. A plain
 `uv run pytest` deselects them
-(`addopts = ["-m", "not models"]`), so it never loads a model; run this suite by
-hand after changing anything in `mlx_models.py`, since CI cannot.
+(`addopts = ["-m", "not models"]`), so it never loads a model. Run this suite by
+hand, since CI cannot, whenever what the fakes stand in for may have moved:
+after changing anything in `mlx_models.py`, after a `uv.lock` change that moves
+`mlx`, `mlx-lm`, `mlx-metal`, `transformers`, `tokenizers` or `huggingface-hub`,
+and after re-downloading a model. A run that skipped a test has not checked it.
 
 Coverage is measured on demand rather than in CI, and carries no threshold — a
 number to keep green invites tests that execute code without asserting anything:
