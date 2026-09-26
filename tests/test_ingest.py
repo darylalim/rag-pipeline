@@ -582,7 +582,9 @@ def test_ingest_preserves_foreign_documents_in_a_shared_collection(
 
     A record this pipeline did not write must survive a rebuild that *does*
     delete -- here one deleting the very source the record names, which is the
-    case every filter short of the marker gets wrong.
+    case every filter short of the marker gets wrong. Surviving, it must still
+    not pass for ours: `indexed_sources` is what the app asks whether an upload
+    was indexed, and here the record is all that is left under a.md.
     """
     ingest_mod.ingest(settings, embeddings=fake_embeddings)
     _add_foreign_record(settings, fake_embeddings)
@@ -597,6 +599,9 @@ def test_ingest_preserves_foreign_documents_in_a_shared_collection(
         "ingest must not delete documents it did not write"
     )
     assert "a.md" not in sources_in(settings, fake_embeddings)
+    assert "a.md" not in ingest_mod.indexed_sources(settings), (
+        "a foreign record was reported as indexed"
+    )
 
 
 def test_a_foreign_record_does_not_change_what_ingest_decides(
@@ -746,21 +751,37 @@ def test_a_removed_document_loses_its_chunks(settings, fake_embeddings):
     assert "a.md" not in sources_in(settings, fake_embeddings)
 
 
-def test_changing_the_chunking_re_embeds_everything(settings, counting_embeddings):
+@pytest.mark.parametrize(
+    "change",
+    [{"chunk_size": 80}, {"chunk_overlap": 10}],
+    ids=["chunk_size", "chunk_overlap"],
+)
+def test_changing_the_chunking_re_embeds_everything(
+    settings, counting_embeddings, change
+):
     """Chunk boundaries are part of what the stored vectors represent.
 
     Content-only fingerprinting would leave every existing chunk in place under
     a new CHUNK_SIZE, so the index would keep vectors the current settings could
     not have produced — stale in a way no file inspection would reveal.
+
+    One setting at a time, each of which must reach the fingerprint on its own:
+    changed together, dropping either went unnoticed. And the documents split
+    the same way under both, so the fingerprint is all that can tell the runs
+    apart: ingest's chunk-count check re-embeds a source whose number of chunks
+    changed whatever the fingerprint says, but one whose chunks only moved is
+    the fingerprint's alone to catch.
     """
+    rechunked = dataclasses.replace(settings, **change)
+    documents = ingest_mod.load_documents(settings.data_dir)
+    before = ingest_mod.split_documents(documents, settings)
+    after = ingest_mod.split_documents(documents, rechunked)
+    assert [c.page_content for c in before] == [c.page_content for c in after]
     ingest_mod.ingest(settings, embeddings=counting_embeddings)
     counting_embeddings.embedded.clear()
 
     ingest_mod.reset_store_cache()
-    n = ingest_mod.ingest(
-        dataclasses.replace(settings, chunk_size=80, chunk_overlap=10),
-        embeddings=counting_embeddings,
-    )
+    n = ingest_mod.ingest(rechunked, embeddings=counting_embeddings)
 
     assert len(counting_embeddings.embedded) == n
 
@@ -1297,8 +1318,15 @@ def test_a_store_reset_cannot_break_another_threads_client_open(
     in between surfaced in the other session as a builtins KeyError or
     AttributeError, outside every union a frontend catches. Starting a System
     is slowed here to widen that window, so an unguarded interleaving shows on
-    nearly every open rather than by luck; the two threads do what the app's
+    nearly every open rather than by luck; the threads do what the app's
     rebuild and every rerun do.
+
+    Two rebuilds, because the lock has two sides and one resetter tests only
+    the open's. A System starts slowly only when it is first built after a
+    reset, and a lone resetter is itself the next to open one -- so its reset
+    never lands in another thread's start, and an unguarded reset passed. A
+    second session rebuilding, or an upload's ingest beside a rebuild, is what
+    lands it there.
     """
     ingest_mod.ingest(settings, embeddings=fake_embeddings)
     start = System.start
@@ -1324,8 +1352,8 @@ def test_a_store_reset_cannot_break_another_threads_client_open(
     def rerun() -> None:  # what every app rerun reads
         ingest_mod.index_version(settings)
 
-    with _workers(2) as pool:
-        sessions = [pool.submit(hammer, step) for step in (rebuild, rerun)]
+    with _workers(3) as pool:
+        sessions = [pool.submit(hammer, step) for step in (rebuild, rebuild, rerun)]
     for session in sessions:
         session.result(timeout=30)
 
