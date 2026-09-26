@@ -4,11 +4,17 @@ __pycache__/
 .venv*/
 *.egg-info/
 
-# Environment / secrets
+# Environment / secrets. `.env.*` includes the `.env.phoenix` Phoenix's own
+# clients read; `.env.example` is the template, so it stays tracked.
 .env
+.env.*
+!.env.example
+.streamlit/secrets.toml
 
-# Coverage artifacts (measured on demand; see README)
+# Coverage artifacts (measured on demand; see README). `patch = ["subprocess"]`
+# turns on parallel mode, so an interrupted run leaves `.coverage.*` behind.
 .coverage
+.coverage.*
 htmlcov/
 
 # Local tool/tokenizer caches
@@ -19,3 +25,14 @@ htmlcov/
 
 # Local Chroma index (PERSIST_DIR)
 chroma_db/
+
+# Your own documents in data/, uploaded or dropped in, are yours rather than
+# this repo's: only the three samples are tracked.
+/data/*
+!/data/langchain_overview.md
+!/data/rag_concepts.md
+!/data/vector_stores.md
+
+# Worktrees Claude Code creates inside the repo (each is its own repository,
+# which `git add -A` would commit as an embedded one)
+.claude/worktrees/

@@ -208,6 +208,17 @@ Either way the CLI and the app immediately answer against the new content: they
 read the same Chroma collection, and the app reloads its pipeline when the corpus
 fingerprint `rag ingest` stamps into the collection changes.
 
+Your documents stay out of git: `.gitignore` ignores everything in `data/` but
+the three samples, and all of `chroma_db/` (whose database holds your documents'
+text too), so a `git add -A` commits neither (`git add -f` a file if you do mean
+to share it). Two exceptions. A document saved under a sample's name replaces a
+tracked file, which git commits like any other edit, so give yours names of
+their own. And a `DATA_DIR` or `PERSIST_DIR` pointed elsewhere inside the
+checkout is not covered: list it in `.git/info/exclude`. Secrets beside the code
+are ignored too — `.env` and its variants such as `.env.phoenix`, and
+Streamlit's `.streamlit/secrets.toml`; only the `.env.example` template is
+tracked.
+
 Uploaded filenames are treated as untrusted input: `save_upload()` reduces a name
 to its final path component and rejects unsupported suffixes before writing, so
 an upload cannot choose its own directory. Its docstring covers the details,
@@ -450,7 +461,7 @@ rag_pipeline/
   cli.py         rag ingest | rag query "..."
 app.py           Streamlit chat UI
 .streamlit/      config.toml: usage statistics, email prompt and file watcher off, loopback only
-data/            sample documents (swap in your own)
+data/            sample documents; add your own (git-ignored)
 chroma_db/       the index, created by rag ingest (git-ignored)
 ```
 

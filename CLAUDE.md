@@ -636,6 +636,7 @@ behavior is:
 | no test loads a real model | conftest's `_no_real_models`, pinned by `tests/test_offline_guard.py` |
 | a question is one trace, ended however the question ends (answered, failed, stopped, closed unread) | `tests/test_tracing.py`, plus `test_a_stop_during_retrieval_still_sends_the_questions_trace` in `test_app.py` |
 | no test leaves tracing on | conftest's `_no_tracer_left_on`, after every test |
+| secrets (`.env`, `.env.*`, `.streamlit/secrets.toml`), the user's documents in `data/`, coverage's parallel data files and Claude Code worktrees stay out of git; `.env.example` and the three samples stay addable | `test_gitignore_keeps_secrets_and_your_documents_out_of_git` — the repo's `.gitignore` in a scratch repository made with no template, global excludes off |
 | the adapters implement their models' official recipes | `tests/test_models_live.py` (`-m models`, by hand on a Mac) — reproduces the model cards' published scores |
 
 The cheap-imports, greedy-decoding and foreign-document rows replaced text rules

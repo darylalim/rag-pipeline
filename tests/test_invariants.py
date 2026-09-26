@@ -12,6 +12,7 @@ collection's foreign documents alone.
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -97,6 +98,40 @@ def test_the_sweep_actually_covers_the_tree() -> None:
     assert "app.py" in SWEPT
 
 
+# Exported by `git --literal-pathspecs` and its siblings, so a hook started from
+# one inherits it; `check-ignore` refuses every pathspec mode.
+PATHSPEC_ENV_VARS = (
+    "GIT_LITERAL_PATHSPECS",
+    "GIT_GLOB_PATHSPECS",
+    "GIT_NOGLOB_PATHSPECS",
+    "GIT_ICASE_PATHSPECS",
+)
+
+
+def init_scratch_repository(path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """`git init` a repository that nothing outside it can reach into.
+
+    A hook that runs the suite exports git's per-repository variables naming
+    the real repository, which the scratch one's commands would act on instead,
+    and may export a pathspec mode (Magit runs git with `--literal-pathspecs`).
+    `--template=` copies no template: a developer's `init.templateDir` or
+    GIT_TEMPLATE_DIR could bring an info/exclude that ignores paths whatever
+    `.gitignore` says.
+    """
+    local = subprocess.run(
+        ["git", "rev-parse", "--local-env-vars"],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=10,
+    )
+    for var in (*local.stdout.split(), *PATHSPEC_ENV_VARS):
+        monkeypatch.delenv(var, raising=False)
+    subprocess.run(
+        ["git", "init", "-q", "--template=", str(path)], check=True, timeout=10
+    )
+
+
 @pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
 def test_the_sweep_covers_a_file_not_yet_added(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -110,16 +145,7 @@ def test_the_sweep_covers_a_file_not_yet_added(
     inherits GIT_INDEX_FILE -- and, in a linked worktree, GIT_DIR -- naming the
     real repository, and this test's `git add` would stage into it.
     """
-    local = subprocess.run(
-        ["git", "rev-parse", "--local-env-vars"],
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=10,
-    )
-    for var in local.stdout.split():
-        monkeypatch.delenv(var, raising=False)
-    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True, timeout=10)
+    init_scratch_repository(tmp_path, monkeypatch)
     (tmp_path / ".gitignore").write_text("ignored/\n")
     (tmp_path / "tracked.py").write_text("")
     subprocess.run(
@@ -130,6 +156,71 @@ def test_the_sweep_covers_a_file_not_yet_added(
     (tmp_path / "ignored" / "vendored.py").write_text("")
 
     assert swept_python_files(tmp_path) == ["new.py", "tracked.py"]
+
+
+# --- what git leaves out -----------------------------------------------------
+
+# Whether `git add -A` passes each path over: secrets and the user's own files
+# (True), and the templates and samples that must stay addable (False).
+GIT_IGNORES = {
+    ".env": True,
+    ".env.phoenix": True,
+    ".env.local": True,
+    ".streamlit/secrets.toml": True,
+    "data/upload.pdf": True,
+    "data/notes/report.md": True,
+    ".coverage.macbook_local.pid12345.XkqzyOax": True,
+    ".claude/worktrees/wf-1/app.py": True,
+    ".env.example": False,
+    ".streamlit/config.toml": False,
+    "data/langchain_overview.md": False,
+    "data/rag_concepts.md": False,
+    "data/vector_stores.md": False,
+    "app.py": False,
+}
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_gitignore_keeps_secrets_and_your_documents_out_of_git(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Secrets and the user's own documents stay untracked; the templates don't.
+
+    The repository is public, and nothing else would notice a gap: a
+    `.env.phoenix`, a Streamlit `secrets.toml` or a document uploaded through
+    the app goes out with the next `git add -A`, every check green. The samples
+    and `.env.example` must stay addable, or one deleted and re-created could
+    not be added back without `-f`.
+
+    The repo's .gitignore is checked in a scratch repository made with no
+    template and with the global excludes file off, so nothing but that file --
+    not a developer's own ignores, nor the real repository's index or
+    info/exclude -- can make it pass. No path need exist: `check-ignore`
+    matches patterns, not files.
+    """
+    init_scratch_repository(tmp_path, monkeypatch)
+    shutil.copy(ROOT / ".gitignore", tmp_path / ".gitignore")
+
+    result = subprocess.run(
+        [
+            "git",
+            "-c",
+            f"core.excludesFile={os.devnull}",
+            "-C",
+            str(tmp_path),
+            "check-ignore",
+            "--stdin",
+        ],
+        input="\n".join(GIT_IGNORES),
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode in (0, 1), result.stderr
+    ignored = set(result.stdout.splitlines())
+    assert {path: path in ignored for path in GIT_IGNORES} == GIT_IGNORES
 
 
 # --- the rules themselves, in-process ----------------------------------------
