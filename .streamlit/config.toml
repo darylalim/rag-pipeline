@@ -12,7 +12,8 @@ gatherUsageStats = false
 # transformers' lazy submodules -- imported with mlx-lm's tokenizers -- raise
 # ModuleNotFoundError (no torch) when it looks at them, which it logs as a
 # traceback: over a hundred per chat turn in the server's terminal. The cost is
-# that editing app.py no longer reruns it; pass
+# that an edit to app.py is not picked up at all: Rerun reuses the compiled
+# script until the last browser tab disconnects or the server restarts. Pass
 # `--server.fileWatcherType auto` while developing the app itself.
 fileWatcherType = "none"
 

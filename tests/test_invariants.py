@@ -584,9 +584,11 @@ def test_every_rule_has_a_case_in_both_directions() -> None:
 
     Checked per rule, not by counting cases: each rule must be the one reported
     by some violating case, and must match the raw text of some allowed case --
-    a near miss it has to let through by path, masking or lookbehind. Without
-    the second half, an allowed case no rule could ever match would pass while
-    testing nothing, and a rule's exemptions would go unexercised.
+    a near miss it has to let through by path or masking. (A lookbehind is part
+    of the pattern, so a case it excludes never matches raw and cannot be the
+    near miss.) Without the second half, a rule's allowed cases could all be
+    ones it never matches -- passing while testing nothing -- and its
+    exemptions would go unexercised.
     """
     assert len(RULES) == 3
     assert len({rule.name for rule in RULES}) == len(RULES)
