@@ -12,6 +12,7 @@ collection's foreign documents alone.
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -29,17 +30,32 @@ from tests.invariants import (
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def tracked_python_files() -> list[str]:
-    """Every tracked .py file, or [] when this is not a git work tree.
+def swept_python_files(root: Path = ROOT) -> list[str]:
+    """Every .py file git would track, added or not, or [] outside a work tree.
 
     Globbed rather than listed because a hardcoded list fails by silently not
-    covering a new file. Returning [] rather than raising matters: this runs at
-    collection time, and an exception here takes down the whole suite — including
-    the product tests — in a release tarball or a Docker build with no .git.
+    covering a new file -- and for the same reason not only the tracked ones: a
+    file just written is the likeliest to break a rule, and is not tracked until
+    it is added. `main` takes direct pushes, so a local run is the one check
+    before a change lands, and a violation left for CI to find is already in.
+    What .gitignore excludes (a venv, the index) is not this repo's source.
+
+    Returning [] rather than raising matters: this runs at collection time, and
+    an exception here takes down the whole suite — including the product tests —
+    in a release tarball or a Docker build with no .git.
     """
     try:
         result = subprocess.run(
-            ["git", "-C", str(ROOT), "ls-files", "*.py"],
+            [
+                "git",
+                "-C",
+                str(root),
+                "ls-files",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+                "*.py",
+            ],
             capture_output=True,
             text=True,
             timeout=10,
@@ -50,16 +66,16 @@ def tracked_python_files() -> list[str]:
     return sorted(result.stdout.split()) if result.returncode == 0 else []
 
 
-TRACKED = tracked_python_files()
+SWEPT = swept_python_files()
 
 
 # --- the tree-wide sweep: the invariant, enforced for everyone ---------------
 
 
-@pytest.mark.skipif(not TRACKED, reason="not a git work tree")
-@pytest.mark.parametrize("relpath", TRACKED or ["<none>"])
+@pytest.mark.skipif(not SWEPT, reason="not a git work tree")
+@pytest.mark.parametrize("relpath", SWEPT or ["<none>"])
 def test_no_source_file_violates_an_invariant(relpath: str) -> None:
-    """The committed tree is clean against every rule.
+    """The tree is clean against every rule, whether or not a file is added yet.
 
     This is what makes the rules real: it fails in CI regardless of who wrote
     the code or which editor they used.
@@ -67,7 +83,7 @@ def test_no_source_file_violates_an_invariant(relpath: str) -> None:
     assert violations(relpath, (ROOT / relpath).read_text()) == []
 
 
-@pytest.mark.skipif(not TRACKED, reason="not a git work tree")
+@pytest.mark.skipif(not SWEPT, reason="not a git work tree")
 def test_the_sweep_actually_covers_the_tree() -> None:
     """Guard against the sweep silently covering nothing.
 
@@ -76,9 +92,44 @@ def test_the_sweep_actually_covers_the_tree() -> None:
     than failed without git, so a release tarball or Docker build still runs
     the product tests; CI always has a work tree, which is where this bites.
     """
-    assert len(TRACKED) >= 10
-    assert "rag_pipeline/config.py" in TRACKED
-    assert "app.py" in TRACKED
+    assert len(SWEPT) >= 10
+    assert "rag_pipeline/config.py" in SWEPT
+    assert "app.py" in SWEPT
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_the_sweep_covers_a_file_not_yet_added(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A new module is swept before it is added; what .gitignore names is not.
+
+    Listing only tracked files let a file that builds Chroma inline pass every
+    local run until someone happened to `git add` it.
+
+    Git's per-repository variables are cleared first. A hook that runs the suite
+    inherits GIT_INDEX_FILE -- and, in a linked worktree, GIT_DIR -- naming the
+    real repository, and this test's `git add` would stage into it.
+    """
+    local = subprocess.run(
+        ["git", "rev-parse", "--local-env-vars"],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=10,
+    )
+    for var in local.stdout.split():
+        monkeypatch.delenv(var, raising=False)
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True, timeout=10)
+    (tmp_path / ".gitignore").write_text("ignored/\n")
+    (tmp_path / "tracked.py").write_text("")
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "add", "tracked.py"], check=True, timeout=10
+    )
+    (tmp_path / "new.py").write_text("")
+    (tmp_path / "ignored").mkdir()
+    (tmp_path / "ignored" / "vendored.py").write_text("")
+
+    assert swept_python_files(tmp_path) == ["new.py", "tracked.py"]
 
 
 # --- the rules themselves, in-process ----------------------------------------

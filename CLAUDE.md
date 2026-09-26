@@ -594,10 +594,11 @@ because they are only observable at the frontend:
 ## Enforcing the invariants
 
 The text-level rules live in `tests/invariants.py` as data, and
-`tests/test_invariants.py` enforces them across every tracked `.py` file.
-**That test is the enforcement** — it runs in CI, for every contributor and
-every PR from a fork, whoever wrote the code and whatever editor they used.
-There is no second layer, and nothing here depends on which editor you use.
+`tests/test_invariants.py` enforces them across every `.py` file git does not
+ignore, whether or not it has been added yet. **That test is the
+enforcement** — it runs in CI, for every contributor and every PR from a fork,
+whoever wrote the code and whatever editor they used. There is no second layer,
+and nothing here depends on which editor you use.
 
 Adding a rule means adding a `Rule` to `RULES`, a case in each direction in
 `test_invariants.py`, and a row in the README rule table —

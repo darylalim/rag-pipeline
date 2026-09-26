@@ -1,9 +1,9 @@
 """The invariants from CLAUDE.md that are properties of source *text*.
 
-``test_invariants.py`` sweeps every tracked ``.py`` file against :data:`RULES`,
-so a violation fails in CI for every contributor and every PR from a fork,
-whoever wrote the code and whatever editor they used. That sweep is the whole
-enforcement; there is no second layer.
+``test_invariants.py`` sweeps every ``.py`` file git does not ignore against
+:data:`RULES`, so a violation fails in CI for every contributor and every PR
+from a fork, whoever wrote the code and whatever editor they used. That sweep
+is the whole enforcement; there is no second layer.
 
 A rule belongs here only when nothing better is available. An invariant that can
 be *observed* belongs in an ordinary test instead, because asserting what the

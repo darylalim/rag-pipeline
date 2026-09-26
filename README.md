@@ -504,7 +504,7 @@ reads and deletes).
 A few of this project's rules are properties of the source *text* rather than of
 its behavior — they say some call never happens, so there is nothing to observe.
 Those live as data in `tests/invariants.py`, and `tests/test_invariants.py`
-enforces them across every tracked `.py` file:
+enforces them across every `.py` file git does not ignore, added or not:
 
 | Rule                 | Forbids                                                        | Why |
 | -------------------- | -------------------------------------------------------------- | --- |
