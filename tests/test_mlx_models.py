@@ -803,13 +803,37 @@ def test_the_answer_streams_in_pieces_through_a_prompt_chain(fake_mlx, model_dir
     assert pieces == ["Chunks ", "overlap ", "to keep context."]
 
 
-def test_invoke_joins_the_stream_and_reports_why_it_stopped(fake_mlx, model_dir):
+@pytest.mark.parametrize(
+    ("finish", "flush", "content", "tokens"),
+    [
+        # The usual end: the EOS arrives after the text, in a response of its
+        # own with none, and is counted.
+        pytest.param("stop", "", "Chunks overlap.", 3, id="stop"),
+        # A trailing space is held back until the detokenizer sees what follows,
+        # so the stop's own response carries it.
+        pytest.param("stop", " ", "Chunks overlap. ", 3, id="stop-with-flush"),
+        # Cut off: the last token is decoded, then the loop ends on the count.
+        pytest.param("length", "", "Chunks overlap.", 2, id="length"),
+    ],
+)
+def test_invoke_joins_the_stream_and_reports_why_it_stopped(
+    fake_mlx, model_dir, finish, flush, content, tokens
+):
+    """Why generation ended, and what it cost, come from mlx-lm's final response.
+
+    That response usually has no text, so an adapter that looked only at the
+    responses that do would report every normal answer as ended for no reason,
+    with its EOS uncounted.
+    """
+    fake_mlx.finish_reason = finish
+    fake_mlx.stop_flush = flush
+
     message = _chat(model_dir).invoke("why?")
 
-    assert message.content == "Chunks overlap."
-    assert message.response_metadata["finish_reason"] == "stop"
+    assert message.content == content
+    assert message.response_metadata["finish_reason"] == finish
     assert message.usage_metadata is not None
-    assert message.usage_metadata["output_tokens"] == 2
+    assert message.usage_metadata["output_tokens"] == tokens
 
 
 def test_message_roles_map_to_the_chat_template(fake_mlx, model_dir):

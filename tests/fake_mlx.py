@@ -123,6 +123,11 @@ class FakeMLX:
     load_delay: float = 0.0
     pieces: list[str] = field(default_factory=lambda: ["Chunks ", "overlap."])
     finish_reason: str = "stop"
+    # What mlx-lm's detokenizer still holds when an EOS ends the answer, and its
+    # final response flushes. Usually nothing: it releases text as each token
+    # completes it, keeping back only a lone space or an unfinished UTF-8 byte
+    # sequence until it knows what follows.
+    stop_flush: str = ""
     stream_error: BaseException | None = None
     on_piece: Callable[[int], None] | None = None
     generate_calls: list[tuple[Any, dict[str, Any]]] = field(default_factory=list)
@@ -140,18 +145,30 @@ class FakeMLX:
         return self.load_result or (FakeModel(), self.tokenizer)
 
     def stream_generate(self, _model: Any, _tokenizer: Any, prompt: Any, **kwargs: Any):
+        """A response per piece, then the one that says why it ended, as mlx-lm's.
+
+        mlx-lm checks each token for EOS before decoding it, so an answer that
+        stops on its own has yielded all its text by the time the final response
+        comes: that one carries ``finish_reason``, whatever the detokenizer still
+        held (``stop_flush``), and a token count that includes the EOS. At
+        ``max_tokens`` the last token is decoded first, so the final response
+        carries the last piece itself. A ``stream_error`` ends the stream after
+        the pieces with no final response, as a failure in the token loop does.
+        """
         self.generate_calls.append((prompt, kwargs))
+        cut_off = self.finish_reason == "length" and self.stream_error is None
         try:
             for i, text in enumerate(self.pieces):
                 if self.on_piece is not None:
                     self.on_piece(i)
-                done = i == len(self.pieces) - 1 and self.stream_error is None
                 self.pieces_generated += 1
-                yield Response(
-                    text, self.finish_reason if done else None, len(prompt), i + 1
-                )
+                if cut_off and i == len(self.pieces) - 1:
+                    yield Response(text, "length", len(prompt), i + 1)
+                    return
+                yield Response(text, None, len(prompt), i + 1)
             if self.stream_error is not None:
                 raise self.stream_error
+            yield Response(self.stop_flush, "stop", len(prompt), len(self.pieces) + 1)
         finally:
             self.streams_closed += 1
             self.lock_held_at_close.append(mlx_models._GENERATION_LOCK.locked())

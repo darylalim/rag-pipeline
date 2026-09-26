@@ -324,6 +324,32 @@ def test_the_chat_model_declines_what_the_context_does_not_say(chat):
     )
 
 
+def test_the_chat_model_reports_why_it_stopped(chat):
+    """The metadata the MAX_TOKENS note is read from, as mlx-lm really sends it.
+
+    The pipeline says an answer was cut off only when the model reports
+    "length", and the fake that CI runs against cannot follow mlx-lm: were an
+    upgrade to rename that value or move it, the note would vanish with every
+    other test still green. An answer that fits must stop on its own, and one
+    given four tokens must be cut off at exactly four.
+    """
+    prompt = _PROMPT.invoke(
+        {
+            "context": _CONTEXT,
+            "question": "How many characters does chunk overlap repeat?",
+        }
+    )
+    finished = chat.invoke(prompt)
+    cut_off = MLXChatModel(model_id=_DEFAULTS.chat_model, max_tokens=4).invoke(prompt)
+
+    assert finished.response_metadata["finish_reason"] == "stop"
+    assert finished.usage_metadata is not None
+    assert 0 < finished.usage_metadata["output_tokens"] < chat.max_tokens
+    assert cut_off.response_metadata["finish_reason"] == "length"
+    assert cut_off.usage_metadata is not None
+    assert cut_off.usage_metadata["output_tokens"] == 4
+
+
 # --- the whole pipeline -------------------------------------------------------
 
 
