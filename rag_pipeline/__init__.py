@@ -25,5 +25,3 @@ import os
 # entry point imports before anything touches langchain; setdefault, so an
 # explicit value wins.
 os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
-
-__version__ = "0.1.0"
