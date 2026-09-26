@@ -12,10 +12,10 @@ frontends catch, and here is where it becomes an exit code and a one-line
 message instead of a traceback -- so each member is exercised through the real
 command rather than trusted to stay caught.
 
-Wired through the same seam as `test_app.py`: `cli.py` builds its own Settings
-from the environment and reaches models only through the three factories, so
-setting the environment and patching the factories keeps these tests inside the
-suite's no-real-model guarantee.
+Wired through the same seam as `test_streamlit_app.py`: `cli.py` builds its
+own Settings from the environment and reaches models only through the three
+factories, so setting the environment and patching the factories keeps these
+tests inside the suite's no-real-model guarantee.
 """
 
 from __future__ import annotations

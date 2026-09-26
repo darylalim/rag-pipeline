@@ -291,7 +291,7 @@ Callers (`grep reset_store_cache`):
   reset in `load_pipeline`, so this is the one that covers it.)
 - `tests/conftest.py` calls it autouse at every test boundary.
 - `test_ingest.py`, `test_pipeline.py`, `test_cli.py` and `test_models_live.py`
-  call it directly between ingests to emulate a fresh CLI process (`test_app.py`
+  call it directly between ingests to emulate a fresh CLI process (`test_streamlit_app.py`
   only wraps it, to count the app's resets).
 
 Every construction (`_client()`) and every clear (`reset_store_cache()`) holds
@@ -428,7 +428,7 @@ fakes at all, not just inconsistently. `st.cache_resource` is cleared per test,
 since its key deliberately ignores `_settings` and would otherwise serve one
 test's pipeline to the next.
 
-What `test_app.py` is *for* is the set of guarantees no lower-level test can see,
+What `test_streamlit_app.py` is *for* is the set of guarantees no lower-level test can see,
 because they are only observable at the frontend:
 
 - A chat turn is stored as a user/assistant **pair** whatever happens to it —
@@ -492,7 +492,7 @@ because they are only observable at the frontend:
   numpy's second attempt is a `RecursionError` — and a library's message need
   not name its variable. Only a fresh interpreter shows any of this — the suite
   imports all of it before its first test — so
-  `test_a_variable_refused_at_import_*`, in `test_app.py` and `test_cli.py`, run
+  `test_a_variable_refused_at_import_*`, in `test_streamlit_app.py` and `test_cli.py`, run
   the frontends through conftest's `fresh_interpreter`.
 - MLX is **macOS-only**: `mlx` and `mlx-lm` are declared
   `; sys_platform == 'darwin'`, so the Linux CI legs never install them. Every
@@ -580,7 +580,7 @@ behavior is:
 | `ingest()` never deletes documents it did not write | `test_ingest_preserves_foreign_documents_in_a_shared_collection` — a foreign doc survives a rebuild that deletes |
 | a stopped answer releases the generation lock, and its turn is still stored | `test_a_real_stop_releases_the_model_and_keeps_the_turn` — Stop as Streamlit delivers it, garbage collector off, real `MLXChatModel` over a fake MLX |
 | no test loads a real model | conftest's `_no_real_models`, pinned by `tests/test_offline_guard.py` |
-| a question is one trace, ended however the question ends (answered, failed, stopped, closed unread) | `tests/test_tracing.py`, plus `test_a_stop_during_retrieval_still_sends_the_questions_trace` in `test_app.py` |
+| a question is one trace, ended however the question ends (answered, failed, stopped, closed unread) | `tests/test_tracing.py`, plus `test_a_stop_during_retrieval_still_sends_the_questions_trace` in `test_streamlit_app.py` |
 | no test leaves tracing on | conftest's `_no_tracer_left_on`, after every test |
 | secrets (`.env`, `.env.*`, `.streamlit/secrets.toml`), the user's documents in `data/`, coverage's parallel data files and Claude Code worktrees stay out of git; `.env.example` and the three samples stay addable | `test_gitignore_keeps_secrets_and_your_documents_out_of_git` — the repo's `.gitignore` in a scratch repository made with no template, global excludes off |
 | the adapters implement their models' official recipes | `tests/test_models_live.py` (`-m models`, by hand on a Mac) — reproduces the model cards' published scores |

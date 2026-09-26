@@ -2,7 +2,7 @@
 
 The test machinery, loaded when work touches `tests/`. The rules it serves are in
 the root `CLAUDE.md`: production passes no models and tests inject fakes, what
-`test_app.py` is there to guarantee, and which test enforces which invariant.
+`test_streamlit_app.py` is there to guarantee, and which test enforces which invariant.
 
 ## Fixtures to take rather than rebuild (`conftest.py`)
 
