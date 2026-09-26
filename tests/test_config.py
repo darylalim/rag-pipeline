@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import dataclasses
+import json
 import os
 from pathlib import Path
 
@@ -15,29 +15,35 @@ from rag_pipeline.config import ENV_VARS, Settings
 # directory it is run from.
 _ROOT = Path(__file__).resolve().parents[1]
 
-# Every field, so a setting added without a default here fails `test_defaults`
-# rather than going untested.
-_DEFAULTS = {
-    "data_dir": _ROOT / "data",
-    "persist_dir": _ROOT / "chroma_db",
-    "collection_name": "rag_docs",
-    "embedding_model": "mlx-community/Qwen3-VL-Embedding-2B-bf16",
-    "embedding_dimensions": 2048,
-    "chat_model": "mlx-community/Qwen3.8-27B-4bit",
-    "max_tokens": 1024,
-    "chunk_size": 1000,
-    "chunk_overlap": 200,
-    "retrieval_k": 4,
-    "fetch_k": 20,
-    "rerank_model": "mlx-community/Qwen3-VL-Reranker-2B-bf16",
+
+def test_defaults(fresh_interpreter):
+    """The defaults that are properties rather than choices.
+
+    Each default is declared once, in config.py, and
+    `test_every_setting_is_documented` holds the README and .env.example to it,
+    so a default changed without its documentation already fails. A copy of
+    every value here was a fourth place to change one, which the three-file
+    recipe for a setting does not name. What stays pinned is what the documents
+    cannot show: that the paths are anchored to this checkout at run time (they
+    document `./data`), and that tracing starts off.
+
+    The paths are read in an interpreter started in another directory: this one
+    runs from the checkout, where paths anchored to the working directory would
+    come out the same.
+    """
+    result = fresh_interpreter(
+        "import json\n"
+        "from rag_pipeline.config import Settings\n"
+        "print(json.dumps([str(Settings().data_dir), str(Settings().persist_dir)]))\n"
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.splitlines()[-1]) == [
+        str(_ROOT / "data"),
+        str(_ROOT / "chroma_db"),
+    ]
     # Empty: tracing is off unless asked for, so a fresh checkout sends nothing.
-    "phoenix_collector_endpoint": "",
-    "phoenix_project": "rag-pipeline",
-}
-
-
-def test_defaults():
-    assert dataclasses.asdict(Settings()) == _DEFAULTS
+    assert Settings().phoenix_collector_endpoint == ""
 
 
 def test_from_env_overrides(monkeypatch, tmp_path):
@@ -138,7 +144,7 @@ def test_from_env_uses_defaults_when_unset(monkeypatch):
     for var in ENV_VARS:
         monkeypatch.delenv(var, raising=False)
 
-    assert dataclasses.asdict(Settings.from_env()) == _DEFAULTS
+    assert Settings.from_env() == Settings()
 
 
 def test_from_env_empty_string_falls_back_to_default(monkeypatch):
@@ -147,7 +153,7 @@ def test_from_env_empty_string_falls_back_to_default(monkeypatch):
     for var in ENV_VARS:
         monkeypatch.setenv(var, "")
 
-    assert dataclasses.asdict(Settings.from_env()) == _DEFAULTS
+    assert Settings.from_env() == Settings()
 
 
 def test_env_vars_are_exactly_what_from_env_reads(monkeypatch):
