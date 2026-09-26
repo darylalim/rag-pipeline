@@ -8,6 +8,8 @@ Mac. Documents are embedded with **Qwen3-VL-Embedding**, stored and searched in
 [MLX](https://github.com/ml-explore/mlx). It ships with a reusable core library,
 a CLI, and a Streamlit chat app — all sharing the same code.
 
+![The Streamlit chat app answering a question from the sample documents, citing its source, with the active models in the sidebar](docs/chat-app.png)
+
 ```
 Ingest (once):   data/ ──load──▶ split ──embed──▶ store (Chroma, on disk)
 Query (per Q):   question ──embed──▶ search ──rerank──▶ [top-k chunks + question] ──▶ local LLM ──▶ grounded answer + sources
@@ -136,6 +138,8 @@ A browser chat UI over the same pipeline, streaming each answer token by token,
 with a sidebar showing the active configuration and a per-answer panel of the
 retrieved passages themselves — so a claim can be checked against the text it
 was generated from, not just against a filename.
+
+![An answer with its retrieved passages open: the first passage holds the sentence the answer paraphrases](docs/retrieved-passages.png)
 
 Only this machine can reach it. Streamlit otherwise listens on every network
 interface, and the app has no login: anyone on your network could ask it about
@@ -488,6 +492,7 @@ streamlit_app.py Streamlit chat UI
 .streamlit/      config.toml: usage statistics, email prompt and file watcher off, loopback only
 data/            sample documents; add your own (git-ignored)
 chroma_db/       the index, created by rag ingest (git-ignored)
+docs/            the README's screenshots
 ```
 
 ## How it works
