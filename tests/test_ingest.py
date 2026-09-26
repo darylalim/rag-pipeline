@@ -280,6 +280,52 @@ def test_save_upload_replaces_a_file_of_the_same_name(tmp_path):
     assert len(list(root.iterdir())) == 1
 
 
+def test_save_upload_returns_the_name_the_loader_will_report(tmp_path):
+    """The name returned is the file's `source`, even when the disk chose it.
+
+    macOS's default volume matches names regardless of case, so `Notes.md`
+    uploaded beside `notes.md` replaces that file and keeps its spelling. The
+    app looks the returned name up among the index's sources to decide whether
+    an upload was indexed, and given the upload's own spelling it reported a
+    file it had just indexed as one with no text. Only a case-insensitive
+    volume -- the Mac the app runs on -- can show that; on a case-sensitive one
+    the two names are two files, and the same contract holds.
+
+    The hard link is that file under another name, one sorting first and never
+    a source: found by what the file is, it could be returned in its place.
+    """
+    root = tmp_path / "data"
+    root.mkdir()
+    (root / "notes.md").write_bytes(b"first version")
+    os.link(root / "notes.md", root / "a-backup")
+
+    name = ingest_mod.save_upload(root, "Notes.md", b"second version")
+
+    docs = ingest_mod.load_documents(root)
+    sources = {d.metadata["source"]: d.page_content for d in docs}
+    assert name in sources, f"{name!r} is not among the sources {sorted(sources)}"
+    assert sources[name] == "second version"
+
+
+def test_an_uppercase_suffix_is_accepted_and_read(tmp_path):
+    """`NOTES.MD` and `SCAN.PDF` are how some tools and scanners name files.
+
+    The suffix is matched regardless of case both where an upload is accepted
+    and where the loader walks `data_dir`: accepted at one and skipped at the
+    other, a file would be saved and then never indexed, with nothing said.
+    """
+    root = tmp_path / "data"
+
+    ingest_mod.save_upload(root, "NOTES.MD", b"Notes under an uppercase suffix.")
+    ingest_mod.save_upload(root, "SCAN.PDF", minimal_pdf(["A scan, uppercase suffix"]))
+
+    docs = ingest_mod.load_documents(root)
+    sources = {d.metadata["source"]: d.page_content for d in docs}
+    assert sorted(sources) == ["NOTES.MD", "SCAN.PDF"]
+    assert "uppercase suffix" in sources["NOTES.MD"]
+    assert "uppercase suffix" in sources["SCAN.PDF"]
+
+
 def test_save_upload_writes_bytes_unchanged(tmp_path):
     """A PDF is binary, so the bytes must survive verbatim.
 

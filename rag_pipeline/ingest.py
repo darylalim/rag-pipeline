@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import hashlib
 import io
+import os
 import sys
 import threading
+import unicodedata
 from collections import Counter, defaultdict
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -401,6 +403,14 @@ def save_upload(data_dir: Path, filename: str, data: bytes) -> str:
     ``.pdf`` is binary, and a mis-encoded ``.txt`` should meet the same warn-and
     -skip path in ``load_documents`` that one copied in by hand does.
 
+    The name returned is the one the directory holds, which is not always the
+    one uploaded: macOS's default volume matches names regardless of case (and
+    of Unicode normalization), so ``Notes.md`` uploaded beside ``notes.md``
+    replaces that file and keeps *its* spelling. That spelling is the ``source``
+    the loader reports, and the app decides whether an upload was indexed by
+    finding its name among the sources -- given the upload's own, it reported a
+    file it had just indexed as one with no text.
+
     Raises ``ValueError`` for a name this pipeline cannot index, which is inside
     the union both frontends already catch.
     """
@@ -419,8 +429,30 @@ def save_upload(data_dir: Path, filename: str, data: bytes) -> str:
     # Created here so an upload can bootstrap an empty checkout, rather than
     # failing on the one path where the app has nothing else to offer.
     data_dir.mkdir(parents=True, exist_ok=True)
-    (data_dir / name).write_bytes(data)
-    return name
+    target = data_dir / name
+    target.write_bytes(data)
+    entries = {entry.name for entry in data_dir.iterdir()}
+    if name in entries:
+        return name
+    # Found by what it is rather than by folding case, since which names the
+    # volume treats as one is its own rule; lstat, so a symlink to the file is
+    # not mistaken for it. A hard link *is* the file, under another name, so the
+    # names that fold to the upload's are tried first.
+    written = target.lstat()
+    folded = _fold(name)
+    return next(
+        (
+            entry
+            for entry in sorted(entries, key=lambda e: (_fold(e) != folded, e))
+            if os.path.samestat((data_dir / entry).lstat(), written)
+        ),
+        name,
+    )
+
+
+def _fold(name: str) -> str:
+    """A name as a case- and normalization-insensitive volume would compare it."""
+    return unicodedata.normalize("NFD", name).casefold()
 
 
 def load_documents(data_dir: Path) -> list[Document]:
