@@ -136,11 +136,21 @@ patch = ["subprocess"]
 # these families: pycodestyle and Pyflakes (E, W, F), import sorting (I), 3.11+
 # idioms (UP), likely-bug patterns (B), simplifications (SIM), comprehensions
 # (C4), pytest style (PT) -- which is what caught the over-broad
-# `pytest.raises` in test_ingest.py -- and ruff's own rules (RUF).
-extend-select = ["E", "W", "F", "I", "UP", "B", "SIM", "C4", "PT", "RUF"]
+# `pytest.raises` in test_ingest.py -- ruff's own rules (RUF), and bandit's
+# security checks (S): pickle, `yaml.load`, `shell=True`, `verify=False`,
+# `eval`, a server bound to every interface, an HTTP call with no timeout.
+extend-select = ["E", "W", "F", "I", "UP", "B", "SIM", "C4", "PT", "RUF", "S"]
 # E501 is the formatter's job; leaving it on would double-report every long line
 # and fight `ruff format` over strings and comments it can't split.
-ignore = ["E501"]
+# S105-S107 take any string given to a name like `token` for a password, and in
+# a model adapter a token is the tokenizer's (`_EMBED_TOKEN`). No setting here
+# is a secret; GitHub's push protection and .gitignore keep real ones out.
+ignore = ["E501", "S105", "S106", "S107"]
+
+[tool.ruff.lint.per-file-ignores]
+# In tests `assert` is how pytest checks (S101), and the subprocesses -- git in a
+# scratch repository, a fresh interpreter -- run a fixed argv (S603, S607).
+"tests/**" = ["S101", "S603", "S607"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["rag_pipeline"]

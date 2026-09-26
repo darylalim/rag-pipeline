@@ -53,7 +53,10 @@ Lint runs ruff's own default rule set plus the families pyproject's
 it), and the tree is clean against it. **Fix findings rather than suppressing
 them** — no `# noqa`, `# ty: ignore`, `# type: ignore`, or any other form ruff
 or ty honours in source. The README's rule table lists them all, and
-`no-suppressions` rejects them. Prefer `uv run ruff`/`uv run ty` over `uvx`, so
+`no-suppressions` rejects them. A rule that does not fit a whole scope (pytest's
+`assert` in `tests/`, bandit's password-name heuristics where a token is the
+tokenizer's) is switched off in pyproject's `ignore` or `per-file-ignores`,
+with its reason beside it — never at the line. Prefer `uv run ruff`/`uv run ty` over `uvx`, so
 versions match the lock. Ruff's line length and ty's target version are both
 inherited (from the default and from `requires-python`) — don't re-pin them in
 `pyproject.toml`.
