@@ -10,6 +10,7 @@ uvx --from huggingface_hub hf download <model id>   # once per model (README Set
 uv run rag ingest                    # embed data/ into the Chroma collection under chroma_db/
 uv run rag query "your question"     # ask from the terminal (loads all three models first)
 uv run streamlit run app.py          # chat UI over the same pipeline
+uv run streamlit run app.py --server.fileWatcherType auto   # while editing app.py (config.toml turns the watcher off)
 uv run pytest                        # full suite (fakes + in-process Chroma; no models, network, Docker or secrets)
 uv run pytest -m models              # live tests against the real models (Apple Silicon + models downloaded; ~1 min)
 uv run pytest tests/test_config.py::test_defaults   # single test
@@ -18,7 +19,8 @@ uv run pytest --cov=rag_pipeline --cov=app --cov-report=term-missing   # coverag
 uv run ruff check --fix . && uv run ruff format .   # lint, then format (order matters)
 uv run ty check                      # type check
 uv sync --locked && uv run ruff check . && uv run ruff format --check . && uv run ty check && uv run pytest   # every check CI runs
-uv version --bump minor              # release: commit pyproject.toml + uv.lock, push to main; CI tags and publishes it
+actionlint .github/workflows/ci.yml  # after editing ci.yml (Homebrew's, with shellcheck on PATH for the run: scripts)
+uv version --bump minor              # release: commit pyproject.toml + uv.lock, push to main; CI tags it and makes a GitHub release (nothing goes to PyPI)
 ```
 
 When working with Python, invoke the relevant `/astral:<skill>` — `/astral:uv`,
@@ -65,6 +67,8 @@ inherited (from the default and from `requires-python`) — don't re-pin them in
 `README.md` covers setup, configuration variables, usage, performance, and what
 CI runs; `ci.yml`'s own comments cover why it is configured as it is. Consult
 both rather than duplicating that material here. Every CI job must stay green.
+CI does not lint its own workflow, and the release job runs only on a push to
+main, so a broken step in it is first seen there — hence `actionlint` above.
 
 ## Architecture
 
@@ -91,9 +95,10 @@ All tunables live here — never inline a literal at a call site. Adding one is 
 2. a commented default in `.env.example`,
 3. a row in the README config table.
 
-Leaving either of the latter two stale is a bug, and nothing else in the repo
-catches it — `ruff`, `ty` and the full suite are all green against a stale
-README. `test_every_setting_is_documented` is what catches it.
+Leaving either of the latter two stale is a bug that only
+`test_every_setting_is_documented` catches (documented defaults included):
+`ruff`, `ty` and the rest of the suite stay green against a stale
+`.env.example` or README.
 
 There is no fourth site. `config.ENV_VARS` derives every variable name from the
 dataclass fields, and `tests/test_config.py` clears *that* rather than a
@@ -111,8 +116,9 @@ also invalidate every stored vector without changing the fingerprint.
 
 ### Why the store factories live in `ingest.py`
 
-`build_embeddings()` and `open_store()` are defined in `ingest.py` and imported
-*by* `pipeline.py`, not the reverse. This is deliberate: vectors from different
+`build_embeddings()` and `open_store()` are defined in `ingest.py`; `pipeline.py`
+imports `open_store()`, never the reverse, and reaches `build_embeddings()` only
+through it. This is deliberate: vectors from different
 embedding models are not comparable, and the store's identity is (persist
 directory, collection name, embedding function). Indexing and querying must
 therefore go through one factory each. **Never construct `Chroma(...)`,
@@ -184,8 +190,8 @@ the button does, with the garbage collector off, over the real `MLXChatModel`.
 
 MLX itself is reached only in a few thin methods (`_pool`, `_forward`, the
 generation loop, `_release_buffers`), so prompts, truncation, batching, ordering,
-locking and error translation are all unit-tested in CI with a fake `mlx_lm`
-(`test_mlx_models.py`). Whether the recipe is *right* is another matter: a
+locking and error translation are all unit-tested in CI (`test_mlx_models.py`,
+over the shared fake MLX stack in `tests/fake_mlx.py`). Whether the recipe is *right* is another matter: a
 subtly wrong prompt or pooling step still yields plausible vectors and
 sensible-looking rankings. Only `tests/test_models_live.py` (`-m models`) notices,
 by reproducing the model cards' published scores — run it after touching an
@@ -203,41 +209,31 @@ a no-op until a provider exists, and `tracing.setup_tracing()` installs one.
 load the tracing stack and start an idle exporter thread), and `app.py` on every
 rerun, inside the pipeline-load `try`; it is once per process, guarded by the
 instrumentor's own state under a lock (`test_concurrent_first_setups_install_once`).
-Like the adapters, it raises only `RuntimeError`, because of where the app calls
-it: the SDK logs most malformed `OTEL_*` variables and falls back to a default,
-but refuses a malformed span limit or an out-of-range batch setting with a
-builtins `ValueError` (before OpenTelemetry 1.45, an unknown compression or an
-out-of-range sampler ratio too), and the exporter refuses a credential provider
-that is not installed with a `RuntimeError` that names no variable.
-`setup_tracing` catches either and raises, in its place, a `RuntimeError` that
-points at the `OTEL_*` variables. It installs nothing until everything is built,
-and shuts down a provider already built when the failure comes — left
-registered, its exit hook would keep it alive until the process ends, one more
-per failed rerun (`test_a_malformed_otel_variable_is_a_runtime_error_that_installs_nothing`
-watches `atexit` for it). Its imports are lazy, so tracing off loads none of the
-instrumentation or exporter (`test_tracing_off_loads_none_of_the_tracing_stack`,
-which takes the frontends' path: import, then `setup_tracing(Settings())`).
+Like the adapters, it raises only `RuntimeError`, because the app calls it on
+the pipeline-load path: the builtins `ValueError` a malformed `OTEL_*` variable
+can cause, and the exporter's `RuntimeError` for a credential provider that is
+not installed, become one `RuntimeError` pointing at the `OTEL_*` variables. It
+installs nothing until everything is built, and shuts down a provider already
+built when the failure comes, or each failed rerun would leave one more exit
+hook (`test_a_malformed_otel_variable_is_a_runtime_error_that_installs_nothing`
+watches `atexit`). Its imports are lazy, so tracing off loads none of the stack
+(`test_tracing_off_loads_none_of_the_tracing_stack`, which takes the frontends'
+path: import, then `setup_tracing(Settings())`).
 
 `setup_tracing` assembles the provider from OpenTelemetry's parts, **not
-`phoenix.otel.register()`**, whose shortcuts are traps here. Given a base URL,
-`register()` posts to it as-is, Phoenix answers 405, and `force_flush()` still
-returns True. So `traces_url()` always appends `/v1/traces`. Left to infer a
-protocol, `register()` picks gRPC, which also bypasses `_offline` (grpc's C
-core). It cannot set the exporter timeout. And it reads `PHOENIX_*` variables
-and `.env.phoenix` files that `Settings` does not know about.
-
-Each choice in `setup_tracing` is measured:
-
-- `BatchSpanProcessor`: a simple processor exports inside `span.end()`, so with
-  Phoenix down each span waits out the exporter's retries: about 7 s at the
-  default timeout, still about 1 s at 2 s.
-- `_EXPORT_TIMEOUT_S = 2`: that timeout is all that bounds the exit flush (about
-  7 s at the default 10 s, about 1 s at 2 s). `force_flush(timeout)` and
-  `OTEL_BSP_EXPORT_TIMEOUT` are ignored.
-- OpenInference's `TracerProvider`: the SDK's keeps only 128 attributes per span.
-  A reranker span carries three per candidate and four per kept passage (80 at
-  the defaults), so from a `FETCH_K` of about 37 the SDK's would silently cut
-  it.
+`phoenix.otel.register()`**, whose shortcuts are traps here — `tracing.py`'s
+module docstring lists them (a base URL posted to as-is, whose 405
+`force_flush()` reports as success; gRPC, whose sockets `_offline` cannot see;
+no exporter timeout; `PHOENIX_*`/`.env.phoenix` that `Settings` does not know).
+So `traces_url()` always builds the collector URL: it appends `/v1/traces` to a
+base URL, keeping a path prefix for a reverse proxy, and leaves an endpoint that
+already ends in it as is. The `BatchSpanProcessor`, `_EXPORT_TIMEOUT_S = 2` and
+OpenInference's `TracerProvider` (the SDK's caps a span at 128 attributes, which
+a reranker span passes from a `FETCH_K` of about 37) are each justified in the
+comments beside them, and
+`test_with_phoenix_down_questions_do_not_wait_and_exit_waits_briefly` measures
+what batching and the timeout buy. The exporter timeout is the only bound on the exit flush:
+`force_flush(timeout)` and `OTEL_BSP_EXPORT_TIMEOUT` are ignored.
 
 A question is one trace, and every path out of it ends the root span:
 
@@ -294,18 +290,15 @@ Callers (`grep reset_store_cache`):
   every filtered one. (The app's upload ingest runs in the sidebar, above the
   reset in `load_pipeline`, so this is the one that covers it.)
 - `tests/conftest.py` calls it autouse at every test boundary.
-- `test_ingest.py`, `test_pipeline.py` and `test_cli.py` call it directly
-  between ingests to emulate a fresh CLI process.
+- `test_ingest.py`, `test_pipeline.py`, `test_cli.py` and `test_models_live.py`
+  call it directly between ingests to emulate a fresh CLI process (`test_app.py`
+  only wraps it, to count the app's resets).
 
-chromadb's System cache is a class-level dict with no lock of its own, and a
-client's construction inserts a System, starts it, then reads it back. So every
-construction (`_client()`) and every clear (`reset_store_cache()`) shares one
-module lock, `_system_cache_lock`: without it one Streamlit session's rebuild,
-landing inside another session's client open, surfaced there as a builtins
-`KeyError`/`AttributeError`. And `_client()` empties the cache when an open
-fails — chromadb caches a System *before* starting it, so one whose start failed
-(a corrupt `chroma.sqlite3`) would otherwise be handed, half-built, to the next
-open, whose cleanup raises a builtins `AttributeError`.
+Every construction (`_client()`) and every clear (`reset_store_cache()`) holds
+one module lock, `_system_cache_lock`, because chromadb's System cache has none
+of its own; and `_client()` empties that cache when an open fails, so a
+half-built System is never handed to the next open. The comment on the lock and
+`_client`'s docstring give the builtins errors each prevents — keep both.
 
 The Streamlit cache key is `index_version()` (a `str`) — a SHA-256 digest over
 the corpus fingerprints that `ingest()` stamps into the *collection metadata*
@@ -319,10 +312,8 @@ without a restart and an unchanged re-ingest does not needlessly bust the cache.
 differs — because a run that died after its writes but before the stamp leaves
 every source looking current, and a stamp written only "when something changed"
 would then never be repaired. It returns `""` when nothing has been ingested,
-and creates nothing: every read path checks `_has_store()` — for
-`chroma.sqlite3`, not merely the directory — before opening a client, which
-would create a database in whatever directory it is given. The app calls it on
-every rerun of a fresh checkout.
+and creates nothing (every read path checks `_has_store()` first; see Gotchas),
+which matters because the app calls it on every rerun of a fresh checkout.
 
 ### Ingest is incremental, and scoped — never a wholesale wipe
 
@@ -455,10 +446,12 @@ real models, are deselected by pyproject's `addopts = ["-m", "not models"]`, and
 run only with `uv run pytest -m models` (a later `-m` replaces the default). They
 skip rather than fail when MLX or a model is missing. CI never runs them.
 
-`app.py` takes no such parameters — it is a script, not a function — so
-`test_app.py` reaches the same seam through the factories instead, patching
+Neither frontend takes such parameters — `app.py` is a script, and `cli.py`
+builds its own `Settings.from_env()` — so conftest's `wired_env` is the seam for
+both: it exports the fixture settings through `ENV_VARS` and patches
 `ingest.build_embeddings`, `pipeline.build_chat_model`, and
-`pipeline.build_reranker` on their modules. That
+`pipeline.build_reranker` on their modules. A new frontend test takes it rather
+than copying it. That
 works only because all are looked up as module globals at call time, which is a
 second reason the never-construct-inline rule above is load-bearing: inline a
 `QwenVLEmbeddings(...)` anywhere and the frontend can no longer be driven with
@@ -550,27 +543,28 @@ because they are only observable at the frontend:
   filtering afterwards cannot work. mlx-lm's `stream_generate` also defaults to
   `max_tokens=256`, so it is passed explicitly.
 - Chroma creates `persist_dir`, and `chroma.sqlite3` in it, when a client opens,
-  so every read path checks `_has_store()` first; `get_collection` (never
-  `get_or_create`) on reads, so a query cannot conjure an empty collection.
+  so every read path checks `_has_store()` — for `chroma.sqlite3`, not merely
+  the directory — first; `get_collection` (never `get_or_create`) on reads, so a
+  query cannot conjure an empty collection.
   chromadb raises *builtins* `ValueError`/`TypeError` from its own argument
   checks — an empty `$in`, a one-clause `$and`, `hnsw:space` passed to
-  `modify`, a `None` metadata value, a search for fewer than one result (hence
-  `RAGPipeline`'s `FETCH_K` check) — which the code avoids by construction
-  rather than catching (catching `ValueError` would swallow ingest's own width
-  errors). `get(include=["embeddings"])` returns a numpy array: use `len()`,
+  `modify`, a `None` in a `where` filter, a search for fewer than one result
+  (hence `RAGPipeline`'s `FETCH_K` check) — which the code avoids by
+  construction rather than catching (catching `ValueError` would swallow
+  ingest's own width errors). A `None` metadata *value* is the silent case: a
+  raw `add` refuses it, but `upsert` — which `add_documents` uses — drops the
+  key, so a chunk whose `ingested_by` came out `None` would fall outside
+  `OWN_CHUNKS` for good. `get(include=["embeddings"])` returns a numpy array: use `len()`,
   never truthiness. `modify(metadata=)` *replaces* the dict, so
   `_write_index_version` merges the existing keys, minus `hnsw:*`.
 - The stale-view and concurrent-writer hazards above are Chroma's two sharp
   edges; both are silent until a later query, so don't remove
   `reset_store_cache()` from `load_pipeline` or from `ingest()`, or the ingest
   `FileLock`.
-- On a Mac, LangChain imports transformers (it arrives with mlx-lm, without
-  torch) as soon as the pipeline is imported — langchain-text-splitters, through
-  `ingest.py`, and before 1.6 langchain-core too — and transformers then prints
-  `PyTorch was not found. Models won't be available` — false here. mlx-lm
-  silences that for itself, but too late, so `rag_pipeline/__init__.py` sets
-  `TRANSFORMERS_NO_ADVISORY_WARNINGS` first. It must stay in the package
-  `__init__`, the earliest import on every entry point;
+- `rag_pipeline/__init__.py` sets `TRANSFORMERS_NO_ADVISORY_WARNINGS` before
+  anything imports LangChain, which on a Mac imports transformers (with mlx-lm,
+  without torch) and prints a false "PyTorch was not found". It must stay in the
+  package `__init__`, the earliest import on every entry point;
   `test_importing_the_pipeline_prints_no_pytorch_warning` checks it.
 - Phoenix's own clients read `PHOENIX_COLLECTOR_ENDPOINT` too, with different
   semantics: unset means `localhost:6006` to them and *off* here, and given no
@@ -584,17 +578,14 @@ because they are only observable at the frontend:
   by itself, uploading every run to LangSmith's cloud. The pipeline does not
   use it, and `_no_tracing` switches it off for tests only; the README and
   `.env.example` tell users with an old `.env` to delete it.
-- `.streamlit/config.toml` turns off Streamlit's usage statistics (its front end
-  would report to Streamlit) and its file watcher (which walks every loaded
-  module on every run and logs a traceback for each of transformers' lazy ones —
-  over a hundred a turn), and sets `server.address` to `127.0.0.1`. Unset,
-  Streamlit listens on every interface, putting the uploader — which writes into
-  `data/` — on the local network with no login; and a headless start then asks
-  checkip.amazonaws.com for the machine's external IP, to print it. It also
-  sets `server.showEmailPrompt` to `false`: a first start that is not headless
-  would otherwise ask for an email address in the terminal and post any address
-  typed to Streamlit. `test_the_app_config_keeps_streamlit_local_and_quiet`
-  pins all four.
+- `.streamlit/config.toml` keeps Streamlit local and quiet: usage statistics,
+  the first-run email prompt and the file watcher off, and `server.address =
+  127.0.0.1` (unset, the uploader — which writes into `data/` — is on the local
+  network with no login). Each setting's reason is beside it, and
+  `test_the_app_config_keeps_streamlit_local_and_quiet` pins all four. With the
+  watcher off an edit to `app.py` is not picked up at all — Rerun reuses the
+  compiled script until every tab has closed or the server restarts; see
+  Commands.
 
 ## Enforcing the invariants
 
@@ -642,9 +633,8 @@ behavior is:
 | secrets (`.env`, `.env.*`, `.streamlit/secrets.toml`), the user's documents in `data/`, coverage's parallel data files and Claude Code worktrees stay out of git; `.env.example` and the three samples stay addable | `test_gitignore_keeps_secrets_and_your_documents_out_of_git` — the repo's `.gitignore` in a scratch repository made with no template, global excludes off |
 | the adapters implement their models' official recipes | `tests/test_models_live.py` (`-m models`, by hand on a Mac) — reproduces the model cards' published scores |
 
-The cheap-imports, greedy-decoding and foreign-document rows replaced text rules
-(`lazy-cli-imports`, `no-sampling-params`, `no-rmtree`) and are each strictly
-stronger than the regex they retired.
+The cheap-imports, greedy-decoding and foreign-document rows each replaced a
+text rule and are strictly stronger than it: don't reintroduce one.
 
 ## Conventions
 
@@ -734,9 +724,14 @@ stronger than the regex they retired.
   It catches only `OSError | ValueError`: `_read_pdf` translates whatever pypdf
   raises on a malformed file — builtins errors included — into `ValueError`
   where pypdf runs, the adapters' pattern for their models. A new loader does
-  the same for its parser.
+  the same for its parser. A new file type is its suffix in `SUPPORTED_SUFFIXES`
+  (the uploader's accepted types derive from it) plus a branch in
+  `load_documents()`; README's two hand-written `.md`/`.txt`/`.pdf` lists (under
+  *Build the index* and *Add your own documents*) and the `data_dir` comment in
+  `config.py` need it too, and no test checks them.
 - Document `source` metadata (path relative to `data_dir`, POSIX-style) is what
   citations key off. Any new loader must set it. Chunk metadata is exactly
   `source`, `content_hash` and `ingested_by`, with `str`/`int`/`float`/`bool`
-  values only — Chroma rejects anything else.
+  values only. That limit is ours to keep, not Chroma's: it also stores lists,
+  and silently drops a key whose value is `None` (see Gotchas).
 - Module and function docstrings explain *why*, not what. Match that register.
