@@ -1188,6 +1188,40 @@ def test_an_ingest_never_writes_back_a_stale_view_of_the_index(
     assert sorted(doc.id or "" for doc in hits) == held
 
 
+@pytest.mark.parametrize(
+    "environment",
+    [
+        {
+            "CHROMA_API_IMPL": "chromadb.api.fastapi.FastAPI",
+            "CHROMA_SERVER_HOST": "127.0.0.1",
+            "CHROMA_SERVER_HTTP_PORT": "9",
+        },
+        {"CHROMA_API_IMPL": "no.such.Module"},
+        {"CHROMA_DB_IMPL": "duckdb+parquet"},
+        {"CHROMA_PRODUCT_TELEMETRY_IMPL": "no_such_module.Client"},
+    ],
+    ids=["a-server", "an-unknown-api", "a-legacy-backend", "a-missing-telemetry"],
+)
+def test_the_environment_cannot_move_or_break_the_store(
+    settings, fake_embeddings, monkeypatch, environment
+):
+    """chromadb reads which implementation to build from the environment.
+
+    CHROMA_* variables left over from another project would otherwise decide
+    what this pipeline's store is: an HTTP client aimed at a server -- every
+    chunk and question sent there, where _offline refuses the connection -- or
+    a class that does not import, a builtins error outside every union the
+    frontends catch. Pinned, the store is the one in persist_dir either way.
+    """
+    for name, value in environment.items():
+        monkeypatch.setenv(name, value)
+
+    indexed = ingest_mod.ingest(settings, embeddings=fake_embeddings)
+
+    assert (settings.persist_dir / "chroma.sqlite3").is_file()
+    assert len(own_ids(settings, fake_embeddings)) == indexed > 0
+
+
 @contextlib.contextmanager
 def _workers(count: int) -> Iterator[ThreadPoolExecutor]:
     """A thread pool whose exit does not wait for its workers.

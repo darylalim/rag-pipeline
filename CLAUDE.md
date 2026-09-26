@@ -120,7 +120,11 @@ with no embedding function (chromadb's default is an ONNX model it downloads on
 first use). `_client()` is the one `PersistentClient` construction, with a
 *fresh* `ChromaSettings(anonymized_telemetry=False)` each call: `PersistentClient`
 mutates the settings object it is handed, and two clients on one directory with
-unequal settings are a builtins `ValueError`.
+unequal settings are a builtins `ValueError`. Every `*_impl` field in it is
+pinned to chromadb's default (`_PINNED_IMPLS`, read from its model): chromadb
+otherwise takes them from the environment, where a stray `CHROMA_API_IMPL`
+turns the store into an HTTP client for whatever server `CHROMA_SERVER_HOST`
+names (`test_the_environment_cannot_move_or_break_the_store`).
 
 The reranker is the deliberate exception: `build_reranker()` lives in
 `pipeline.py`, not here. Reranking is query-only — it has no ingest-side

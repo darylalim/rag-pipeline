@@ -40,6 +40,20 @@ SUPPORTED_SUFFIXES = {".md", ".txt", ".pdf"}
 # lack the key: a scoped delete built on it removes other people's documents.
 OWN_CHUNKS: chromadb.Where = {"ingested_by": "rag-pipeline"}
 
+# The settings that choose which implementation chromadb builds for each part of
+# a client, pinned to chromadb's own defaults: the in-process store on SQLite.
+# Left to chromadb, each is read from the environment, where a CHROMA_API_IMPL
+# left over from another project swaps the store for an HTTP client -- every
+# ingest and question would then go to whatever server CHROMA_SERVER_HOST names
+# -- and one naming nothing importable fails as a builtins ValueError or
+# ImportError, outside every union the frontends catch. Read from chromadb's
+# model rather than listed here, so a field an upgrade adds is pinned too.
+_PINNED_IMPLS = {
+    name: field.default
+    for name, field in ChromaSettings.model_fields.items()
+    if name.endswith("_impl")
+}
+
 # The collection-metadata key holding the corpus digest (see index_version).
 # Metadata rather than a reserved record, because Chroma cannot store a record
 # without an embedding -- and one with a made-up vector could be retrieved.
@@ -85,7 +99,8 @@ def _client(settings: Settings) -> chromadb.ClientAPI:
     catch), which is what routing them all through here guarantees. The settings
     object is nonetheless new each call, because PersistentClient mutates the
     one it is handed. Telemetry is off so an in-process store has no reason to
-    reach the network.
+    reach the network, and ``_PINNED_IMPLS`` keeps it in-process whatever the
+    environment says.
 
     A failed open empties chromadb's cache before re-raising. chromadb caches a
     directory's System *before* starting it, so one whose start failed (a
@@ -101,7 +116,7 @@ def _client(settings: Settings) -> chromadb.ClientAPI:
         try:
             return chromadb.PersistentClient(
                 path=str(settings.persist_dir),
-                settings=ChromaSettings(anonymized_telemetry=False),
+                settings=ChromaSettings(anonymized_telemetry=False, **_PINNED_IMPLS),
             )
         except Exception:
             SharedSystemClient.clear_system_cache()
