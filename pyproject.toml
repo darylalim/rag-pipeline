@@ -103,6 +103,20 @@ testpaths = ["tests"]
 # a plain `uv run pytest` must never reach them. A later `-m` replaces this one,
 # which is how they are opted into: `uv run pytest -m models`.
 addopts = ["-m", "not models"]
+# An exception in a worker thread, or one Python can only report rather than
+# raise (in a finalizer, or a generator's cleanup), is a pytest *warning* by
+# default: a lock test passed with five of its six workers crashed. These two
+# categories only -- a blanket "error" would tie the suite to every
+# dependency's deprecation schedule.
+filterwarnings = [
+    "error::pytest.PytestUnhandledThreadExceptionWarning",
+    "error::pytest.PytestUnraisableExceptionWarning",
+]
+# A test still running after this many seconds has every thread's stack dumped
+# into the output, naming where it is stuck; the test is not failed for it.
+# Well above the suite's own bounds (60s on a lock, 120s on a child
+# interpreter), so a dump means a hang rather than a slow wait.
+faulthandler_timeout = 300
 markers = [
     "models: loads the real local MLX models (opt in with `-m models`; needs Apple Silicon and the models in the HF cache)",
 ]

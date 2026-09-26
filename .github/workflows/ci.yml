@@ -52,6 +52,9 @@ jobs:
       github.event_name == 'push'
       || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
+    # Unset, a stuck job holds its runner for GitHub's default of six hours; the
+    # job itself takes about a minute.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -98,6 +101,14 @@ jobs:
       github.event_name == 'push'
       || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-latest
+    # The suite's threaded tests exist to catch a lock that is never released.
+    # A test that hangs on one in its own body gets every stack dumped into the
+    # log five minutes in, naming it (pyproject's faulthandler_timeout). One
+    # that fails its bounded wait instead is named in pytest's report -- but its
+    # stuck worker can then hold the interpreter open at exit, with no further
+    # output, and this is what ends that job, rather than GitHub's default of
+    # six hours. A healthy run takes about a minute.
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
