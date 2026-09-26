@@ -20,9 +20,9 @@ keys and no accounts. The chat app keeps to that too: `.streamlit/config.toml`
 switches off Streamlit's usage statistics, which its browser front end would
 otherwise send to Streamlit, and keeps the app to this machine — though
 Streamlit can still look up the machine's external IP address (see
-[below](#3-or-use-the-chat-app)). So does tracing, which is off unless you turn
-it on and then goes to a [Phoenix](#tracing-with-phoenix) server you run
-yourself. (LangSmith is no longer used — but see
+[below](#3-or-use-the-chat-app)). Tracing keeps to it as well: it is off unless
+you turn it on, and then goes to a [Phoenix](#tracing-with-phoenix) server you
+run yourself. (LangSmith is no longer used — but see
 [below](#tracing-with-phoenix) if an old `.env` still switches it on.)
 
 **Contents** — [Prerequisites](#prerequisites) · [Setup](#setup) ·
@@ -350,8 +350,8 @@ guards keep it that way:
 - Every socket is blocked.
 - Tracing is forced off, whatever `.env` says. That covers Phoenix, and also
   LangSmith, which still ships inside langchain-core. A test that leaves a
-  tracer switched on fails, because the tracing SDK swallows the socket block's
-  error and the block alone would not notice.
+  tracer switched on fails, because the tracing stack catches the socket block's
+  error and only logs it, so the block alone would not notice.
 
 Most of the tests that check traces record spans in memory. The two that check
 what reaches a collector run the real exporter in a subprocess, against a

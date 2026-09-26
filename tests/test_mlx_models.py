@@ -183,8 +183,8 @@ def test_a_cached_snapshot_missing_a_shard_is_incomplete(tmp_path, monkeypatch):
 
 def test_an_id_that_is_neither_a_directory_nor_a_repo_is_a_runtime_error(tmp_path):
     """huggingface_hub rejects it with a ValueError, which must not escape:
-    app.py reads ValueError as a configuration error and stops above the
-    sidebar, hiding the uploader."""
+    app.py's pipeline-load guard does not catch it, so it would be a traceback
+    under the sidebar in place of the error."""
     with pytest.raises(RuntimeError, match="neither a model directory"):
         resolve_model_path(str(tmp_path / "no" / "such" / "model"))
 

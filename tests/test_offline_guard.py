@@ -10,7 +10,7 @@ green everywhere else, so each route to a real model is tripped here on purpose
 -- every factory, and both entry points that build one when a fake is left out
 -- and the socket block is checked on its own. So is the tracing guard: an
 exporter is the one route out the socket block cannot stop, since the tracing
-SDK catches its error. And a leak it catches must fail only the test that left
+stack catches its error. And a leak it catches must fail only the test that left
 it, not every test after.
 """
 

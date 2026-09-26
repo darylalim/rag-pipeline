@@ -10,7 +10,9 @@ dependencies = [
     "langchain-core>=1.2.5",
     "langchain-text-splitters>=1.0",
     "streamlit>=1.59",
-    "python-dotenv>=1.0",
+    # 1.2.0 is the first to honour PYTHON_DOTENV_DISABLED, which the tests that
+    # start a fresh interpreter set so a developer's .env stays out of the child.
+    "python-dotenv>=1.2.0",
     "pypdf>=5.0",
     # The local models: mlx-lm loads all three checkpoints (text-only) and runs
     # generation; mlx is declared too because mlx_models.py imports mlx.core
@@ -104,6 +106,12 @@ addopts = ["-m", "not models"]
 markers = [
     "models: loads the real local MLX models (opt in with `-m models`; needs Apple Silicon and the models in the HF cache)",
 ]
+
+[tool.coverage.run]
+# Follow the tests' child interpreters: app.py's handling of a failed pipeline
+# import runs only in the fresh ones the test_a_variable_refused_at_import_*
+# tests start, so without this an on-demand coverage run reports it uncovered.
+patch = ["subprocess"]
 
 [tool.ruff.lint]
 # Ruff's default rule set, extended. `extend-select` rather than `select`,

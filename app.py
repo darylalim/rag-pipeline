@@ -260,12 +260,19 @@ except (FileNotFoundError, RuntimeError) as exc:
     # FileNotFoundError: no/empty index, or a model missing from the Hugging
     # Face cache. RuntimeError: MLX unavailable, a model that fails to load, or
     # a store error.
-    # One callout, not an error stacked on an info: "Then reload this page" is a
-    # continuation of the error, meaningless on its own. Left generic because it
-    # covers every case and each exception already names its own remedy; the
-    # sidebar has rendered above this guard, so the uploader that resolves the
-    # missing-index case is on screen to speak for itself.
-    st.error(f"{exc}\n\nThen reload this page.", icon=":material/error:")
+    # One callout, not an error stacked on an info: the advice is a continuation
+    # of the error, meaningless on its own. Left generic because it covers every
+    # case and each exception already names its own remedy: a reload picks up a
+    # fix made on disk (an index built, a model downloaded), but a fix to a
+    # setting (FETCH_K, MAX_TOKENS, an OTEL_* variable) needs a restart, since --
+    # as above the sidebar -- the server read its environment and .env when it
+    # started. The sidebar has rendered above this guard, so the uploader that
+    # resolves the missing-index case is on screen to speak for itself.
+    st.error(
+        f"{exc}\n\nThen reload this page — or restart the app, if the fix was to "
+        "a setting.",
+        icon=":material/error:",
+    )
     st.stop()
 
 

@@ -19,7 +19,7 @@ silent otherwise:
   Chroma's default ONNX embedder -- reaches the network. ``_no_tracing`` keeps
   tracing off whatever a developer's .env says, and ``_no_tracer_left_on``
   fails a test that leaves it on: an exporter is the one route out that the
-  socket block cannot stop, because the tracing SDK swallows the error.
+  socket block cannot stop, because the tracing stack swallows the error.
 """
 
 from __future__ import annotations
@@ -387,7 +387,7 @@ def _no_tracing():
     config.py loads .env at import time, so a ``PHOENIX_COLLECTOR_ENDPOINT``
     there would reach every test that builds its settings from the
     environment -- both frontends -- and each would install a real exporter.
-    ``_offline`` does not stop one: the tracing SDK catches the socket block's
+    ``_offline`` does not stop one: the tracing stack catches the socket block's
     error and logs it, and a batch still queued at exit is sent after the block
     is undone, into the developer's own Phoenix.
 
