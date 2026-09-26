@@ -18,7 +18,8 @@ Hugging Face cache, and Chroma runs in-process against a directory on disk. The
 one network step is downloading the models, once, during setup. There are no API
 keys and no accounts. The chat app keeps to that too: `.streamlit/config.toml`
 switches off Streamlit's usage statistics, which its browser front end would
-otherwise send to Streamlit, and keeps the app to this machine — though
+otherwise send to Streamlit, and its first-run prompt for an email address, and
+keeps the app to this machine — though
 Streamlit can still look up the machine's external IP address (see
 [below](#3-or-use-the-chat-app)). Tracing keeps to it as well: it is off unless
 you turn it on, and then goes to a [Phoenix](#tracing-with-phoenix) server you
@@ -309,8 +310,9 @@ Each model setting is a Hugging Face repo id, resolved from the local cache, or 
 path to a model directory.
 
 The chat app's own Streamlit settings are in `.streamlit/config.toml`, each with
-a comment on why: usage statistics off ([above](#rag-pipeline)), and the file
-watcher off and the server on loopback ([the chat app](#3-or-use-the-chat-app)).
+a comment on why: usage statistics and the email prompt off
+([above](#rag-pipeline)), and the file watcher off and the server on loopback
+([the chat app](#3-or-use-the-chat-app)).
 
 ## Development
 
@@ -443,7 +445,7 @@ rag_pipeline/
   tracing.py     optional tracing to a self-hosted Phoenix (setup_tracing)
   cli.py         rag ingest | rag query "..."
 app.py           Streamlit chat UI
-.streamlit/      config.toml: usage statistics and the file watcher off, loopback only
+.streamlit/      config.toml: usage statistics, email prompt and file watcher off, loopback only
 data/            sample documents (swap in your own)
 chroma_db/       the index, created by rag ingest (git-ignored)
 ```

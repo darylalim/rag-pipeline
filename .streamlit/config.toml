@@ -25,3 +25,9 @@ fileWatcherType = "none"
 # would be allowed -- before refusing it.) Pass `--server.address 0.0.0.0` to
 # open the app to your network deliberately.
 address = "127.0.0.1"
+
+# No first-run email prompt. A first start that is not headless, with no
+# ~/.streamlit/credentials.toml, asks in the terminal for an email address and
+# posts any address typed to Streamlit's servers. Nothing about this app is
+# meant to leave the machine, so the question is not asked.
+showEmailPrompt = false

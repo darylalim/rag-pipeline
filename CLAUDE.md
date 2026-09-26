@@ -581,8 +581,11 @@ because they are only observable at the frontend:
   over a hundred a turn), and sets `server.address` to `127.0.0.1`. Unset,
   Streamlit listens on every interface, putting the uploader — which writes into
   `data/` — on the local network with no login; and a headless start then asks
-  checkip.amazonaws.com for the machine's external IP, to print it.
-  `test_the_app_config_keeps_streamlit_local_and_quiet` pins all three.
+  checkip.amazonaws.com for the machine's external IP, to print it. It also
+  sets `server.showEmailPrompt` to `false`: a first start that is not headless
+  would otherwise ask for an email address in the terminal and post any address
+  typed to Streamlit. `test_the_app_config_keeps_streamlit_local_and_quiet`
+  pins all four.
 
 ## Enforcing the invariants
 
