@@ -87,7 +87,7 @@ def test_from_env_overrides(monkeypatch, tmp_path):
 def test_an_unusable_path_setting_is_a_value_error_naming_it(monkeypatch, var):
     """pathlib signals a `~user` with no home directory as a RuntimeError.
 
-    Left as that, it would slip past the ValueError guard app.py puts around
+    Left as that, it would slip past the ValueError guard streamlit_app.py puts around
     Settings -- the one that stops above the sidebar with "Fix it" -- and reach
     the user as a crash page instead. A malformed setting is a ValueError,
     whichever reader found it.
@@ -113,7 +113,7 @@ def test_an_unusable_phoenix_endpoint_is_a_value_error_naming_it(monkeypatch, en
 
     The exporter takes any string, and one it cannot post to fails only on
     export, as a log line on a background thread -- every trace lost, and
-    nothing on screen to say why. A ValueError here is what app.py stops on
+    nothing on screen to say why. A ValueError here is what streamlit_app.py stops on
     above its sidebar and what the CLI prints as its one-line error.
     """
     monkeypatch.setenv("PHOENIX_COLLECTOR_ENDPOINT", endpoint)

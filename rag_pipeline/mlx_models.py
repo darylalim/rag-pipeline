@@ -21,7 +21,7 @@ Guarantees every adapter keeps:
 - Loading never reaches the network: a model id resolves to its local cached
   snapshot (``local_files_only=True``) or is a path to a model directory.
 - Failures stay inside ``FileNotFoundError | RuntimeError | ValueError`` --
-  and construction never raises ``ValueError`` (app.py catches only
+  and construction never raises ``ValueError`` (streamlit_app.py catches only
   ``FileNotFoundError | RuntimeError`` around the pipeline load):
   model not cached / incomplete -> ``FileNotFoundError`` naming the download
   command; MLX unavailable, a failed load, a failed forward pass or generation
@@ -114,10 +114,10 @@ def _missing_files(path: Path) -> list[str]:
     index = path / "model.safetensors.index.json"
     if index.is_file():
         # Every way a cut-off or malformed index can fail is a RuntimeError --
-        # a JSONDecodeError is a ValueError, which app.py's pipeline-load guard
-        # does not catch: a traceback under its sidebar. A shard name that is
-        # not a string is checked here too, or it would fail below, outside the
-        # try.
+        # a JSONDecodeError is a ValueError, which streamlit_app.py's
+        # pipeline-load guard does not catch: a traceback under its sidebar. A
+        # shard name that is not a string is checked here too, or it would fail
+        # below, outside the try.
         try:
             shards = sorted(set(json.loads(index.read_text())["weight_map"].values()))
             if not all(isinstance(name, str) for name in shards):
@@ -162,7 +162,7 @@ def resolve_model_path(model_id: str) -> Path:
         raise _not_cached(model_id) from exc
     except Exception as exc:
         # HFValidationError, for an id that is not a repo id, is a ValueError --
-        # which app.py's pipeline-load guard does not catch: a traceback.
+        # which streamlit_app.py's pipeline-load guard does not catch: a traceback.
         raise RuntimeError(
             f"Model {model_id!r} is neither a model directory nor a cached "
             f"Hugging Face repo: {exc}"
@@ -660,8 +660,8 @@ class MLXChatModel(BaseChatModel):
         closed half-way. Dropped half-way, it is released only when the garbage
         collector finalizes the stream, which for a stream something still
         refers to can be never, so a consumer that stops early must close it:
-        app.py does when Streamlit's Stop interrupts an answer, and the pipeline
-        closes this stream when its own is closed. Errors keep to the union:
+        streamlit_app.py does when Streamlit's Stop interrupts an answer, and the
+        pipeline closes this stream when its own is closed. Errors keep to the union:
         RuntimeError and ValueError pass through and anything else (a template
         error, say) becomes RuntimeError, while BaseException -- Streamlit's own
         stop signal, GeneratorExit -- passes untouched.

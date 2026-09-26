@@ -8,7 +8,7 @@ the root `CLAUDE.md`: production passes no models and tests inject fakes, what
 
 | For | Take |
 | --- | ---- |
-| a frontend (`app.py` or `cli.py`) over fakes | `wired_env` — every `ENV_VARS` name from `settings`, and fakes behind the three model factories. Derived from `ENV_VARS` because a hand-kept list would let the developer's `.env` answer a missed name |
+| a frontend (`streamlit_app.py` or `cli.py`) over fakes | `wired_env` — every `ENV_VARS` name from `settings`, and fakes behind the three model factories. Derived from `ENV_VARS` because a hand-kept list would let the developer's `.env` answer a missed name |
 | the real adapters, down to the generation lock, with no MLX | `fake_mlx` over a `model_dir` — the shared fake stack in `fake_mlx.py`, installed for one test after `_no_real_models`, with the model memo swapped so no fake model outlives it |
 | asserting on spans | `spans` — production's provider, a synchronous processor into memory, LangChain instrumented; all undone after |
 | running `setup_tracing` for real | `undo_tracing` |

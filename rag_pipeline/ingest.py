@@ -205,7 +205,7 @@ def store_errors_as_runtime() -> Iterator[None]:
     types sit outside the ``FileNotFoundError | RuntimeError | ValueError`` union
     both frontends handle, and none belongs in a frontend. Everything becomes a
     RuntimeError, never a ValueError -- a store failure while the app loads its
-    pipeline must land in the branch ``app.py`` catches *below* its sidebar,
+    pipeline must land in the branch ``streamlit_app.py`` catches *below* its sidebar,
     keeping the uploader reachable, rather than the ``ValueError`` branch that
     stops the script above it.
 

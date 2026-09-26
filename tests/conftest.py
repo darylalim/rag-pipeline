@@ -163,9 +163,10 @@ def wired_env(settings, fake_embeddings, fake_reranker, monkeypatch) -> Settings
     """A frontend's view of the world: fixture settings in the environment, fakes
     behind the three model factories.
 
-    Neither frontend takes injected models -- `app.py` is a script and `cli.py`
-    builds its own `Settings.from_env()` -- so the environment is how a fixture's
-    temp index reaches them, and the factories are where they reach a model.
+    Neither frontend takes injected models -- `streamlit_app.py` is a script and
+    `cli.py` builds its own `Settings.from_env()` -- so the environment is how a
+    fixture's temp index reaches them, and the factories are where they reach a
+    model.
     That is the same seam for both, which is why this is one fixture rather than
     a copy in each frontend's test file.
 

@@ -1,13 +1,13 @@
 """Tests for the Streamlit frontend, run headless via ``streamlit.testing``.
 
-`app.py` cannot take injected fakes the way `ingest()` and `RAGPipeline` do — it
-is a script, not a function. But it reaches the embedding model, the reranker
-and the chat model only through `build_embeddings()`, `build_reranker()` and
-`build_chat_model()`, which the architecture already requires of every caller,
-and all three are resolved as module globals at call time. Patching them there
-is the same dependency-injection seam entering by a different door, and it is
-what keeps these tests inside the suite's guarantees: no model loaded, no MLX,
-no socket.
+`streamlit_app.py` cannot take injected fakes the way `ingest()` and
+`RAGPipeline` do — it is a script, not a function. But it reaches the embedding
+model, the reranker and the chat model only through `build_embeddings()`,
+`build_reranker()` and `build_chat_model()`, which the architecture already
+requires of every caller, and all three are resolved as module globals at call
+time. Patching them there is the same dependency-injection seam entering by a
+different door, and it is what keeps these tests inside the suite's guarantees:
+no model loaded, no MLX, no socket.
 
 What earns these tests their runtime is the turn-pairing invariant. Every other
 guarantee in this repo is about a function's return value, which an ordinary
@@ -39,14 +39,14 @@ from rag_pipeline import pipeline as pipeline_mod
 from rag_pipeline import tracing as tracing_mod
 from rag_pipeline.mlx_models import MLXChatModel
 
-APP = Path(__file__).resolve().parent.parent / "app.py"
+APP = Path(__file__).resolve().parent.parent / "streamlit_app.py"
 
 _ZEBRA = "Zebras are striped equids from Africa."
 
 
 @pytest.fixture
 def app(wired_env, fake_embeddings) -> AppTest:
-    """An `AppTest` over `app.py`, wired to fakes and a freshly ingested index.
+    """An `AppTest` over `streamlit_app.py`, wired to fakes and a fresh index.
 
     `wired_env` supplies everything both frontends need; what is left here is
     what only a Streamlit script does.
@@ -213,7 +213,7 @@ def test_a_real_stop_releases_the_model_and_keeps_the_turn(
 
     Unlike `fail_mid_stream`, which raises from inside generation, the button
     asks the runner to stop; the exception arrives inside write_stream, with the
-    answer stream suspended mid-generation. Two things then rest on app.py:
+    answer stream suspended mid-generation. Two things then rest on streamlit_app.py:
 
     - The stream is *closed*, so the model stops and releases the process-wide
       generation lock there and then. Merely dropped, it lives on as a global of
@@ -783,7 +783,7 @@ def test_a_malformed_setting_stops_before_the_sidebar(app, monkeypatch, var, val
     assert not at.chat_input
 
 
-# Two loads of app.py, reported as JSON: what the first page load shows, and
+# Two loads of streamlit_app.py, reported as JSON: what the first page load shows, and
 # what a reload after it does.
 _TWO_LOADS = """
 import json, sys

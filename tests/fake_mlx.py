@@ -2,8 +2,9 @@
 
 Shared rather than private to ``test_mlx_models.py`` because the adapters'
 contract does not end at the adapter: whether Streamlit's Stop releases the
-generation lock depends on how the pipeline and app.py close the stream, so the
-frontend and pipeline tests drive the real ``MLXChatModel`` over this fake too.
+generation lock depends on how the pipeline and streamlit_app.py close the
+stream, so the frontend and pipeline tests drive the real ``MLXChatModel`` over
+this fake too.
 conftest's ``fake_mlx`` fixture installs it into ``sys.modules`` for one test.
 
 The tokenizer is character-level, so the ids a fake forward pass or generation

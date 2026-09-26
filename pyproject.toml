@@ -122,9 +122,10 @@ markers = [
 ]
 
 [tool.coverage.run]
-# Follow the tests' child interpreters: app.py's handling of a failed pipeline
-# import runs only in the fresh ones the test_a_variable_refused_at_import_*
-# tests start, so without this an on-demand coverage run reports it uncovered.
+# Follow the tests' child interpreters: streamlit_app.py's handling of a failed
+# pipeline import runs only in the fresh ones the
+# test_a_variable_refused_at_import_* tests start, so without this an on-demand
+# coverage run reports it uncovered.
 patch = ["subprocess"]
 
 [tool.ruff.lint]

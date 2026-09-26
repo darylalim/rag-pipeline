@@ -32,7 +32,7 @@ def _env_path(name: str, default: Path) -> Path:
     # pathlib signals an unusable path with RuntimeError: expanduser() for a
     # `~user` with no home directory, resolve() for a symlink loop (on 3.11 and
     # 3.12). That is a malformed setting, so it is raised as the ValueError
-    # every other one is -- the type app.py stops on above its sidebar with
+    # every other one is -- the type streamlit_app.py stops on above its sidebar with
     # "Fix it" -- rather than escaping that guard as an uncaught RuntimeError.
     try:
         return Path(value).expanduser().resolve()

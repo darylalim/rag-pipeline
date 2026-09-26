@@ -113,7 +113,7 @@ def test_the_sweep_actually_covers_the_tree() -> None:
     """
     assert len(SWEPT) >= 10
     assert "rag_pipeline/config.py" in SWEPT
-    assert "app.py" in SWEPT
+    assert "streamlit_app.py" in SWEPT
 
 
 # Exported by `git --literal-pathspecs` and its siblings, so a hook started from
@@ -241,13 +241,13 @@ GIT_IGNORES = {
     "data/upload.pdf": True,
     "data/notes/report.md": True,
     ".coverage.macbook_local.pid12345.XkqzyOax": True,
-    ".claude/worktrees/wf-1/app.py": True,
+    ".claude/worktrees/wf-1/streamlit_app.py": True,
     ".env.example": False,
     ".streamlit/config.toml": False,
     "data/langchain_overview.md": False,
     "data/rag_concepts.md": False,
     "data/vector_stores.md": False,
-    "app.py": False,
+    "streamlit_app.py": False,
 }
 
 
@@ -297,9 +297,11 @@ def test_gitignore_keeps_secrets_and_your_documents_out_of_git(
 # --- the rules themselves, in-process ----------------------------------------
 
 VIOLATIONS = [
-    pytest.param("app.py", 'store = Chroma(collection_name="x")', id="inline-chroma"),
     pytest.param(
-        "app.py",
+        "streamlit_app.py", 'store = Chroma(collection_name="x")', id="inline-chroma"
+    ),
+    pytest.param(
+        "streamlit_app.py",
         "store = Chroma.from_documents(docs, embedding=e)",
         id="chroma-classmethod-constructor",
     ),
@@ -308,7 +310,9 @@ VIOLATIONS = [
         "client = chromadb.PersistentClient(path=p)",
         id="inline-persistent-client",
     ),
-    pytest.param("app.py", "client = chromadb.Client()", id="inline-chroma-client"),
+    pytest.param(
+        "streamlit_app.py", "client = chromadb.Client()", id="inline-chroma-client"
+    ),
     pytest.param(
         # tests/ is not exempt: a test that needs a collection opens it through
         # open_store(), so a second, differently configured client never exists.
@@ -317,7 +321,9 @@ VIOLATIONS = [
         id="store-in-tests",
     ),
     pytest.param(
-        "app.py", "e = QwenVLEmbeddings(m, dimensions=32)", id="inline-embeddings"
+        "streamlit_app.py",
+        "e = QwenVLEmbeddings(m, dimensions=32)",
+        id="inline-embeddings",
     ),
     pytest.param(
         # Qualified by its module, the construction is still a construction.
@@ -336,7 +342,7 @@ VIOLATIONS = [
     pytest.param(
         # A quote in a comment opens no string. Masked as one, this triple
         # quote blanked everything up to the next, the construction included.
-        "app.py",
+        "streamlit_app.py",
         '# a """ in a comment\nstore = Chroma(collection_name="x")\n# and """',
         id="store-after-a-comment-that-quotes",
     ),
@@ -379,26 +385,30 @@ VIOLATIONS = [
         id="ruff-disable-range",
     ),
     pytest.param(
-        "app.py", "# isort: skip_file\nimport sys\nimport os", id="isort-skip-file"
+        "streamlit_app.py",
+        "# isort: skip_file\nimport sys\nimport os",
+        id="isort-skip-file",
     ),
     pytest.param(
-        "app.py",
+        "streamlit_app.py",
         "# isort: off\nimport sys\nimport os\n# isort: on",
         id="isort-off",
     ),
     pytest.param(
         # ruff honours this one with no hash in front of it.
-        "app.py",
+        "streamlit_app.py",
         "import sys  # keep first, isort: skip\nimport os",
         id="isort-skip-behind-prose",
     ),
     pytest.param(
-        "app.py", "import sys  #isort:skip\nimport os", id="isort-skip-unspaced"
+        "streamlit_app.py",
+        "import sys  #isort:skip\nimport os",
+        id="isort-skip-unspaced",
     ),
     pytest.param(
         # Each block is sorted on its own, so an import split off by itself
         # passes out of order.
-        "app.py",
+        "streamlit_app.py",
         "import sys\n\n# isort: split\n\nimport os",
         id="isort-split",
     ),
@@ -455,7 +465,7 @@ ALLOWED = [
     pytest.param(
         # Only chromadb's Client is the store; a bare `Client(` belongs to every
         # HTTP library, so the rule names the module rather than guess.
-        "app.py",
+        "streamlit_app.py",
         "http = httpx.Client(timeout=5)",
         id="another-librarys-client",
     ),
@@ -481,7 +491,7 @@ ALLOWED = [
     ),
     # Prose describing a rule must not trip it, or the rule cannot be documented.
     pytest.param(
-        "app.py",
+        "streamlit_app.py",
         "# Never construct Chroma(...) inline -- use open_store().",
         id="comment-describing-store-rule",
     ),
@@ -494,63 +504,67 @@ ALLOWED = [
         # A banned construction inside a triple-quoted block, at column 0 so no
         # indentation hides it: the case that proves multi-line string masking
         # works, and not merely that the single-line kind above does.
-        "app.py",
+        "streamlit_app.py",
         'HELP = """\nchromadb.PersistentClient(path=p)\n"""',
         id="store-inside-a-docstring",
     ),
     pytest.param("README.md", "Never construct Chroma(...) inline.", id="not-python"),
     # Near misses for the suppression rule: none silences a ruff or ty finding.
     pytest.param(
-        "app.py", "# a type ignore would only hide the finding", id="prose-about-it"
+        "streamlit_app.py",
+        "# a type ignore would only hide the finding",
+        id="prose-about-it",
     ),
     pytest.param(
-        "app.py",
+        "streamlit_app.py",
         "# https://docs.astral.sh/ty/suppression/#type-ignore-comments",
         id="a-url-fragment",
     ),
     pytest.param(
         # ruff rejects noqa that starts a longer word, so this suppresses nothing.
-        "app.py",
+        "streamlit_app.py",
         "# https://example.com/#noqa-directives",
         id="noqa-starting-a-longer-word",
     ),
-    pytest.param("app.py", "x = []  # type: list[int]", id="a-type-comment"),
+    pytest.param("streamlit_app.py", "x = []  # type: list[int]", id="a-type-comment"),
     pytest.param(
         # ty rejects ignore starting a longer word, as ruff does noqa.
-        "app.py",
+        "streamlit_app.py",
         "x = y  # ty: ignored",
         id="ty-ignore-starting-a-longer-word",
     ),
     pytest.param(
         # ruff's ignore needs codes; bare, it suppresses nothing.
-        "app.py",
+        "streamlit_app.py",
         "import os  # ruff: ignore",
         id="ruff-ignore-without-codes",
     ),
     pytest.param(
         # An isort: on only ends an off; alone, it suppresses nothing.
-        "app.py",
+        "streamlit_app.py",
         "# isort: on\nimport os",
         id="isort-on-alone",
     ),
     pytest.param(
         # A directive ends with its comment's line: this noqa is a name.
-        "app.py",
+        "streamlit_app.py",
         "x = 1  #\nnoqa = 2",
         id="noqa-on-the-line-after-a-comment",
     ),
     pytest.param(
-        "app.py", "x = y  # pyright: ignore[reportAssignmentType]", id="another-checker"
+        "streamlit_app.py",
+        "x = y  # pyright: ignore[reportAssignmentType]",
+        id="another-checker",
     ),
     pytest.param(
         # The formatter keeps the hand layout; the linter still reports under it.
-        "app.py",
+        "streamlit_app.py",
         "# fmt: off\nGRID = [\n    1, 0,\n    0, 1,\n]\n# fmt: on\nx = 1  # fmt: skip",
         id="formatter-directives",
     ),
     pytest.param(
         # The decorator is code, so a comment may name it.
-        "app.py",
+        "streamlit_app.py",
         "# typing's no_type_check would hide this function from ty",
         id="naming-the-decorator-in-a-comment",
     ),

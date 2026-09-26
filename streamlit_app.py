@@ -1,6 +1,6 @@
 """Streamlit chat UI over the RAG pipeline.
 
-Run with:  uv run streamlit run app.py
+Run with:  uv run streamlit run streamlit_app.py
 
 Uses the same Settings and RAGPipeline as the CLI. The pipeline (persisted index
 + local models) is cached with st.cache_resource, so it is built once per index

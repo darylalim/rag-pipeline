@@ -9,13 +9,13 @@ uv sync                              # install deps (creates .venv; MLX only on 
 uvx --from huggingface_hub hf download <model id>   # once per model (README Setup lists the three); loading never downloads
 uv run rag ingest                    # embed data/ into the Chroma collection under chroma_db/
 uv run rag query "your question"     # ask from the terminal (loads all three models first)
-uv run streamlit run app.py          # chat UI over the same pipeline
-uv run streamlit run app.py --server.fileWatcherType auto   # while editing app.py (config.toml turns the watcher off)
+uv run streamlit run streamlit_app.py # chat UI over the same pipeline
+uv run streamlit run streamlit_app.py --server.fileWatcherType auto   # while editing streamlit_app.py (config.toml turns the watcher off)
 uv run pytest                        # full suite (fakes + in-process Chroma; no models, network, Docker or secrets)
 uv run pytest -m models              # live tests against the real models (Apple Silicon + models downloaded; ~1 min)
 uv run pytest tests/test_config.py::test_defaults   # single test
 uv run pytest -k idempotent -v                      # by keyword
-uv run pytest --cov=rag_pipeline --cov=app --cov-report=term-missing   # coverage, on demand
+uv run pytest --cov=rag_pipeline --cov=streamlit_app --cov-report=term-missing   # coverage, on demand
 uv run ruff check --fix . && uv run ruff format .   # lint, then format (order matters)
 uv run ty check                      # type check
 uv sync --locked && uv run ruff check . && uv run ruff format --check . && uv run ty check && uv run pytest   # every check CI runs
@@ -83,7 +83,7 @@ tracing (rag_pipeline/tracing.py)     optional: each question as one trace, to a
 ```
 
 `Settings` (`config.py`) is a frozen dataclass built via `Settings.from_env()`.
-Both frontends — `rag_pipeline/cli.py` and `app.py` — construct it the same way,
+Both frontends — `rag_pipeline/cli.py` and `streamlit_app.py` — construct it the same way,
 which is what keeps them agreeing on the persist directory and collection, the
 models, and chunking. There are no secrets: every setting is a field with a
 literal default.
@@ -178,7 +178,7 @@ closed half-way. **A stream that is dropped rather than closed keeps the lock
 until the garbage collector finalizes it**, which for one a Streamlit script
 holds as a module global can be never — every later question, from every
 session, then hangs on the lock. So everything between the model and a frontend
-closes rather than drops: `app.py` wraps generation in `closing(chunks)` (the
+closes rather than drops: `streamlit_app.py` wraps generation in `closing(chunks)` (the
 Stop button raises inside `st.write_stream` with the stream suspended),
 `stream_answer`'s tracing wrapper (`_traced`) closes `_generate`'s stream with
 its own, and `RAGPipeline._generate` closes the chain's stream with its own. That chain is
@@ -206,7 +206,7 @@ a malformed one as `ValueError`). OpenTelemetry's own split: `pipeline.py`
 imports only `opentelemetry-api` and OpenInference's attribute names, which are
 a no-op until a provider exists, and `tracing.setup_tracing()` installs one.
 `cli.py` calls it in `cmd_query` only (ingest emits no spans, so it would only
-load the tracing stack and start an idle exporter thread), and `app.py` on every
+load the tracing stack and start an idle exporter thread), and `streamlit_app.py` on every
 rerun, inside the pipeline-load `try`; it is once per process, guarded by the
 instrumentor's own state under a lock (`test_concurrent_first_setups_install_once`).
 Like the adapters, it raises only `RuntimeError`, because the app calls it on
@@ -278,7 +278,7 @@ dropped System merely keeps its old view, and what that raises is a
 `ChromaError`, which `store_errors_as_runtime` turns into a RuntimeError.
 Callers (`grep reset_store_cache`):
 
-- `app.py`'s `load_pipeline` calls it before every build, or the fresh pipeline
+- `streamlit_app.py`'s `load_pipeline` calls it before every build, or the fresh pipeline
   would answer from the old index while its cache key already names the new one.
   `max_entries=1` for the same reason: a second slot would keep a pipeline opened
   before the last reset, and a corpus that changes and changes back mints its
@@ -415,7 +415,7 @@ real models, are deselected by pyproject's `addopts = ["-m", "not models"]`, and
 run only with `uv run pytest -m models` (a later `-m` replaces the default). They
 skip rather than fail when MLX or a model is missing. CI never runs them.
 
-Neither frontend takes such parameters — `app.py` is a script, and `cli.py`
+Neither frontend takes such parameters — `streamlit_app.py` is a script, and `cli.py`
 builds its own `Settings.from_env()` — so conftest's `wired_env` is the seam for
 both: it exports the fixture settings through `ENV_VARS` and patches
 `ingest.build_embeddings`, `pipeline.build_chat_model`, and
@@ -434,7 +434,7 @@ because they are only observable at the frontend:
 - A chat turn is stored as a user/assistant **pair** whatever happens to it —
   success, a failed generation, or the run being torn down mid-answer — so a
   question can never be left in the history with nothing under it. This is what
-  the `finally` in `app.py` buys, and the reason a failed turn is stored with an
+  the `finally` in `streamlit_app.py` buys, and the reason a failed turn is stored with an
   `error` flag rather than as ordinary text. The `finally` writes through a
   `history` bound before the turn, never through `st.session_state`: after a
   real Stop the runner *stays* stopped, and every `st.session_state` access is
@@ -444,7 +444,7 @@ because they are only observable at the frontend:
 - A stopped answer releases the model: see the concurrency paragraph above.
 - A Stop during *retrieval* still closes the stream. It is raised at the
   retrieval spinner's exit (a Streamlit call), after `stream_answer` returned
-  and before generation starts, so `app.py` registers `closing(chunks)` inside
+  and before generation starts, so `streamlit_app.py` registers `closing(chunks)` inside
   the spinner through an `ExitStack`. No lock is held then, but the stream holds
   the question's root span, and a dropped stream means a trace never sent.
 - An upload is reported as added only if it reached the index
@@ -484,7 +484,7 @@ because they are only observable at the frontend:
   `OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT`, and builds its own pydantic `Settings()` in
   its `__init__` (from the environment, and from a `.env` in the working
   directory); numpy, langsmith and huggingface_hub (through transformers, on a
-  Mac) each `int()` a variable or two of theirs. So `app.py` imports the
+  Mac) each `int()` a variable or two of theirs. So `streamlit_app.py` imports the
   pipeline inside its `Settings` guard, not at the top of the file, where any of
   these was a traceback in place of the whole page. It does so once per process,
   through the cached `_import_failure()`, which keeps a failure as surely as a
@@ -552,7 +552,7 @@ because they are only observable at the frontend:
   127.0.0.1` (unset, the uploader — which writes into `data/` — is on the local
   network with no login). Each setting's reason is beside it, and
   `test_the_app_config_keeps_streamlit_local_and_quiet` pins all four. With the
-  watcher off an edit to `app.py` is not picked up at all — Rerun reuses the
+  watcher off an edit to `streamlit_app.py` is not picked up at all — Rerun reuses the
   compiled script until every tab has closed or the server restarts; see
   Commands.
 
@@ -592,7 +592,7 @@ text rule and are strictly stronger than it: don't reintroduce one.
 
 - New failure modes must fit `FileNotFoundError | RuntimeError | ValueError` —
   the union both frontends catch. `cli.py` catches it in one place (`main()`);
-  `app.py` splits it across two, because the sidebar has to render in between:
+  `streamlit_app.py` splits it across two, because the sidebar has to render in between:
   `ValueError` from `Settings.from_env()`, or from the pipeline's imports (a
   malformed variable a library reads as it is imported; see Gotchas), stops the
   script above the sidebar, and `FileNotFoundError | RuntimeError` from the
@@ -629,7 +629,7 @@ text rule and are strictly stronger than it: don't reintroduce one.
   `MAX_TOKENS` (its `finish_reason` is `"length"`), which would otherwise read
   as complete. `stream_answer()` wraps `_generate()` and `answer()` joins
   over that, so every shape inherits it. A new check belongs here rather than in
-  a frontend: the one that goes in `app.py` is the one `cli.py` silently doesn't
+  a frontend: the one that goes in `streamlit_app.py` is the one `cli.py` silently doesn't
   get. Note failures surface during *iteration*, not at the `.stream()` call:
   the chain is lazy, so a `try` around the call alone would catch nothing.
 - `stream_answer()` returns `(docs, chunks)` because every frontend needs both,
@@ -669,7 +669,7 @@ text rule and are strictly stronger than it: don't reintroduce one.
 - Env-var helpers in `config.py` treat set-but-empty (`CHAT_MODEL=`) as unset and
   fall back to the default, and report a malformed value as `ValueError` — for a
   path too, where pathlib's own signal (a `~user` with no home directory) is a
-  `RuntimeError` that would slip past `app.py`'s guard above the sidebar. Match
+  `RuntimeError` that would slip past `streamlit_app.py`'s guard above the sidebar. Match
   that behavior for new settings.
 - `load_documents()` warns on stderr for unreadable files and *silently* skips
   whitespace-only ones, rather than aborting the ingest. Preserve that resilience.

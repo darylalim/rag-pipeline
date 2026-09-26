@@ -122,8 +122,8 @@ def test_a_directory_missing_a_shard_is_incomplete(tmp_path, no_hub):
 def test_an_unreadable_weight_index_is_a_runtime_error(tmp_path, no_hub, index):
     """An index cut off by an interrupted convert or copy must stay a RuntimeError.
 
-    Its JSONDecodeError is a ValueError, which app.py's pipeline-load guard does
-    not catch: a traceback under the sidebar in place of the error. Every
+    Its JSONDecodeError is a ValueError, which streamlit_app.py's pipeline-load
+    guard does not catch: a traceback under the sidebar in place of the error. Every
     malformed shape is covered, including a shard name that is not a string,
     which would otherwise fail outside the translation.
     """
@@ -183,7 +183,7 @@ def test_a_cached_snapshot_missing_a_shard_is_incomplete(tmp_path, monkeypatch):
 
 def test_an_id_that_is_neither_a_directory_nor_a_repo_is_a_runtime_error(tmp_path):
     """huggingface_hub rejects it with a ValueError, which must not escape:
-    app.py's pipeline-load guard does not catch it, so it would be a traceback
+    streamlit_app.py's pipeline-load guard does not catch it, so it would be a traceback
     under the sidebar in place of the error."""
     with pytest.raises(RuntimeError, match="neither a model directory"):
         resolve_model_path(str(tmp_path / "no" / "such" / "model"))
@@ -323,7 +323,7 @@ _ADAPTERS = {
 
 @pytest.mark.parametrize("build", _ADAPTERS.values(), ids=_ADAPTERS.keys())
 def test_no_adapter_construction_raises_value_error(fake_mlx, model_dir, build):
-    """mlx-lm reports an unsupported model as ValueError, which app.py's
+    """mlx-lm reports an unsupported model as ValueError, which streamlit_app.py's
     pipeline-load guard does not catch: a traceback in place of its error."""
     fake_mlx.load_error = ValueError("Model type not supported.")
 

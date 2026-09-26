@@ -129,7 +129,7 @@ it is still reading the prompt.
 ### 3. Or use the chat app
 
 ```bash
-uv run streamlit run app.py
+uv run streamlit run streamlit_app.py
 ```
 
 A browser chat UI over the same pipeline, streaming each answer token by token,
@@ -159,11 +159,11 @@ finish. The toolbar's **Stop** ends an answer where it is — the model stops
 generating there and then — and the turn stays in the history, marked as
 interrupted.
 
-Editing `app.py` does not rerun it: `.streamlit/config.toml` turns Streamlit's
+Editing `streamlit_app.py` does not rerun it: `.streamlit/config.toml` turns Streamlit's
 file watcher off, because on every run it walks every loaded module and logs a
 traceback for each of transformers' lazily loaded ones — over a hundred a turn.
 While working on the app itself, run it with
-`uv run streamlit run app.py --server.fileWatcherType auto`.
+`uv run streamlit run streamlit_app.py --server.fileWatcherType auto`.
 
 The sidebar also takes uploads, so the whole loop — add a document, index it,
 ask about it — can happen in the browser. See below.
@@ -408,7 +408,7 @@ Coverage is measured on demand rather than in CI, and carries no threshold — a
 number to keep green invites tests that execute code without asserting anything:
 
 ```bash
-uv run pytest --cov=rag_pipeline --cov=app --cov-report=term-missing
+uv run pytest --cov=rag_pipeline --cov=streamlit_app --cov-report=term-missing
 ```
 
 The lines it reports uncovered should be the ones only a real terminal or a real
@@ -484,7 +484,7 @@ rag_pipeline/
   mlx_models.py  the three local models behind LangChain's interfaces, loaded once per process
   tracing.py     optional tracing to a self-hosted Phoenix (setup_tracing)
   cli.py         rag ingest | rag query "..."
-app.py           Streamlit chat UI
+streamlit_app.py Streamlit chat UI
 .streamlit/      config.toml: usage statistics, email prompt and file watcher off, loopback only
 data/            sample documents; add your own (git-ignored)
 chroma_db/       the index, created by rag ingest (git-ignored)

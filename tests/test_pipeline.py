@@ -669,8 +669,9 @@ def test_model_errors_pass_through_unchanged(
     assert info.value is error
 
 
-# The exception union both frontends catch (`cli.py`, `app.py`). A failure mode
-# outside it escapes as a traceback in the CLI and a Streamlit crash page.
+# The exception union both frontends catch (`cli.py`, `streamlit_app.py`). A
+# failure mode outside it escapes as a traceback in the CLI and a Streamlit crash
+# page.
 _FRONTEND_EXCEPTIONS = (FileNotFoundError, RuntimeError, ValueError)
 
 # How the local models fail by the time the pipeline sees them: already a
@@ -702,7 +703,7 @@ def _fail_ingest_invalid_collection_name(
 ):
     # Chroma rejects the name when the collection is created. The translation
     # must make that a RuntimeError -- never chromadb's own type, and never a
-    # ValueError, which app.py's pipeline-load guard does not catch.
+    # ValueError, which streamlit_app.py's pipeline-load guard does not catch.
     ingest_mod.ingest(
         dataclasses.replace(settings, collection_name="x"), embeddings=fake_embeddings
     )
@@ -1034,7 +1035,7 @@ def test_failure_modes_stay_inside_the_frontend_exception_union(
     tmp_path,
 ):
     """Every known failure path must land in `FileNotFoundError | RuntimeError |
-    ValueError`, the union `cli.py` and `app.py` catch.
+    ValueError`, the union `cli.py` and `streamlit_app.py` catch.
 
     Individual tests above already cover most of these one at a time; this one
     exists to make the *union* the thing under test, so adding a fourth type
@@ -1042,8 +1043,8 @@ def test_failure_modes_stay_inside_the_frontend_exception_union(
     which would drag that library into both frontends) fails here rather than
     at a user's terminal. `expected_type` is checked exactly, so a path can't
     drift to a different member of the union unnoticed -- and nothing on the
-    pipeline-load path may become a ValueError, which app.py's guard there does
-    not catch: a traceback under the sidebar, on every rerun.
+    pipeline-load path may become a ValueError, which streamlit_app.py's guard
+    there does not catch: a traceback under the sidebar, on every rerun.
     """
     with pytest.raises(_FRONTEND_EXCEPTIONS, match=expected_message) as excinfo:
         failing_call(settings, fake_embeddings, fake_reranker, monkeypatch, tmp_path)

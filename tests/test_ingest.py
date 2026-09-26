@@ -861,7 +861,7 @@ def test_a_width_the_collection_cannot_hold_is_a_runtime_error_with_the_fix(
     pre-write check -- which reads only this pipeline's chunks -- has nothing
     to compare against, and the add is what fails. That failure is a
     ``ChromaError``, outside the union both frontends catch; it must arrive as
-    a RuntimeError, which ``app.py`` handles below its sidebar, and still name
+    a RuntimeError, which ``streamlit_app.py`` handles below its sidebar, and still name
     the remedy.
     """
     ingest_mod.open_store(settings, fake_embeddings).add_texts(
