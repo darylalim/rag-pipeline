@@ -65,3 +65,85 @@ jobs:
 
       - name: Run tests
         run: uv run pytest
+
+  # Once its checks pass, main's head releases its version if that has no
+  # published release yet. The tag and the release are made in one call, so a
+  # failed run leaves nothing half-made and the next push to main tries again.
+  release:
+    needs: [lint, test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # the tags and history the notes are built from
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          # Nothing here fills uv's cache, and setup-uv fails a job that caches
+          # with nothing to save.
+          enable-cache: false
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(uv version --short)
+          tag="v$version"
+          # Published releases only: `gh release view` would also find a draft.
+          # Any failure but a 404 stops here, not later as a false tag error.
+          if out=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" \
+            --silent 2>&1); then
+            echo "$tag is already released"
+            exit 0
+          elif [[ $out != *"(HTTP 404)"* ]]; then
+            echo "::error::$out"
+            exit 1
+          fi
+
+          # Only main's head releases, so a later push's run does once its
+          # checks pass. GitHub refuses the workflow token a tag on an older
+          # commit whose workflows differ from main's, and an older version
+          # released late would take Latest from a newer one.
+          head=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" \
+            --jq .object.sha)
+          if [ "$head" != "$GITHUB_SHA" ]; then
+            echo "main has moved on to $head; a passing run there releases"
+            exit 0
+          fi
+
+          # The API ignores --target for a tag that already exists (pushed by
+          # hand, or left by a deleted release) and would release that commit.
+          if tagged=$(git rev-parse -q --verify "refs/tags/$tag^{commit}") &&
+            [ "$tagged" != "$GITHUB_SHA" ]; then
+            echo "::error::$tag already tags $tagged, not $GITHUB_SHA"
+            exit 1
+          fi
+
+          prev=$(git describe --tags --abbrev=0 --match 'v*' --exclude "$tag" \
+            2> /dev/null || true)
+          repo="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          {
+            echo "## What's changed"
+            git log --no-merges --format='- %s (%h)' "${prev:+$prev..}$GITHUB_SHA"
+            echo
+            if [ -n "$prev" ]; then
+              echo "**Full Changelog**: $repo/compare/$prev...$tag"
+            else
+              echo "**Full Changelog**: $repo/commits/$tag"
+            fi
+          } > "$RUNNER_TEMP/notes.md"
+
+          # uv prints the version normalized (1.0rc1, 1.0.dev2, 1.0rc1.post1):
+          # short of a +local part, a/b/rc/dev and a digit mean a pre-release.
+          flags=()
+          if [[ ${version%%+*} =~ (a|b|rc|dev)[0-9] ]]; then
+            flags=(--prerelease --latest=false)
+          fi
+          gh release create "$tag" --target "$GITHUB_SHA" --title "$tag" \
+            --notes-file "$RUNNER_TEMP/notes.md" "${flags[@]}"

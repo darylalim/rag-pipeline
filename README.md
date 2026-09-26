@@ -417,13 +417,14 @@ model reaches: `cli.py`'s `if __name__ == "__main__"` guard, and the MLX calls i
 
 ### Continuous integration
 
-`.github/workflows/ci.yml` runs on every push — any branch — and on every pull
-request, as two jobs:
+`.github/workflows/ci.yml` checks every push — any branch — and every pull
+request with two jobs, and a third publishes [releases](#releases) from `main`:
 
-| Job    | Status check name                    | Runs |
-| ------ | ------------------------------------ | ---- |
-| `lint` | `ruff + ty`                          | `ruff check`, `ruff format --check`, `ty check` |
-| `test` | `pytest (py3.11)`, `pytest (py3.13)` | the pytest suite on the `requires-python` floor and the version `.python-version` pins |
+| Job       | Status check name                    | Runs |
+| --------- | ------------------------------------ | ---- |
+| `lint`    | `ruff + ty`                          | `ruff check`, `ruff format --check`, `ty check` |
+| `test`    | `pytest (py3.11)`, `pytest (py3.13)` | the pytest suite on the `requires-python` floor and the version `.python-version` pins |
+| `release` | `release`                            | on a push to `main`, after both: a GitHub release for a version that has none yet |
 
 Both install with `uv sync --locked`, which fails if `uv.lock` has drifted from
 `pyproject.toml` — so a dependency added by hand without re-locking is caught
@@ -441,12 +442,37 @@ produces no push event here, that is the only run.
 
 Nothing gates `main` — it accepts direct pushes, and CI reports on the result
 rather than blocking it. To gate merges instead, add a repository ruleset
-requiring the three status check names in the table above. To run the same
-checks locally beforehand:
+requiring the three `lint` and `test` status check names in the table above. To
+run the same checks locally beforehand:
 
 ```bash
 uv sync --locked && uv run ruff check . && uv run ruff format --check . && uv run ty check && uv run pytest
 ```
+
+### Releases
+
+A release is a version bump pushed to `main`:
+
+```bash
+uv version --bump minor    # or patch, major; updates pyproject.toml and uv.lock together
+git commit -am "Release 0.2.0" && git push
+```
+
+Once lint and tests pass on that push, the `release` job tags the commit
+`v0.2.0` and publishes a GitHub release listing the commits since the previous
+tag. Only `main`'s head releases, though: if another push has reached `main` by
+then, the release waits for a run that passes at the head, and is made from that
+commit — and a version bumped again in the meantime is never released on its
+own, its commits listed under the next one. On any push whose version already
+has a release the job stops there, and a push whose release failed is retried by
+the next push to `main`. A `v0.2.0` tag already on another commit (pushed by
+hand, or left by a deleted release) fails the job until the tag is deleted or
+the version bumped. Edit the version by hand and forget to re-lock, and CI fails
+at `uv sync --locked`, since `uv.lock` records it too. A pre-release version
+(`0.2.0rc1`) is published as a pre-release. Nothing is
+built or attached — GitHub adds the source archives itself, and the wheel would
+lack the chat app — and nothing goes to PyPI, where the name `rag-pipeline` is
+taken.
 
 ## Project structure
 

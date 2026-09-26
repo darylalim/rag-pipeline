@@ -18,6 +18,7 @@ uv run pytest --cov=rag_pipeline --cov=app --cov-report=term-missing   # coverag
 uv run ruff check --fix . && uv run ruff format .   # lint, then format (order matters)
 uv run ty check                      # type check
 uv sync --locked && uv run ruff check . && uv run ruff format --check . && uv run ty check && uv run pytest   # every check CI runs
+uv version --bump minor              # release: commit pyproject.toml + uv.lock, push to main; CI tags and publishes it
 ```
 
 When working with Python, invoke the relevant `/astral:<skill>` — `/astral:uv`,
