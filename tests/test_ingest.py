@@ -12,6 +12,7 @@ import sys
 import textwrap
 import threading
 import time
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 
@@ -1187,6 +1188,24 @@ def test_an_ingest_never_writes_back_a_stale_view_of_the_index(
     assert sorted(doc.id or "" for doc in hits) == held
 
 
+@contextlib.contextmanager
+def _workers(count: int) -> Iterator[ThreadPoolExecutor]:
+    """A thread pool whose exit does not wait for its workers.
+
+    `with ThreadPoolExecutor()` joins every worker on the way out, unbounded,
+    so a run that never finishes -- a lock never released, the very bug the
+    tests below exist for -- would hang the suite without naming the test. Each
+    test waits in `result(timeout=)` instead: that fails, or raises what the
+    worker failed with. A stuck worker still holds the interpreter open at exit,
+    as any non-daemon thread does, but only after the failure is reported.
+    """
+    pool = ThreadPoolExecutor(max_workers=count)
+    try:
+        yield pool
+    finally:
+        pool.shutdown(wait=False)
+
+
 def test_a_store_reset_cannot_break_another_threads_client_open(
     settings, fake_embeddings, monkeypatch
 ):
@@ -1225,10 +1244,10 @@ def test_a_store_reset_cannot_break_another_threads_client_open(
     def rerun() -> None:  # what every app rerun reads
         ingest_mod.index_version(settings)
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    with _workers(2) as pool:
         sessions = [pool.submit(hammer, step) for step in (rebuild, rerun)]
     for session in sessions:
-        session.result()
+        session.result(timeout=30)
 
 
 # --- one writer at a time ----------------------------------------------------
@@ -1257,10 +1276,11 @@ def test_concurrent_ingests_take_turns(settings, fake_embeddings):
         start.wait()
         return ingest_mod.ingest(settings, embeddings=fake_embeddings)
 
-    with pytest.MonkeyPatch.context() as mp, ThreadPoolExecutor(max_workers=2) as pool:
+    with pytest.MonkeyPatch.context() as mp, _workers(2) as pool:
         mp.setattr(Chroma, "get", slow_read)
         ingests = [pool.submit(run) for _ in range(2)]
-    counts = [ingest.result() for ingest in ingests]
+        # Inside, so the slowed reads last as long as the runs do.
+        counts = [ingest.result(timeout=60) for ingest in ingests]
 
     switches = sum(a != b for a, b in itertools.pairwise(calls))
     assert switches == 1, "the two ingests' store reads interleaved"
@@ -1278,16 +1298,15 @@ def test_ingest_waits_for_a_writer_holding_the_lock(settings, fake_embeddings):
     """
     settings.persist_dir.mkdir(parents=True)
 
-    # Exited in reverse: the lock is released, then the pool waits for the run.
     with (
-        ThreadPoolExecutor(max_workers=1) as pool,
+        _workers(1) as pool,
         FileLock(str(settings.persist_dir / ".ingest.lock")),
     ):
         run = pool.submit(ingest_mod.ingest, settings, embeddings=fake_embeddings)
         wait([run], timeout=1)
         waited = not run.done()
         written_meanwhile = ingest_mod.index_version(settings)
-    run.result()  # it completed once released, or raises what it failed with
+    run.result(timeout=60)  # it completes once released, or raises what it failed with
 
     assert waited, "ingest ran while another writer held the lock"
     assert written_meanwhile == ""
@@ -1307,7 +1326,7 @@ def test_a_run_that_waited_for_the_lock_indexes_data_dir_as_it_is_now(
     settings.persist_dir.mkdir(parents=True)
 
     with (
-        ThreadPoolExecutor(max_workers=1) as pool,
+        _workers(1) as pool,
         FileLock(str(settings.persist_dir / ".ingest.lock")),
     ):
         run = pool.submit(ingest_mod.ingest, settings, embeddings=fake_embeddings)
@@ -1316,7 +1335,7 @@ def test_a_run_that_waited_for_the_lock_indexes_data_dir_as_it_is_now(
         (settings.data_dir / "late.md").write_text(
             "Written while the ingest waited.\n", encoding="utf-8"
         )
-    run.result()
+    run.result(timeout=60)
 
     assert "late.md" in sources_in(settings, fake_embeddings)
 

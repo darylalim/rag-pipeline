@@ -735,11 +735,15 @@ def test_forward_passes_over_one_model_are_serialized(fake_mlx, model_dir, monke
         call()
 
     # A thread each, or the barrier waits for good; result() raises here what
-    # any of them failed with, traceback and all.
-    with ThreadPoolExecutor(max_workers=len(calls)) as executor:
+    # any of them failed with, traceback and all. Not `with`: its exit joins the
+    # workers unbounded, so a pass stuck on the lock would hang here, not fail.
+    executor = ThreadPoolExecutor(max_workers=len(calls))
+    try:
         passes = [executor.submit(run, call) for call in calls]
-    for future in passes:
-        future.result()
+        for future in passes:
+            future.result(timeout=10)
+    finally:
+        executor.shutdown(wait=False)
 
     assert peak == 1
 

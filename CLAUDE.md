@@ -643,7 +643,7 @@ stronger than the regex they retired.
   pipeline load is caught below it, so the uploader stays reachable when there
   is no index. A chat turn catches the union too, then anything else — a bug,
   not a failure mode — which it shows the same way but also logs with its
-  traceback, since caught it never reaches Streamlit's own log. Grep
+  traceback, since once caught it never reaches Streamlit's own log. Grep
   `except (FileNotFoundError` rather than trusting a line number. Don't add a
   fourth type — `_add_documents()` catching `OSError` is not one: it is the
   filesystem's own error on a write, and `FileNotFoundError` is already a
