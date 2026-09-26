@@ -401,45 +401,14 @@ load multi-gigabyte MLX checkpoints from the Hugging Face cache, but none runs
 under test. Any new code path touching an embedding model, the reranker, or the
 LLM should thread these through rather than constructing them unconditionally.
 
-Injection is a convention, so `conftest.py` backs it with autouse guards:
-
-- `_no_real_models` puts `None` in `sys.modules` for `mlx` and `mlx_lm`, so
-  `import mlx_lm` raises and `load_mlx_model()` reports a RuntimeError before it
-  looks in the cache. **This is the one that catches a forgotten injection.** A
-  test that forgets `embeddings=` names no banned symbol, and with the models
-  cached it opens no socket either — a network block alone would let it load
-  gigabytes of weights. It behaves identically on a Mac with MLX installed and on
-  the Linux CI legs without it.
-- `_offline` blocks every socket, to any host: Chroma is in-process and the
-  models are local files, so a connection means something is downloading (a
-  model, Chroma's default ONNX embedder) or phoning home.
-- `_no_tracing` (session-scoped) deletes `PHOENIX_COLLECTOR_ENDPOINT` and forces
-  LangSmith's switches to `false` (the pipeline no longer uses LangSmith, but
-  langsmith ships inside langchain-core and still acts on them). `.env` is loaded
-  at import time, and either would otherwise send test traces from a background
-  flush that can land after `_offline` is undone. **`_offline` cannot catch an
-  exporter**: the socket block's `RuntimeError` is caught inside the tracing
-  stack and only logged — by the exporter's own HTTP transport from
-  OpenTelemetry 1.45, by the batch processor before — so the test passes.
-- `_no_tracer_left_on` is what makes that failure loud: after every test it
-  fails one that left a global tracer provider installed or LangChain
-  instrumented. A test that runs `setup_tracing` for real takes `undo_tracing`;
-  one that asserts on spans takes `spans`, which records them in memory
-  (OpenInference's provider, a synchronous processor, LangChain instrumented)
-  and undoes all of it — OpenTelemetry allows one global provider per process,
-  and `opentelemetry-test-utils`' `reset_trace_globals()` is what undoes it.
-  The guard switches a leak off before failing, through the same
-  `_switch_tracing_off()` as `undo_tracing`, so the failure stays with the test
-  that leaked. Left on, it would fail the tests after it too: each would trip
-  the check again until one undid tracing, and one that sets tracing up would
-  find it done and return early, installing and raising nothing.
-  `test_a_leak_fails_only_the_test_that_left_tracing_on` runs such a session
-  in a pytest subprocess.
-
-`tests/test_offline_guard.py` trips every route to a real model on purpose —
-each factory, an ingest and a pipeline left without a fake — and checks the
-socket block and the `models` exemption (through the `hide_mlx` fixture), so a
-guard that loosens reads as a failure rather than as green.
+Injection is a convention, so `conftest.py` backs it with autouse guards, each
+pinned by `tests/test_offline_guard.py` so one that loosens reads as a failure: `_no_real_models` makes MLX unimportable (**the one that catches a
+forgotten injection** — with the models cached, a network block alone would let
+it load them), `_offline` blocks every socket, `_no_tracing` keeps Phoenix and
+LangSmith off whatever `.env` says, and `_no_tracer_left_on` fails a test that
+left tracing on (which `_offline` cannot see: the tracing stack swallows the
+socket error). How each works, and which fixture a new test takes, is in
+`tests/CLAUDE.md`.
 
 Tests marked `@pytest.mark.models` are the deliberate exception: they load the
 real models, are deselected by pyproject's `addopts = ["-m", "not models"]`, and
@@ -591,27 +560,10 @@ because they are only observable at the frontend:
 
 The text-level rules live in `tests/invariants.py` as data, and
 `tests/test_invariants.py` enforces them across every `.py` file git does not
-ignore, whether or not it has been added yet. **That test is the
-enforcement** — it runs in CI, for every contributor and every PR from a fork,
-whoever wrote the code and whatever editor they used. There is no second layer,
-and nothing here depends on which editor you use.
-
-Adding a rule means adding a `Rule` to `RULES`, a case in each direction in
-`test_invariants.py`, and a row in the README rule table —
-`test_every_rule_is_documented` is what catches the last one, and it exists
-because the README's prose had already fallen two rules behind `RULES` with the
-whole suite green. Two properties are load-bearing and easy to break:
-
-- Rules match a **masked** copy of the text: string literals are blanked for
-  every rule, comments too for all but the suppression rule. Without that, a
-  comment describing a rule is blocked by the rule it describes. Strings and
-  comments are found in one pass, so a quote inside a comment opens no string:
-  masking strings first let an apostrophe and a later quote in one comment
-  hide the text between them, suppressions included.
-- The masking alternation must stay **linear**. An earlier form let two branches
-  both match a backslash, and an unterminated quote took 6.5s at 8 lines and
-  never finished at 12 — the sweep hanging rather than failing.
-  `test_masking_is_linear_on_pathological_input` is the guard.
+ignore, whether or not it has been added yet. **That test is the only
+enforcement**: it runs locally and in CI for every contributor, and there is no
+hook or editor layer. How to add a rule, and the two properties of its masking
+that are easy to break, are in `tests/CLAUDE.md`.
 
 **Prefer a behavioral test to a rule.** A rule matches spellings; a test
 observes the property, so it covers routes nobody thought to enumerate. Reach
