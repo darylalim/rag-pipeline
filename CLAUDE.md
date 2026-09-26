@@ -62,9 +62,8 @@ inherited (from the default and from `requires-python`) — don't re-pin them in
 `pyproject.toml`.
 
 `README.md` covers setup, configuration variables, usage, performance, and what
-CI runs; `ci.yml`'s own comments cover why its steps are ordered as they are.
-Consult both rather than duplicating that material here. Every CI job must stay
-green.
+CI runs; `ci.yml`'s own comments cover why it is configured as it is. Consult
+both rather than duplicating that material here. Every CI job must stay green.
 
 ## Architecture
 

@@ -1,118 +1,56 @@
 name: CI
 
-# `push` is unscoped so every branch gets CI immediately, not only once a PR is
-# open — a branch that has been broken for six commits is worth knowing about
-# before review.
-#
-# `pull_request` is still required, not decorative: a PR from a fork produces no
-# push event in this repo, so without it a fork's changes would arrive for review
-# with no CI signal at all. The `if:` on each job below is what stops a same-repo
-# PR running everything twice.
+# `push` is unscoped, so a branch gets CI before any PR exists. `pull_request`
+# is a fork's only CI: a fork's PR makes no push event in this repo.
 on:
   push:
   pull_request:
 
-# Neither job writes anything back to the repo; least privilege limits what a
-# compromised dependency build backend could reach during `uv sync`.
+# Read-only whatever the repo's default token permissions: every job runs
+# third-party code with checkout's token left in .git/config. A job that has to
+# write raises its own permissions.
 permissions:
   contents: read
 
-# Cancel superseded runs on the same ref so only the latest push/PR is tested.
-# head_ref is set for pull_request events, ref for push.
-concurrency:
-  group: ci-${{ github.head_ref || github.ref }}
-  cancel-in-progress: true
-
-# The rendered `name:` of each job below is what appears as a status check:
-#
-#     ruff + ty · pytest (py3.11) · pytest (py3.13)
-#
-# Nothing requires them at present — `main` carries no ruleset and takes direct
-# pushes, so CI reports on a commit rather than gating it. Confirm with:
-#     gh api repos/darylalim/rag-pipeline/rulesets
-#
-# If a gate is added back it matches these by exact string, so renaming a job or
-# changing a matrix value has to happen in the same change as the rule. A rule
-# matching no check still reads as configured while enforcing nothing, which is
-# the failure worth remembering: a protection that appears active and is not.
-#
-# Both jobs carry the same `if:`. A same-repo PR branch already got a full run
-# from its own push event on the identical SHA, so the pull_request run skips
-# instead of repeating it — and a skipped check reports as passing, so this
-# stays compatible with a required-checks gate if one returns. A fork PR has no
-# push event here, so the condition is true and the checks run for real.
-# Comparing `full_name` never reaches a shell -- it is an expression, not
-# interpolation into `run:`.
 jobs:
-  # Lint and type checks are interpreter-independent, so they run once on a
-  # single version rather than across the test matrix.
+  # ruff and ty take their target version from requires-python, not from the
+  # interpreter, so they run once rather than across the test matrix.
   lint:
-    name: ruff + ty  # ← status check name
-    if: >-
-      github.event_name == 'push'
-      || github.event.pull_request.head.repo.full_name != github.repository
+    name: ruff + ty
     runs-on: ubuntu-latest
-    # Unset, a stuck job holds its runner for GitHub's default of six hours; the
-    # job itself takes about a minute.
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
       - name: Install uv
         uses: astral-sh/setup-uv@v6
-        with:
-          enable-cache: true
-          python-version: "3.13"
 
-      # ruff is a standalone binary and needs none of the project's dependencies,
-      # so install just the dev group first — seconds, versus longer for the full
-      # project (chromadb, langchain, streamlit). A ruff failure then costs
-      # nothing further.
-      #
-      # --locked installs from uv.lock *and* asserts the lock is up to date with
-      # pyproject.toml. --frozen would skip that check, so a dependency added by
-      # hand without re-locking would silently never install and CI would pass.
-      - name: Install lint tools
-        run: uv sync --locked --only-group dev
+      # --locked, not --frozen: a uv.lock that has drifted from pyproject.toml
+      # fails here, where --frozen would install it as-is and CI would pass.
+      - name: Install dependencies
+        run: uv sync --locked
 
-      # --no-sync is load-bearing: a plain `uv run` re-syncs the full project
-      # first, which would install the full dependency set and undo the step above.
       - name: Lint
-        run: uv run --no-sync ruff check .
+        run: uv run ruff check .
 
       - name: Check formatting
-        run: uv run --no-sync ruff format --check .
-
-      # ty, unlike ruff, needs the real dependencies installed — it resolves
-      # imports through them, and reports unresolved-import without them.
-      # The one exception is MLX: it is declared `; sys_platform == 'darwin'`,
-      # so this Linux runner never installs it, and pyproject's
-      # `replace-imports-with-any` types it as Any on every platform — which is
-      # what makes this check give the same answer as `uv run ty check` on a Mac.
-      - name: Install project dependencies
-        run: uv sync --locked
+        run: uv run ruff format --check .
 
       - name: Type check
         run: uv run ty check
 
   test:
-    name: pytest (py${{ matrix.python-version }})  # ← status check name
-    if: >-
-      github.event_name == 'push'
-      || github.event.pull_request.head.repo.full_name != github.repository
+    name: pytest (py${{ matrix.python-version }})
     runs-on: ubuntu-latest
-    # The suite's threaded tests exist to catch a lock that is never released.
-    # A test that hangs on one in its own body gets every stack dumped into the
-    # log five minutes in, naming it (pyproject's faulthandler_timeout). One
-    # that fails its bounded wait instead is named in pytest's report -- but its
-    # stuck worker can then hold the interpreter open at exit, with no further
-    # output, and this is what ends that job, rather than GitHub's default of
-    # six hours. A healthy run takes about a minute.
+    # Above pyproject's faulthandler_timeout (300 s), which only dumps a hung
+    # test's stacks; a job cancelled before that never names the test. It is
+    # also all that ends a run whose stuck worker thread holds the interpreter
+    # open, silently, after pytest has reported. GitHub's default is six hours.
     timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
-        # Minimum supported and latest — the ends of requires-python.
+        # requires-python's floor, and the version .python-version pins.
         python-version: ["3.11", "3.13"]
     steps:
       - uses: actions/checkout@v4
@@ -120,23 +58,10 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v6
         with:
-          enable-cache: true
           python-version: ${{ matrix.python-version }}
 
-      # --locked installs exactly what's in uv.lock and fails if the lock has
-      # drifted from pyproject.toml (see the lint job for why not --frozen).
-      # The dev group (pytest) is included by default. MLX is macOS-only, so
-      # it is the one part of the lock this never installs.
       - name: Install dependencies
         run: uv sync --locked
 
-      # Tests inject fake embedding, reranker and chat models, and run Chroma
-      # in-process under a per-test temp directory — so no secret, no model, no
-      # container and no network (conftest blocks every socket). They never
-      # import MLX either: conftest makes it unimportable even on a Mac where it
-      # is installed, so this Linux runner, which lacks it, sees the same suite.
-      # The `models` tests load the real checkpoints and need Apple Silicon;
-      # pyproject's addopts deselects them, and they run only by hand on a Mac
-      # (`uv run pytest -m models`).
       - name: Run tests
         run: uv run pytest

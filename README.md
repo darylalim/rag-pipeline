@@ -423,12 +423,11 @@ request, as two jobs:
 | Job    | Status check name                    | Runs |
 | ------ | ------------------------------------ | ---- |
 | `lint` | `ruff + ty`                          | `ruff check`, `ruff format --check`, `ty check` |
-| `test` | `pytest (py3.11)`, `pytest (py3.13)` | the pytest suite on both ends of `requires-python` |
+| `test` | `pytest (py3.11)`, `pytest (py3.13)` | the pytest suite on the `requires-python` floor and the version `.python-version` pins |
 
 Both install with `uv sync --locked`, which fails if `uv.lock` has drifted from
 `pyproject.toml` — so a dependency added by hand without re-locking is caught
-rather than silently skipped. The `lint` job installs only the dev group before
-running ruff, and the full environment only for `ty check`.
+rather than silently skipped.
 
 Both run on Linux, where the project does not install MLX. That costs nothing:
 MLX is declared macOS-only in `pyproject.toml` (`; sys_platform == 'darwin'`), so
@@ -436,9 +435,9 @@ the runners never install it, and the suite never imports it anyway. Tests need 
 The `models` tests are the part CI never runs.
 
 Every branch push gets CI immediately, so a branch that has been broken for
-several commits is visible before review rather than after. A same-repo pull
-request then reuses that run; a fork's pull request produces no push event here,
-so its jobs run for real.
+several commits is visible before review rather than after. A pull request gets
+a second run, on the result of merging it into its base; for a fork's, which
+produces no push event here, that is the only run.
 
 Nothing gates `main` — it accepts direct pushes, and CI reports on the result
 rather than blocking it. To gate merges instead, add a repository ruleset
