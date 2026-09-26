@@ -34,12 +34,25 @@ ROOT = Path(__file__).resolve().parent.parent
 def swept_python_files(root: Path = ROOT) -> list[str]:
     """Every .py file git would track, added or not, or [] outside a work tree.
 
-    Globbed rather than listed because a hardcoded list fails by silently not
-    covering a new file -- and for the same reason not only the tracked ones: a
-    file just written is the likeliest to break a rule, and is not tracked until
-    it is added. `main` takes direct pushes, so a local run is the one check
-    before a change lands, and a violation left for CI to find is already in.
-    What .gitignore excludes (a venv, the index) is not this repo's source.
+    Asked of git rather than listed because a hardcoded list fails by silently
+    not covering a new file -- and for the same reason not only the tracked
+    ones: a file just written is the likeliest to break a rule, and is not
+    tracked until it is added. `main` takes direct pushes, so a local run is the
+    one check before a change lands, and a violation left for CI to find is
+    already in. What .gitignore excludes (a venv, the index) is not this repo's
+    source.
+
+    Filtered here, not by a `*.py` pathspec: a hook started by
+    `git --literal-pathspecs` (Magit runs git that way) inherits
+    GIT_LITERAL_PATHSPECS, under which that pathspec matches no file, and every
+    tree test skipped as "not a git work tree" -- green, with nothing swept.
+
+    NUL-separated, because otherwise git wraps a name holding a non-ASCII
+    character, a quote or a backslash in quotes, with octal escapes -- the
+    suffix check would drop `données.py` without a word -- and a name with a
+    space in it splits on whitespace. Unquoted, the names are raw bytes,
+    decoded as the filesystem does: a single name that is not UTF-8, anywhere
+    in the checkout, would otherwise stop collection.
 
     Returning [] rather than raising matters: this runs at collection time, and
     an exception here takes down the whole suite — including the product tests —
@@ -52,19 +65,24 @@ def swept_python_files(root: Path = ROOT) -> list[str]:
                 "-C",
                 str(root),
                 "ls-files",
+                "-z",
                 "--cached",
                 "--others",
                 "--exclude-standard",
-                "*.py",
             ],
             capture_output=True,
-            text=True,
             timeout=10,
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
         return []
-    return sorted(result.stdout.split()) if result.returncode == 0 else []
+    if result.returncode != 0:
+        return []
+    return sorted(
+        os.fsdecode(path)
+        for path in result.stdout.split(b"\0")
+        if path.endswith(b".py")
+    )
 
 
 SWEPT = swept_python_files()
@@ -156,6 +174,59 @@ def test_the_sweep_covers_a_file_not_yet_added(
     (tmp_path / "ignored" / "vendored.py").write_text("")
 
     assert swept_python_files(tmp_path) == ["new.py", "tracked.py"]
+
+
+@pytest.mark.parametrize("var", PATHSPEC_ENV_VARS)
+def test_a_pathspec_mode_a_hook_inherits_leaves_the_sweep_whole(
+    var: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The sweep finds the same files whatever pathspec mode git is in.
+
+    Under the literal and noglob modes a `*.py` pathspec matched nothing, and
+    the sweep skipped rather than failed; under the glob mode it matched only
+    the top level. Each is exported to a hook by `git --<mode>-pathspecs`.
+
+    The baseline is taken here with every mode cleared, not from SWEPT: in a
+    run started from such a hook, SWEPT is what a regression would empty, and
+    a test gated on it would skip along with the sweep.
+    """
+    for mode in PATHSPEC_ENV_VARS:
+        monkeypatch.delenv(mode, raising=False)
+    baseline = swept_python_files()
+    if not baseline:
+        pytest.skip("not a git work tree")
+    monkeypatch.setenv(var, "1")
+
+    assert swept_python_files() == baseline
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+def test_a_file_name_that_is_not_utf8_does_not_stop_collection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A name git lists that is not UTF-8 is swept, not raised on.
+
+    Unquoted, git's listing is raw bytes, and decoding them strictly raised at
+    collection -- from any such name in the checkout -- and took the whole
+    suite down with it. The name goes straight into the index, because macOS's
+    filesystem refuses to create it.
+    """
+    init_scratch_repository(tmp_path, monkeypatch)
+    blob = subprocess.run(
+        ["git", "-C", str(tmp_path), "hash-object", "-w", "--stdin"],
+        input=b"",
+        capture_output=True,
+        check=True,
+        timeout=10,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "update-index", "-z", "--index-info"],
+        input=b"100644 " + blob + b"\tcaf\xe9.py\0",
+        check=True,
+        timeout=10,
+    )
+
+    assert swept_python_files(tmp_path) == [os.fsdecode(b"caf\xe9.py")]
 
 
 # --- what git leaves out -----------------------------------------------------
