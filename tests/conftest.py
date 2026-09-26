@@ -293,7 +293,10 @@ def fresh_interpreter(tmp_path) -> Callable[..., subprocess.CompletedProcess[str
     the developer's own settings -- this repo's (config.py's load_dotenv() has
     put .env's in os.environ), OpenTelemetry's, and chromadb's, which it reads
     under its field names, not all of them CHROMA_ ones (ALLOW_RESET) -- and
-    .env is switched off, or config.py would read it straight back in. The
+    .env is switched off, or config.py would read it straight back in. So is
+    what this package sets for itself as it is imported
+    (TRANSFORMERS_NO_ADVISORY_WARNINGS): this process's import already put it
+    in os.environ, and inherited, it would answer for the child's own. The
     working directory is the test's own, because chromadb reads a .env from
     there for itself. MLX is made unimportable and PERSIST_DIR names an index
     that does not exist, so the child can load no model and open no store,
@@ -309,6 +312,7 @@ def fresh_interpreter(tmp_path) -> Callable[..., subprocess.CompletedProcess[str
             name: value
             for name, value in os.environ.items()
             if name not in ENV_VARS
+            and name != "TRANSFORMERS_NO_ADVISORY_WARNINGS"
             and not name.startswith(("OTEL_", "CHROMA_"))
             and name.lower() not in ChromaSettings.model_fields
         }

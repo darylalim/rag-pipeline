@@ -362,8 +362,7 @@ TRACING_STACK = (
 
 # Records which HEAVY modules are loaded after importing cli.py, then again after
 # importing the store and query modules -- one interpreter, so the second
-# reading is the control for the first. Whether transformers came along is
-# recorded too: the stderr check below means something only when it did.
+# reading is the control for the first.
 _IMPORT_PROBE = """
 import json, sys
 loaded = {{}}
@@ -375,15 +374,13 @@ from rag_pipeline.config import Settings
 from rag_pipeline.tracing import setup_tracing
 setup_tracing(Settings())  # what both frontends do with tracing off
 loaded["tracing"] = [m for m in {tracing!r} if m in sys.modules]
-loaded["transformers"] = "transformers" in sys.modules
 print(json.dumps(loaded))
 """
 
 
 @pytest.fixture(scope="module")
 def heavy_modules_loaded() -> dict:
-    """What a fresh interpreter holds of HEAVY, after cli.py and after the rest,
-    and what it printed on stderr doing so.
+    """What a fresh interpreter holds of HEAVY, after cli.py and after the rest.
 
     In a subprocess because this suite has already imported all of it; the
     question is what a fresh interpreter loads, which is the only place the
@@ -401,8 +398,7 @@ def heavy_modules_loaded() -> dict:
         timeout=120,
         check=True,
     )
-    loaded = json.loads(result.stdout.strip().splitlines()[-1])
-    return {**loaded, "stderr": result.stderr}
+    return json.loads(result.stdout.strip().splitlines()[-1])
 
 
 def test_importing_cli_does_not_load_the_heavy_stack(heavy_modules_loaded):
@@ -456,15 +452,29 @@ def test_tracing_off_loads_none_of_the_tracing_stack(heavy_modules_loaded):
     importlib.util.find_spec("transformers") is None,
     reason="transformers arrives only with mlx-lm, which is installed only on macOS",
 )
-def test_importing_the_pipeline_prints_no_pytorch_warning(heavy_modules_loaded):
+def test_importing_the_pipeline_prints_no_pytorch_warning(fresh_interpreter):
     """No "PyTorch was not found" on every command.
 
     transformers is only mlx-lm's tokenizer backend, and torch is deliberately
     absent -- but LangChain imports transformers as soon as the pipeline is
     imported, before mlx-lm can silence the notice, so without the package's
     own setting every `rag` command and the app would open by announcing that
-    models won't be available. The first assertion is the control: transformers
-    has to have been imported for the second to mean anything.
+    models won't be available.
+
+    The pipeline modules are imported first and alone: whichever module an
+    entry point starts from, the package's `__init__` runs before it, so only a
+    setting made there holds for all of them -- one moved into cli.py would
+    leave the app printing the notice. In a scrubbed interpreter, because this
+    one set the variable when it imported the package, and a child inheriting it
+    would pass whether or not the package still sets it. The transformers check
+    is the control: transformers has to have been imported for the notice check
+    to mean anything.
     """
-    assert heavy_modules_loaded["transformers"]
-    assert "PyTorch was not found" not in heavy_modules_loaded["stderr"]
+    result = fresh_interpreter(
+        "import sys, rag_pipeline.ingest, rag_pipeline.pipeline\n"
+        "print('transformers' in sys.modules)\n"
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split()[-1] == "True"
+    assert "PyTorch was not found" not in result.stderr
