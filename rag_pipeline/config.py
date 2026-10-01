@@ -76,6 +76,34 @@ def _env_url(name: str, default: str) -> str:
     return value
 
 
+def require_env_key(name: str, used_for: str) -> str:
+    """Return the credential in ``name``, or raise ``RuntimeError`` naming it.
+
+    Credentials are deliberately not ``Settings`` fields. A field needs a
+    literal default that the README and ``.env.example`` can state, and a key
+    has none; and a field is a value the frontends display and a traceback can
+    print, which a key must never be. So each stage that needs a key reads it
+    where it is used, through this one function, and they all agree on what a
+    missing key is -- set-but-empty counts as unset, as it does for the
+    ``_env_*`` helpers -- and on what the user is told.
+
+    ``RuntimeError`` rather than the ``ValueError`` a malformed setting raises:
+    a key is first needed while the pipeline loads, below the Streamlit
+    sidebar, where only ``FileNotFoundError`` and ``RuntimeError`` are caught.
+    The message is built here rather than by each caller, so the variable it
+    names is always the one that was checked. ``used_for`` names the stage
+    that needs the key ("Answers come from Claude") and is spliced in ahead of
+    a semicolon, so it takes no trailing punctuation.
+    """
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(
+            f"{name} is not set. {used_for}; set it in your environment or in "
+            "a .env file (see .env.example)."
+        )
+    return value
+
+
 @dataclass(frozen=True)
 class Settings:
     """Immutable bundle of pipeline configuration."""

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from rag_pipeline.config import ENV_VARS, Settings
+from rag_pipeline.config import ENV_VARS, Settings, require_env_key
 
 # The checkout this test file sits in. The path defaults are anchored to the
 # repository, not the working directory, so `rag` behaves the same whichever
@@ -177,3 +177,56 @@ def test_env_vars_are_exactly_what_from_env_reads(monkeypatch):
     Settings.from_env()
 
     assert sorted(read) == sorted(ENV_VARS)
+
+
+# The credentials the cloud migration reads. Exemplary rather than exhaustive:
+# what is tested is how `require_env_key` treats any name, and these are the
+# ones a developer's .env is most likely to hold -- which is why each test
+# deletes or sets them explicitly rather than trusting the environment.
+_CREDENTIALS = (
+    "ANTHROPIC_API_KEY",
+    "VOYAGE_API_KEY",
+    "MONGODB_URI",
+    "LANGSMITH_API_KEY",
+)
+
+
+@pytest.mark.parametrize("name", _CREDENTIALS)
+@pytest.mark.parametrize("value", [None, ""], ids=["unset", "empty"])
+def test_a_missing_credential_is_a_runtime_error_naming_it(monkeypatch, name, value):
+    # RuntimeError, not ValueError: a key is first needed on the pipeline-load
+    # path, where the app's guard catches only FileNotFoundError | RuntimeError.
+    if value is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, value)
+
+    with pytest.raises(RuntimeError, match=rf"^{name} is not set\. ") as excinfo:
+        require_env_key(name, "Answers come from Claude")
+
+    message = str(excinfo.value)
+    assert "Answers come from Claude; set it" in message
+    assert ".env.example" in message
+
+
+def test_a_set_credential_is_returned(monkeypatch):
+    monkeypatch.setenv("MONGODB_URI", "mongodb+srv://user:pw@cluster.example.net")
+
+    assert (
+        require_env_key("MONGODB_URI", "The index is stored in Atlas")
+        == "mongodb+srv://user:pw@cluster.example.net"
+    )
+
+
+def test_a_credential_never_reaches_settings(monkeypatch):
+    """No key is a Settings field, so none is displayed or printed with them.
+
+    The sidebar renders Settings values, and a traceback through any function
+    holding a Settings prints its repr. A key read into a field -- under its
+    own name or any other -- would carry the sentinel into that repr.
+    """
+    sentinel = "sk-sentinel-must-not-appear"
+    for name in _CREDENTIALS:
+        monkeypatch.setenv(name, sentinel)
+
+    assert sentinel not in repr(Settings.from_env())

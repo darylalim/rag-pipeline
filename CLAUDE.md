@@ -85,8 +85,16 @@ tracing (rag_pipeline/tracing.py)     optional: each question as one trace, to a
 `Settings` (`config.py`) is a frozen dataclass built via `Settings.from_env()`.
 Both frontends — `rag_pipeline/cli.py` and `streamlit_app.py` — construct it the same way,
 which is what keeps them agreeing on the persist directory and collection, the
-models, and chunking. There are no secrets: every setting is a field with a
-literal default.
+models, and chunking. Every setting is a field with a literal default.
+
+Credentials are not settings. A key has no literal default to document, and a
+field is a value the sidebar displays and a traceback prints, so no key is ever
+a `Settings` field (`test_a_credential_never_reaches_settings`). The stage that
+needs a key reads it where it is used, through `config.require_env_key()`: a
+`RuntimeError` naming the variable when it is unset or empty, which lands in
+the pipeline-load guard. A key is documented in `.env.example` and the README in
+the same change as the code that first reads it, not before — until then the
+docs would ask for a key nothing uses.
 
 All tunables live here — never inline a literal at a call site. Adding one is a
 **three-file change**:
