@@ -1,0 +1,39 @@
+{
+  "dataset": "rag-pipeline-qa-6c17186e8443",
+  "experiment": "rag-pipeline-38ee4ec4",
+  "url": "https://smith.langchain.com/o/98ceb257-f10c-4666-b247-995cd045bb7d/datasets/721a09b7-aede-498d-b1e0-1714413c99df/compare?selectedSessions=a149bc84-0b24-42ce-b786-a7fff176d8ea",
+  "date": "2026-10-01",
+  "judge": "claude-opus-5-5",
+  "settings": {
+    "collection_name": "rag_eval",
+    "embedding_model": "mlx-community/Qwen3-VL-Embedding-2B-bf16",
+    "embedding_dimensions": 2048,
+    "chat_model": "mlx-community/Qwen3.8-27B-4bit",
+    "max_tokens": 1024,
+    "chunk_size": 1000,
+    "chunk_overlap": 200,
+    "retrieval_k": 4,
+    "fetch_k": 20,
+    "rerank_model": "mlx-community/Qwen3-VL-Reranker-2B-bf16",
+    "phoenix_collector_endpoint": "",
+    "phoenix_project": "rag-pipeline"
+  },
+  "scores": {
+    "retrieval_hit": {
+      "mean": 1.0,
+      "n": 45
+    },
+    "retrieval_rank": {
+      "mean": 1.0,
+      "n": 45
+    },
+    "correct": {
+      "mean": 1.0,
+      "n": 50
+    },
+    "grounded": {
+      "mean": 1.0,
+      "n": 50
+    }
+  }
+}

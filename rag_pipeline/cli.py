@@ -1,4 +1,4 @@
-"""Command-line interface: `rag ingest` and `rag query "..."`.
+"""Command-line interface: `rag ingest`, `rag query "..."` and `rag eval`.
 
 A thin wrapper over the core modules so the pipeline is scriptable from a
 terminal. The same ``Settings`` and ``RAGPipeline`` back the Streamlit app.
@@ -57,6 +57,19 @@ def cmd_query(settings: Settings, question: str) -> int:
     return 0
 
 
+def cmd_eval(settings: Settings, save_baseline: bool) -> int:
+    from rag_pipeline.evaluation import run
+
+    print(
+        "Scoring the pipeline on evals/questions.json, over evals/corpus/ in "
+        "its own collection. This loads the models and answers every "
+        "question, so it takes several minutes."
+    )
+    for line in run(settings, save_baseline=save_baseline):
+        print(line)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="rag",
@@ -71,6 +84,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     query_parser.add_argument("question", help="The question to answer")
 
+    eval_parser = subparsers.add_parser(
+        "eval",
+        help="Score the pipeline on evals/questions.json, as a LangSmith experiment",
+    )
+    eval_parser.add_argument(
+        "--save-baseline",
+        action="store_true",
+        help="Save this run's scores as the baseline later runs are compared with",
+    )
+
     args = parser.parse_args(argv)
 
     try:
@@ -80,6 +103,8 @@ def main(argv: list[str] | None = None) -> int:
         settings = Settings.from_env()
         if args.command == "ingest":
             return cmd_ingest(settings)
+        if args.command == "eval":
+            return cmd_eval(settings, args.save_baseline)
         # `required=True` guarantees a subcommand; "query" is the only other one.
         return cmd_query(settings, args.question)
     except (FileNotFoundError, RuntimeError, ValueError) as exc:

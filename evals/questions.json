@@ -1,0 +1,397 @@
+[
+  {
+    "id": "dockhand-timeout",
+    "question": "What is Dockhand's request timeout?",
+    "answer": "30 seconds per carrier request.",
+    "sources": [
+      "services/dockhand.md"
+    ]
+  },
+  {
+    "id": "lantern-timeout",
+    "question": "What is the request timeout of the search service?",
+    "answer": "800 milliseconds (Lantern).",
+    "sources": [
+      "services/lantern.md"
+    ]
+  },
+  {
+    "id": "signalbox-retries",
+    "question": "How many times does Signalbox retry a delivery, and how long can it wait between attempts?",
+    "answer": "5 attempts, with backoff capped at 60 seconds between attempts.",
+    "sources": [
+      "services/signalbox.md"
+    ]
+  },
+  {
+    "id": "tidewatch-max-runtime",
+    "question": "What happens to a Tidewatch job that runs longer than its limit, and what is the limit?",
+    "answer": "The limit is 45 minutes; a job still running then is killed and counted as failed.",
+    "sources": [
+      "services/tidewatch.md"
+    ]
+  },
+  {
+    "id": "gantry-slo",
+    "question": "What is Gantry's availability SLO?",
+    "answer": "99.95% monthly availability.",
+    "sources": [
+      "services/gantry.md"
+    ]
+  },
+  {
+    "id": "lantern-slo",
+    "question": "What availability does Lantern target?",
+    "answer": "99.9% monthly availability.",
+    "sources": [
+      "services/lantern.md"
+    ]
+  },
+  {
+    "id": "dockhand-language",
+    "question": "Which language is Dockhand written in, and which team owns it?",
+    "answer": "Go; the Pipeline team owns it.",
+    "sources": [
+      "services/dockhand.md"
+    ]
+  },
+  {
+    "id": "signalbox-owner",
+    "question": "Which team owns the notification service?",
+    "answer": "Customer Comms owns Signalbox.",
+    "sources": [
+      "services/signalbox.md"
+    ]
+  },
+  {
+    "id": "harbor-session",
+    "question": "How long does a Harbor dashboard session last?",
+    "answer": "12 hours.",
+    "sources": [
+      "services/harbor.md"
+    ]
+  },
+  {
+    "id": "quay-certification",
+    "question": "How does a new carrier get certified in Quay?",
+    "answer": "By sending 3 valid test scans to Dockhand's sandbox endpoint.",
+    "sources": [
+      "services/quay.md"
+    ]
+  },
+  {
+    "id": "ballast-concurrency",
+    "question": "What consumer concurrency does Ballast use on shipments.raw?",
+    "answer": "32.",
+    "sources": [
+      "services/ballast.md"
+    ]
+  },
+  {
+    "id": "dockhand-422",
+    "question": "What does Dockhand do with a payload that has no carrier_id?",
+    "answer": "It rejects it with HTTP 422 and never retries it.",
+    "sources": [
+      "services/dockhand.md"
+    ]
+  },
+  {
+    "id": "lantern-rebuild-time",
+    "question": "When is Lantern's index rebuilt, and how long does a rebuild take?",
+    "answer": "Every night at 02:00 UTC, by a Tidewatch job; a rebuild takes about 40 minutes.",
+    "sources": [
+      "services/lantern.md"
+    ]
+  },
+  {
+    "id": "webhook-key-rotation",
+    "question": "How often is the webhook signing key rotated?",
+    "answer": "Every 90 days.",
+    "sources": [
+      "services/signalbox.md",
+      "runbooks/rotate-webhook-signing-key.md"
+    ]
+  },
+  {
+    "id": "arch-lantern-stream",
+    "question": "Which stream does Lantern consume?",
+    "answer": "shipments.enriched.",
+    "sources": [
+      "architecture/overview.md",
+      "services/lantern.md"
+    ]
+  },
+  {
+    "id": "arch-broker",
+    "question": "Which message broker do the event streams run on?",
+    "answer": "NATS JetStream.",
+    "sources": [
+      "architecture/overview.md",
+      "adr/0007-nats-jetstream.md"
+    ]
+  },
+  {
+    "id": "arch-standby",
+    "question": "Which region is the warm standby?",
+    "answer": "us-west-2.",
+    "sources": [
+      "architecture/overview.md"
+    ]
+  },
+  {
+    "id": "deploy-canary",
+    "question": "What percentage of traffic does a canary deploy get, and for how long?",
+    "answer": "5% of traffic for a 30-minute bake.",
+    "sources": [
+      "deploy/deployment-guide-v2.md"
+    ]
+  },
+  {
+    "id": "deploy-rollback",
+    "question": "When does a deploy roll back automatically?",
+    "answer": "When the error rate stays above 2% for 5 minutes during any stage.",
+    "sources": [
+      "deploy/deployment-guide-v2.md"
+    ]
+  },
+  {
+    "id": "deploy-friday",
+    "question": "Can I deploy to production on a Friday?",
+    "answer": "No. Under the current (v2) process, deploys run Monday to Thursday only.",
+    "sources": [
+      "deploy/deployment-guide-v2.md"
+    ]
+  },
+  {
+    "id": "deploy-v1-canary",
+    "question": "What canary percentage did the deprecated v1 deployment process use?",
+    "answer": "10% of traffic for a 15-minute bake.",
+    "sources": [
+      "deploy/deployment-guide-v1-deprecated.md"
+    ]
+  },
+  {
+    "id": "deploy-v2-date",
+    "question": "When did shipit v2 replace the v1 deployment process?",
+    "answer": "On 3 November 2025.",
+    "sources": [
+      "deploy/deployment-guide-v2.md",
+      "adr/0019-shipit-v2.md",
+      "deploy/deployment-guide-v1-deprecated.md"
+    ]
+  },
+  {
+    "id": "sev1-ack",
+    "question": "How quickly must the on-call acknowledge a SEV1 page?",
+    "answer": "Within 5 minutes.",
+    "sources": [
+      "oncall/incident-severity.md"
+    ]
+  },
+  {
+    "id": "sev2-ack",
+    "question": "How quickly must the on-call acknowledge a SEV2?",
+    "answer": "Within 15 minutes.",
+    "sources": [
+      "oncall/incident-severity.md"
+    ]
+  },
+  {
+    "id": "postmortem-deadline",
+    "question": "Which incidents need a written postmortem, and by when?",
+    "answer": "SEV1 and SEV2 incidents, within 5 business days.",
+    "sources": [
+      "oncall/incident-severity.md"
+    ]
+  },
+  {
+    "id": "oncall-handoff",
+    "question": "When do on-call rotations hand off?",
+    "answer": "Tuesdays at 10:00 Pacific time.",
+    "sources": [
+      "oncall/oncall-handbook.md"
+    ]
+  },
+  {
+    "id": "oncall-escalation",
+    "question": "When does an unacknowledged page reach the engineering manager?",
+    "answer": "After 15 minutes without an acknowledgement.",
+    "sources": [
+      "oncall/oncall-handbook.md"
+    ]
+  },
+  {
+    "id": "oncall-join",
+    "question": "When does a new engineer join an on-call rotation?",
+    "answer": "After 6 weeks, as secondary on-call.",
+    "sources": [
+      "onboarding/first-week.md"
+    ]
+  },
+  {
+    "id": "pm-lantern-cause",
+    "question": "What caused the March 2025 Lantern outage?",
+    "answer": "A Ballast schema migration removed the lane_code field that Lantern's indexer required, so queries touching new records panicked.",
+    "sources": [
+      "postmortems/2025-03-lantern-outage.md"
+    ]
+  },
+  {
+    "id": "pm-lantern-duration",
+    "question": "How long did the March 2025 search outage last?",
+    "answer": "47 minutes, from 14:12 to 14:59 UTC.",
+    "sources": [
+      "postmortems/2025-03-lantern-outage.md"
+    ]
+  },
+  {
+    "id": "pm-backlog-peak",
+    "question": "How large did the shipments.raw backlog get in July 2025?",
+    "answer": "A peak of 1.8 million messages.",
+    "sources": [
+      "postmortems/2025-07-dockhand-backlog.md"
+    ]
+  },
+  {
+    "id": "pm-gantry-limit",
+    "question": "What rate limit did the September 2025 Gantry misconfiguration set?",
+    "answer": "60 requests per minute.",
+    "sources": [
+      "postmortems/2025-09-gantry-rate-limit.md"
+    ]
+  },
+  {
+    "id": "pm-tidewatch-cause",
+    "question": "Why did Tidewatch miss its nightly jobs in January 2025?",
+    "answer": "Its leader election stalled after a node replacement, so no instance ran scheduled jobs.",
+    "sources": [
+      "postmortems/2025-01-tidewatch-missed-jobs.md"
+    ]
+  },
+  {
+    "id": "pm-sms-delay",
+    "question": "How late did SMS notifications arrive in the November 2024 Signalbox incident?",
+    "answer": "Up to 40 minutes late.",
+    "sources": [
+      "postmortems/2024-11-signalbox-sms-delay.md"
+    ]
+  },
+  {
+    "id": "retention-raw",
+    "question": "How long are raw carrier payloads kept?",
+    "answer": "30 days.",
+    "sources": [
+      "policies/data-retention.md"
+    ]
+  },
+  {
+    "id": "retention-notification-logs",
+    "question": "How long are notification delivery logs retained?",
+    "answer": "180 days.",
+    "sources": [
+      "policies/data-retention.md"
+    ]
+  },
+  {
+    "id": "retention-app-logs",
+    "question": "How long are application logs kept?",
+    "answer": "14 days in hot storage, then 90 days in archive.",
+    "sources": [
+      "engineering/logging.md"
+    ]
+  },
+  {
+    "id": "db-write-approvals",
+    "question": "What does it take to get write access to the production freight database?",
+    "answer": "Two approvals, one of them from the Platform team; the access expires after 8 hours.",
+    "sources": [
+      "policies/access-control.md"
+    ]
+  },
+  {
+    "id": "db-credentials-rotation",
+    "question": "How often are production database credentials rotated?",
+    "answer": "Every 30 days.",
+    "sources": [
+      "policies/secrets-management.md"
+    ]
+  },
+  {
+    "id": "review-two-approvals",
+    "question": "Which pull requests need two approvals?",
+    "answer": "Changes under infra/ and database schema migrations.",
+    "sources": [
+      "engineering/code-review.md"
+    ]
+  },
+  {
+    "id": "release-cut",
+    "question": "When is the weekly release train cut?",
+    "answer": "Every Wednesday at 12:00 Pacific time.",
+    "sources": [
+      "engineering/release-calendar.md"
+    ]
+  },
+  {
+    "id": "sla-credits",
+    "question": "What service credit does a customer get if tracking API availability falls below 99.0% in a month?",
+    "answer": "25% of the monthly fee.",
+    "sources": [
+      "product/customer-sla.md"
+    ]
+  },
+  {
+    "id": "failover-rto",
+    "question": "What are the recovery objectives for a regional failover?",
+    "answer": "An RPO of 5 minutes and an RTO of 30 minutes.",
+    "sources": [
+      "runbooks/regional-failover.md"
+    ]
+  },
+  {
+    "id": "webhook-replay",
+    "question": "When a disabled webhook is re-enabled, how far back are events replayed?",
+    "answer": "The last 72 hours of events.",
+    "sources": [
+      "runbooks/signalbox-webhook-disabled.md"
+    ]
+  },
+  {
+    "id": "glossary-dwell",
+    "question": "What is dwell time?",
+    "answer": "How long a shipment stays at one facility between scans.",
+    "sources": [
+      "glossary.md"
+    ]
+  },
+  {
+    "id": "none-billing-timeout",
+    "question": "What is the billing service's request timeout?",
+    "answer": "The documents do not say; the answer should state that it is not in the provided documents.",
+    "sources": []
+  },
+  {
+    "id": "none-sev5",
+    "question": "What is the acknowledgement time for a SEV5 incident?",
+    "answer": "The documents do not say; the answer should state that it is not in the provided documents.",
+    "sources": []
+  },
+  {
+    "id": "none-cto",
+    "question": "Who is Tallowmere's CTO?",
+    "answer": "The documents do not say; the answer should state that it is not in the provided documents.",
+    "sources": []
+  },
+  {
+    "id": "none-kafka-partitions",
+    "question": "How many partitions does the shipments.raw Kafka topic have?",
+    "answer": "The documents do not say; the answer should state that it is not in the provided documents.",
+    "sources": []
+  },
+  {
+    "id": "none-oncall-pay",
+    "question": "How much are engineers paid for an on-call week?",
+    "answer": "The documents do not say; the answer should state that it is not in the provided documents.",
+    "sources": []
+  }
+]

@@ -63,6 +63,13 @@ dependencies = [
     "openinference-semantic-conventions>=0.1.39",
     "openinference-instrumentation>=0.1.66",
     "openinference-instrumentation-langchain>=0.1.76",
+    # `rag eval` (rag_pipeline/evaluation.py): the question set is a LangSmith
+    # dataset and each run a LangSmith experiment, and Claude judges the
+    # answers through the Anthropic SDK. Imported directly, so declared, though
+    # langsmith also arrives through langchain-core. Both are imported only
+    # inside the eval command, so `rag --help` and the app never load them.
+    "langsmith>=0.14.1",
+    "anthropic>=1.11.0",
 ]
 
 [project.scripts]

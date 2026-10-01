@@ -9,6 +9,8 @@ uv sync                              # install deps (creates .venv; MLX only on 
 uvx --from huggingface_hub hf download <model id>   # once per model (README Setup lists the three); loading never downloads
 uv run rag ingest                    # embed data/ into the Chroma collection under chroma_db/
 uv run rag query "your question"     # ask from the terminal (loads all three models first)
+uv run rag eval                      # score the pipeline on evals/questions.json (needs LANGSMITH_API_KEY + ANTHROPIC_API_KEY; indexes evals/corpus itself; ~20 min, ~$1-2)
+uv run rag eval --save-baseline      # ...and save the scores as evals/baseline.json
 uv run streamlit run streamlit_app.py # chat UI over the same pipeline
 uv run streamlit run streamlit_app.py --server.fileWatcherType auto   # while editing streamlit_app.py (config.toml turns the watcher off)
 uv run pytest                        # full suite (fakes + in-process Chroma; no models, network, Docker or secrets)
@@ -80,6 +82,7 @@ ingest  (rag_pipeline/ingest.py)      load → split → embed → store (Chroma
 query   (rag_pipeline/pipeline.py)    embed question → search → rerank → stuff prompt → local LLM
 models  (rag_pipeline/mlx_models.py)  QwenVLEmbeddings · QwenVLReranker · MLXChatModel, over MLX
 tracing (rag_pipeline/tracing.py)     optional: each question as one trace, to a self-hosted Phoenix
+eval    (rag_pipeline/evaluation.py)  rag eval: evals/questions.json as a LangSmith dataset, judged by Claude
 ```
 
 `Settings` (`config.py`) is a frozen dataclass built via `Settings.from_env()`.
@@ -121,6 +124,46 @@ prompt limit — are deliberately *not* settings. They are each model family's
 recipe (and measured optima), not user tunables: the prompts are what the live
 tests' model-card scores check, and changing the embedding instruction would
 also invalidate every stored vector without changing the fingerprint.
+
+### Evaluation (`rag eval`)
+
+`evaluation.py` runs the real pipeline over `evals/questions.json` through
+`langsmith.evaluate` and scores each answer `retrieval_hit` and
+`retrieval_rank` (computed from the chunks in the prompt; the rank, a reciprocal
+rank, because the local stack scored a 100% hit rate and a hit rate cannot see a
+right file slipping from first place), `correct` and `grounded` (judged by
+Claude). It exists so the migration to
+hosted models can be measured: each phase is compared with `evals/baseline.json`,
+scored on the local stack.
+
+The questions are about `evals/corpus/`, a fictional company's handbook, which
+`run()` ingests through `eval_settings()` — the caller's models and chunking,
+`EVAL_CORPUS` and its own `EVAL_COLLECTION` — so the user's index is never read
+or written. Fictional, so an answer cannot come from the model's own knowledge;
+confusable (services documented alike, a deprecated guide contradicting the
+current one); and kept at least twice `FETCH_K` in chunks
+(`test_the_eval_corpus_outnumbers_what_vector_search_fetches`), or every chunk
+reaches the reranker and the embedder goes untested. The sample `data/` made 9
+chunks and scored 100% on everything. Editing the corpus or the questions means
+a new baseline.
+
+Two things make scores comparable, and both are deliberate:
+
+- **The dataset name is a digest of the questions** (`dataset_name()`), so an
+  edited question set is a new dataset, never a dataset edited in place under
+  old experiments. `format_report` refuses to compare across datasets.
+- **The judge is a constant, `JUDGE_MODEL`, not a setting**, and `ClaudeJudge`
+  passes no fallback model: a judge that changed mid-run, or per run, would make
+  scores incomparable. A refused or unparseable grade is a `RuntimeError` that
+  LangSmith records against the example as unscored, and `--save-baseline`
+  refuses any run with an unscored example.
+
+Its two keys are read through `require_env_key` inside `run()`, which checks the
+question set, both keys, the judge and the dataset before any model loads.
+`anthropic` and `langsmith` are imported only there (cli imports
+`evaluation` inside `cmd_eval`; `anthropic` is in `test_cli.py`'s `HEAVY`). The
+tests stand in for LangSmith through the `DatasetStore` protocol and for Claude
+through the `Judge` callable; nothing in the suite calls either service.
 
 ### Why the store factories live in `ingest.py`
 

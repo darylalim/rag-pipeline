@@ -17,20 +17,23 @@ Query (per Q):   question ──embed──▶ search ──rerank──▶ [top
 
 No step of either phase touches the network: the models load from the local
 Hugging Face cache, and Chroma runs in-process against a directory on disk. The
-one network step is downloading the models, once, during setup. There are no API
-keys and no accounts. The chat app keeps to that too: `.streamlit/config.toml`
+one network step is downloading the models, once, during setup. Answering
+questions needs no API keys and no accounts; only the optional
+[`rag eval`](#evaluation), which scores the pipeline, does. The chat app keeps
+to that too: `.streamlit/config.toml`
 switches off Streamlit's usage statistics, which its browser front end would
 otherwise send to Streamlit, and its first-run prompt for an email address, and
 keeps the app to this machine — though
 Streamlit can still look up the machine's external IP address (see
 [below](#3-or-use-the-chat-app)). Tracing keeps to it as well: it is off unless
 you turn it on, and then goes to a [Phoenix](#tracing-with-phoenix) server you
-run yourself. (LangSmith is no longer used — but see
-[below](#tracing-with-phoenix) if an old `.env` still switches it on.)
+run yourself. (LangSmith is not used for tracing — `rag eval` keeps its
+questions and results there — but see [below](#tracing-with-phoenix) if an old
+`.env` still switches LangSmith tracing on.)
 
 **Contents** — [Prerequisites](#prerequisites) · [Setup](#setup) ·
 [Usage](#usage) · [Add your own documents](#add-your-own-documents) ·
-[Tracing with Phoenix](#tracing-with-phoenix) ·
+[Evaluation](#evaluation) · [Tracing with Phoenix](#tracing-with-phoenix) ·
 [Configuration](#configuration) · [Development](#development) ·
 [Project structure](#project-structure) · [How it works](#how-it-works) ·
 [Invariants](#invariants)
@@ -49,7 +52,8 @@ run yourself. (LangSmith is no longer used — but see
   4.3 GB each for the embedder and the reranker), in the Hugging Face cache.
 - [uv](https://docs.astral.sh/uv/) and Python 3.11+.
 
-Nothing else: no API keys, no cloud account, no Docker.
+Nothing else: no API keys, no cloud account, no Docker. (The optional
+[`rag eval`](#evaluation) needs two API keys.)
 
 ## Setup
 
@@ -228,6 +232,73 @@ to its final path component and rejects unsupported suffixes before writing, so
 an upload cannot choose its own directory. Its docstring covers the details,
 including where that boundary deliberately stops.
 
+## Evaluation
+
+`rag eval` scores the pipeline on a fixed set of 50 questions, so a change — a
+model, a setting, a prompt — can be judged on every question at once rather than
+on one answer. The questions are about `evals/corpus/`, the engineering handbook
+of **Tallowmere**, a fictional freight-tracking company: 48 short documents
+(49 chunks at the default chunk size) on services, deploys, incidents and
+policies. `rag eval` indexes it into a collection of its own, `rag_eval`, beside
+your index; it never reads or retrieves your documents, and `rag ingest` never
+sees the corpus.
+
+The company is fictional so that a question can only be answered by retrieving
+the right passage: about real topics, a model can answer from what it already
+knows, whatever retrieval did. And the corpus is built to be easy to get wrong —
+four services documented alike with different values, a deprecated deployment
+guide that contradicts the current one, a customer SLA beside the internal
+SLOs — and large enough that vector search, which fetches `FETCH_K` = 20 chunks,
+has to choose. (The three sample documents in `data/` make 9 chunks, and on them
+every question scored 100%: nothing could fail.)
+
+Each question gets four scores:
+
+| Score | Passes when | Judged by |
+| ----- | ----------- | --------- |
+| `retrieval_hit` | a file the answer should come from is among the chunks in the prompt (not scored for the 5 questions the documents cannot answer) | the pipeline's own output |
+| `retrieval_rank` | not a pass or fail: 1 divided by the rank of the first chunk from such a file — 1 for first, ½ for second, 0 if none — averaged into a mean reciprocal rank. It shows a right file slipping down the prompt before `retrieval_hit` sees it drop out | the pipeline's own output |
+| `correct` | the answer matches the reference answer — or, for a question the documents cannot answer, says so rather than answering from general knowledge | Claude Opus 5.5 |
+| `grounded` | every claim in the answer is supported by the chunks it was generated from | Claude Opus 5.5 |
+
+It needs two keys, in `.env` or the environment — the only ones anything in this
+project reads:
+
+| Variable | Used for |
+| -------- | -------- |
+| `LANGSMITH_API_KEY` | The questions are uploaded as a [LangSmith](https://smith.langchain.com) dataset, and each run is recorded there as an experiment, with every answer, its retrieved passages and the judge's reasoning |
+| `ANTHROPIC_API_KEY` | Claude grades `correct` and `grounded` |
+
+```bash
+uv run rag eval                    # score, and compare with the saved baseline
+uv run rag eval --save-baseline    # score, and save these scores as the baseline
+```
+
+A run indexes the corpus (only what changed, after the first run), loads the
+models and answers every question: about 20 minutes on the machine in
+[What to expect](#what-to-expect), judging included, and an estimated $1–2 of
+Anthropic API usage for the judge. It prints each score, its change from the
+baseline in `evals/baseline.json`, and a link to the experiment in LangSmith.
+It stops before loading any model if a key is missing or the judge or LangSmith
+cannot be reached.
+
+Some things to know:
+
+- **What leaves this machine** is the eval corpus's questions, the passages
+  retrieved from it and the answers, sent to LangSmith and to Anthropic. Your
+  own documents are never part of a run.
+- **Scores compare only within one question set and one judge.** The dataset's
+  name is derived from the questions' content, so editing `evals/questions.json`
+  starts a new dataset, and the report then declines to compare with a baseline
+  scored on the old one. The judge is fixed in code (`JUDGE_MODEL` in
+  `rag_pipeline/evaluation.py`) for the same reason, and never falls back to
+  another model when it declines to grade: a declined grade is recorded as
+  unscored.
+- **A baseline needs every question scored.** `--save-baseline` refuses a run in
+  which a question failed or a grade was declined.
+- **Only the eval talks to LangSmith.** It does not switch LangSmith tracing on
+  for anything else.
+
 ## Tracing with Phoenix
 
 Optional, and off unless you set it up. With it on, every question — from the
@@ -292,7 +363,7 @@ them in SQLite under `~/.phoenix` (`PHOENIX_WORKING_DIR` moves it).
   — about two for a remote host that never answers (four before OpenTelemetry
   1.45).
 - **Only questions are traced.** Nothing in ingest is a LangChain run.
-- **LangSmith is not used — but an old `.env` may still switch it on.**
+- **LangSmith is not used for tracing — but an old `.env` may still switch it on.**
   langchain-core still acts on `LANGSMITH_TRACING=true` (or
   `LANGCHAIN_TRACING_V2=true`) by itself, and while either is set it uploads
   every question — the prompt, every retrieved passage and the answer — to
@@ -301,8 +372,8 @@ them in SQLite under `~/.phoenix` (`PHOENIX_WORKING_DIR` moves it).
 
 ## Configuration
 
-Nothing is required. Every setting has a default and can be overridden in `.env`
-(see `.env.example`) or the environment:
+Nothing is required to answer questions. Every setting has a default and can be
+overridden in `.env` (see `.env.example`) or the environment:
 
 | Variable            | Default            | Purpose |
 | ------------------- | ------------------ | ------- |
@@ -323,6 +394,10 @@ Nothing is required. Every setting has a default and can be overridden in `.env`
 
 Each model setting is a Hugging Face repo id, resolved from the local cache, or a
 path to a model directory.
+
+API keys are not settings: they have no default, and are never shown in the
+app's sidebar or in an error. The two that `rag eval` reads are listed under
+[Evaluation](#evaluation).
 
 The chat app's own Streamlit settings are in `.streamlit/config.toml`, each with
 a comment on why: usage statistics and the email prompt off
@@ -487,12 +562,14 @@ rag_pipeline/
   pipeline.py    RAGPipeline: load index + local models, stream_answer(...) / answer(...)
   mlx_models.py  the three local models behind LangChain's interfaces, loaded once per process
   tracing.py     optional tracing to a self-hosted Phoenix (setup_tracing)
-  cli.py         rag ingest | rag query "..."
+  evaluation.py  rag eval: the questions as a LangSmith dataset, scored by Claude
+  cli.py         rag ingest | rag query "..." | rag eval
 streamlit_app.py Streamlit chat UI
 .streamlit/      config.toml: usage statistics, email prompt and file watcher off, loopback only
 data/            sample documents; add your own (git-ignored)
 chroma_db/       the index, created by rag ingest (git-ignored)
 docs/            the README's screenshots
+evals/           rag eval's corpus/ (a fictional handbook), questions.json about it, and baseline.json
 ```
 
 ## How it works

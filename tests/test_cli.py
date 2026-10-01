@@ -160,6 +160,19 @@ def test_a_model_missing_from_the_cache_is_an_error_not_a_traceback(
     assert "hf download some-org/never-downloaded" in err
 
 
+def test_eval_without_its_keys_is_an_error_not_a_traceback(
+    wired_env, capsys, monkeypatch
+):
+    """Reported before any model loads or any request is sent."""
+    monkeypatch.delenv("LANGSMITH_API_KEY", raising=False)
+
+    assert cli.main(["eval"]) == 1
+
+    err = capsys.readouterr().err
+    assert "LANGSMITH_API_KEY is not set" in err
+    assert "Traceback" not in err
+
+
 def test_a_malformed_numeric_setting_is_an_error_not_a_traceback(
     wired_env, capsys, monkeypatch
 ):
@@ -351,7 +364,9 @@ def test_a_question_sets_up_tracing_and_an_ingest_does_not(indexed, monkeypatch)
 # cli.py reaches all of it, but only from inside a command function: importing
 # the module must not pay for a stack the user may never reach, since `rag
 # --help` and a usage error load cli.py and then exit.
-HEAVY = ("chromadb", "langchain_chroma", "mlx", "mlx_lm")
+# `anthropic` is the eval command's alone (its judge): `rag --help`, `rag ingest`
+# and `rag query` have no use for it.
+HEAVY = ("chromadb", "langchain_chroma", "mlx", "mlx_lm", "anthropic")
 
 # What tracing loads once it is on: the LangChain instrumentation and the span
 # exporter. Off, the pipeline carries the OpenTelemetry API alone.
