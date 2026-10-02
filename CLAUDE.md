@@ -724,8 +724,9 @@ text rule and are strictly stronger than it: don't reintroduce one.
   path too, where pathlib's own signal (a `~user` with no home directory) is a
   `RuntimeError` that would slip past `streamlit_app.py`'s guard above the sidebar. Match
   that behavior for new settings.
-- `load_documents()` warns on stderr for unreadable files and *silently* skips
-  whitespace-only ones, rather than aborting the ingest. Preserve that resilience.
+- `load_documents()` warns on stderr for unreadable files and for a PDF with no
+  extractable text (a scan), and *silently* skips whitespace-only text files,
+  rather than aborting the ingest. Preserve that resilience.
   It catches only `OSError | ValueError`: `_read_pdf` translates whatever pypdf
   raises on a malformed file — builtins errors included — into `ValueError`
   where pypdf runs, the adapters' pattern for their models. A new loader does

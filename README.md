@@ -107,8 +107,8 @@ straight away.
 - **Scoped.** Unrelated documents that share the collection are never read or
   deleted.
 - **Resilient.** An unreadable file (bad encoding, corrupt PDF, permissions) is
-  skipped with a warning. A file with no text is skipped **silently**, which
-  includes scanned, image-only PDFs.
+  skipped with a warning. So is a PDF with no extractable text, such as a
+  scan, which needs OCR first. A blank text file is skipped silently.
 - **Settings-aware.** Changing `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS`,
   `CHUNK_SIZE` or `CHUNK_OVERLAP` re-embeds everything. Changing
   `EMBEDDING_DIMENSIONS` also needs a new `COLLECTION_NAME`, because a vector

@@ -493,7 +493,17 @@ def load_documents(data_dir: Path) -> list[Document]:
             continue
 
         if not text.strip():
-            continue  # skip empty files
+            # A blank text file is plainly meant to be empty, so it goes
+            # quietly. A PDF with pages but no text is almost always a scan:
+            # its content is real, just not extractable, and skipping it
+            # silently would leave a terminal ingest with no sign it is absent.
+            if suffix == ".pdf":
+                print(
+                    f"Warning: skipping {source!r}: no extractable text "
+                    "(a scanned PDF? it needs OCR first)",
+                    file=sys.stderr,
+                )
+            continue
 
         documents.append(Document(page_content=text, metadata={"source": source}))
 

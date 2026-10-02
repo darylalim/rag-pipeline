@@ -121,21 +121,28 @@ def test_load_documents_reads_a_pdf_joining_its_pages(tmp_path):
     assert "Overlap preserves context" in docs[0].page_content
 
 
-def test_load_documents_skips_a_pdf_with_no_extractable_text(tmp_path):
+def test_load_documents_skips_a_pdf_with_no_extractable_text(tmp_path, capsys):
     """A scanned PDF is the realistic case: pages exist, text does not.
 
     It must be skipped like a whitespace-only markdown file rather than indexed
     as an empty document, which would occupy a retrieval slot with nothing in
-    it and cite a source that says nothing.
+    it and cite a source that says nothing. Unlike that file it is warned
+    about: its content is real but unreadable, and the app's "not added"
+    notice is the only other place it would show -- `rag ingest` has none. The
+    blank markdown beside it shows the warning is the PDF's, not every skip's.
     """
     root = tmp_path / "data"
     root.mkdir()
     (root / "scanned.pdf").write_bytes(minimal_pdf(["", ""]))
+    (root / "blank.md").write_text("   \n", encoding="utf-8")
     (root / "real.md").write_text("actual content", encoding="utf-8")
 
     docs = ingest_mod.load_documents(root)
 
     assert [d.metadata["source"] for d in docs] == ["real.md"]
+    err = capsys.readouterr().err
+    assert "scanned.pdf" in err
+    assert "blank.md" not in err
 
 
 def test_load_documents_skips_a_corrupt_pdf_without_aborting(tmp_path, capsys):
