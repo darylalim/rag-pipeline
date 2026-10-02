@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 uv sync                              # install deps (creates .venv; MLX only on macOS)
 uvx --from huggingface_hub hf download <model id>   # once per model (README Setup lists the three); loading never downloads
 uv run rag ingest                    # embed data/ into the Atlas collection (needs MONGODB_URI)
-uv run rag query "your question"     # ask from the terminal (loads all three models first)
+uv run rag query "your question"     # ask from the terminal (loads the chat model first)
 uv run rag eval                      # score the pipeline on evals/questions.json (needs LANGSMITH_API_KEY + ANTHROPIC_API_KEY; indexes evals/corpus itself; ~20 min, ~$1-2)
 uv run rag eval --save-baseline      # ...and save the scores as evals/baseline.json
 uv run streamlit run streamlit_app.py # chat UI over the same pipeline
@@ -80,7 +80,7 @@ local models behind LangChain's interfaces:
 ```
 ingest  (rag_pipeline/ingest.py)      load → split → embed → store (MongoDB Atlas + vector index)
 query   (rag_pipeline/pipeline.py)    embed question → search → rerank → stuff prompt → local LLM
-models  (rag_pipeline/mlx_models.py)  QwenVLEmbeddings · QwenVLReranker · MLXChatModel, over MLX
+models  embeddings + rerank: Voyage AI's API (factories in ingest.py / pipeline.py) · chat: MLXChatModel, over MLX (mlx_models.py)
 tracing (rag_pipeline/tracing.py)     optional: each question as one trace, to a self-hosted Phoenix
 eval    (rag_pipeline/evaluation.py)  rag eval: evals/questions.json as a LangSmith dataset, judged by Claude
 ```
@@ -118,12 +118,10 @@ hand-kept list. This matters because `config.py` loads `.env` at import time
 developer's own `.env`, so its default would silently stop being tested. Derived,
 that drift is not merely detected — it is inexpressible.
 
-The adapters' private constants in `mlx_models.py` — the embedding and
-reranking instructions and prompt formats, the batch sizes, the 8192-token
-prompt limit — are deliberately *not* settings. They are each model family's
-recipe (and measured optima), not user tunables: the prompts are what the live
-tests' model-card scores check, and changing the embedding instruction would
-also invalidate every stored vector without changing the fingerprint.
+The Voyage clients' retry budget and timeout (`_VOYAGE_ATTEMPTS`,
+`_VOYAGE_TIMEOUT_S` in `ingest.py`) and the store's internal waits are
+deliberately *not* settings: they bound how the pipeline copes with a service,
+not what it computes.
 
 ### Evaluation (`rag eval`)
 
@@ -173,7 +171,7 @@ through it. This is deliberate: vectors from different
 embedding models are not comparable, and the store's identity is (`MONGODB_URI`,
 database, collection, vector index, embedding function). Indexing and querying
 must therefore go through one factory each. **Never construct
-`MongoDBAtlasVectorSearch(...)`, `MongoClient(...)` or `QwenVLEmbeddings(...)`
+`MongoDBAtlasVectorSearch(...)`, `MongoClient(...)` or `VoyageAIEmbeddings(...)`
 inline** — route through these factories (`tests/conftest.py`'s administration
 of the test container is the one exemption). `open_store()` returns the langchain
 `MongoDBAtlasVectorSearch`, constructed with `auto_create_index=False` so the
@@ -181,7 +179,7 @@ query path creates nothing; bookkeeping that needs no model goes through
 `_collection()` and `_meta()`, the raw pymongo handles. Both translate pymongo's
 `InvalidName` — raised for a refused database or collection name when the
 *handle* is made, before any operation — so they wrap their own construction in
-`store_errors_as_runtime`.
+`provider_errors_as_runtime`.
 
 The reranker is the deliberate exception: `build_reranker()` lives in
 `pipeline.py`, not here. Reranking is query-only — it has no ingest-side
@@ -192,16 +190,42 @@ ordinary behavioral test (the MLX block + the injection seam), not a text
 invariant, because the risk it guards — offline testability — is one a behavioral
 test already covers.
 
-### Models load once per process (`mlx_models.py`)
+### Voyage AI: the embedder and the reranker
 
-The three factories construct adapters (`QwenVLEmbeddings`, `QwenVLReranker`,
-`MLXChatModel`), and every adapter gets its weights from `load_mlx_model()` —
-the only place weights load. It is memoized by resolved snapshot path under a
-double-checked lock, so concurrent first calls from Streamlit sessions load once.
-That memo is what makes the factories cheap to call again: the app rebuilds its
-pipeline after every ingest, and `ingest()` builds its own embedder, and both
-wrap the weights already in memory rather than loading second copies of ~22 GB.
-Never call `mlx_lm.load` anywhere else.
+`build_embeddings()` returns langchain-voyageai's `VoyageAIEmbeddings` at
+`output_dimension=EMBEDDING_DIMENSIONS` (256, 512, 1024 or 2048 — anything else
+is a `RuntimeError` before any call), and `build_reranker()` its
+`VoyageAIRerank` with `top_k=RETRIEVAL_K` (below 1 is a `RuntimeError`). Both
+read `VOYAGE_API_KEY` through `require_env_key`, so a missing key is the
+`RuntimeError` the pipeline-load guard catches, and both get their clients from
+`ingest.voyage_clients()`: langchain-voyageai builds its own with voyageai's
+defaults — one attempt, no timeout — and offers no setting for either, so the
+factories replace them (`test_the_voyage_clients_retry_and_time_out`). voyageai
+retries rate limits, unavailability and timeouts with exponential backoff, and
+re-raises the last `VoyageError` as itself, which `provider_errors_as_runtime`
+turns into a `RuntimeError`. Every Voyage call happens inside that context
+manager: ingest's adds and width probe, the question's embedding in the search,
+and the rerank in `retrieve()`. The reranker is `pipeline._VoyageRerank`, a subclass
+whose `compress_documents` returns the candidates themselves with only
+`relevance_score` added: langchain-voyageai's rebuilds each document without its
+id (`source:index:content_hash`, which the reranker trace span records) and adds
+a `total_tokens` key to its metadata. It calls the library's private `_rerank`,
+so `test_the_reranker_returns_the_candidates_themselves_in_voyages_order` pins
+it offline and the live suite checks it against the real API.
+
+A Voyage account with no payment method is held to 3 requests and 10,000 tokens
+a minute — less than one ingest slice — and fails with `RateLimitError` even
+after the retries. Its free tokens apply with a payment method added.
+
+### The chat model loads once per process (`mlx_models.py`)
+
+`build_chat_model()` constructs `MLXChatModel`, which gets its weights from
+`load_mlx_model()` — the only place weights load. It is memoized by resolved
+snapshot path under a double-checked lock, so concurrent first calls from
+Streamlit sessions load once. That memo is what makes the factory cheap to call
+again: the app rebuilds its pipeline after every ingest and wraps the weights
+already in memory rather than loading a second copy of ~15 GB. Never call
+`mlx_lm.load` anywhere else.
 
 `load_mlx_model()`'s ordering is load-bearing:
 
@@ -216,9 +240,8 @@ Never call `mlx_lm.load` anywhere else.
 3. `mlx_lm.load()` gets that resolved path, never the repo id — given an id,
    mlx-lm tries the network first even when the model is cached.
 
-Concurrency: one lock per *loaded model* (keyed by the model, not the adapter,
-so an outgoing and an incoming pipeline share it) serializes forward passes; one
-module-level `_GENERATION_LOCK` is held for a whole generation, because mlx-lm
+Concurrency: one module-level `_GENERATION_LOCK` is held for a whole
+generation, because mlx-lm
 sets and restores the process-wide Metal wired limit around each one and
 overlapping calls race on it. mlx-lm's stream is closed while that lock is still
 held, and the lock is released however the stream ends — exhausted, failed, or
@@ -236,16 +259,19 @@ parser's input, i.e. generates on to `MAX_TOKENS` under the lock.
 `test_a_real_stop_releases_the_model_and_keeps_the_turn` delivers Stop the way
 the button does, with the garbage collector off, over the real `MLXChatModel`.
 
-MLX itself is reached only in a few thin methods (`_pool`, `_forward`, the
-generation loop, `_release_buffers`), so prompts, truncation, batching, ordering,
-locking and error translation are all unit-tested in CI (`test_mlx_models.py`,
-over the shared fake MLX stack in `tests/fake_mlx.py`). Whether the recipe is *right* is another matter: a
-subtly wrong prompt or pooling step still yields plausible vectors and
-sensible-looking rankings. Only `tests/test_models_live.py` (`-m models`) notices,
-by reproducing the model cards' published scores — run it after touching an
-adapter, after a `uv.lock` change that moves `mlx`, `mlx-lm`, `mlx-metal`,
-`transformers`, `tokenizers` or `huggingface-hub`, and after re-downloading a
-model: the fakes stay put while all of those move. Skipped is not passed.
+MLX itself is reached only in the generation loop and `_release_buffers`, so
+the prompt, locking, stopping and error translation are all unit-tested in CI
+(`test_mlx_models.py`, over the shared fake MLX stack in `tests/fake_mlx.py`).
+What the fakes cannot check — that the real chat model streams a grounded
+answer with thinking off, and that the Voyage factories embed documents and
+questions the right way round at the configured width — is
+`tests/test_models_live.py` (`-m models`): run it after touching
+`mlx_models.py` or a factory, after a `uv.lock` change that moves `mlx`,
+`mlx-lm`, `mlx-metal`, `transformers`, `tokenizers`, `huggingface-hub`,
+`voyageai` or `langchain-voyageai`, and after re-downloading the model: the
+fakes stay put while all of those move. It calls Voyage's real API, so conftest
+exempts the `models` mark from `_offline` and lets it keep `VOYAGE_API_KEY`.
+Skipped is not passed.
 
 ### Tracing is the API in the pipeline, the SDK in the frontends
 
@@ -386,7 +412,7 @@ up without being announced. Consequences that are easy to get wrong:
   `ingested_by` and `source` as filter fields, since `$vectorSearch` refuses a
   pre-filter on an undeclared field. An index this pipeline did not make is
   refused, never rebuilt in place: it may be another tool's. A search at the
-  wrong width is Atlas's own `OperationFailure`, which `store_errors_as_runtime`
+  wrong width is Atlas's own `OperationFailure`, which `provider_errors_as_runtime`
   turns into a `RuntimeError` with the `COLLECTION_NAME` hint.
 - `_ensure_vector_index` runs on every run, after the deletes and before the
   adds: it creates the collection (Atlas refuses a search index on a collection
@@ -448,16 +474,18 @@ number, and what both frontends' "Indexed N chunks" means.
 `embeddings` / `llm` — and `RAGPipeline.__init__` also `reranker`. **Production
 always passes `None`**; the parameters exist so tests can inject
 `DeterministicFakeEmbedding`, `FakeListChatModel`, and a fake
-`BaseDocumentCompressor`. This is why the suite needs no model and no Apple
-Silicon: the real `build_embeddings()`/`build_reranker()`/`build_chat_model()`
-load multi-gigabyte MLX checkpoints from the Hugging Face cache, but none runs
+`BaseDocumentCompressor`. This is why the suite needs no model, no API key and
+no Apple Silicon: the real `build_embeddings()`/`build_reranker()` call Voyage's
+paid API and `build_chat_model()` loads a 15 GB MLX checkpoint, but none runs
 under test. Any new code path touching an embedding model, the reranker, or the
 LLM should thread these through rather than constructing them unconditionally.
 
 Injection is a convention, so `conftest.py` backs it with autouse guards, each
 pinned by `tests/test_offline_guard.py` so one that loosens reads as a failure: `_no_real_models` makes MLX unimportable (**the one that catches a
-forgotten injection** — with the models cached, a network block alone would let
-it load them), `_no_real_store` removes the developer's real `MONGODB_URI`,
+forgotten chat-model injection** — with the model cached, a network block alone
+would let it load), `_no_real_store` removes the developer's real `MONGODB_URI`
+and API keys (so a forgotten embedder or reranker injection stops at the
+missing `VOYAGE_API_KEY`),
 `_offline` blocks every socket to a host other than this machine (the atlas-local
 container is on loopback), `_no_tracing` keeps Phoenix and
 LangSmith off whatever `.env` says, and `_no_tracer_left_on` fails a test that
@@ -478,7 +506,7 @@ both: it exports the fixture settings through `ENV_VARS` and patches
 than copying it. That
 works only because all are looked up as module globals at call time, which is a
 second reason the never-construct-inline rule above is load-bearing: inline a
-`QwenVLEmbeddings(...)` anywhere and the frontend can no longer be driven with
+`VoyageAIEmbeddings(...)` anywhere and the frontend can no longer be driven with
 fakes at all, not just inconsistently. `st.cache_resource` is cleared per test,
 since its key deliberately ignores `_settings` and would otherwise serve one
 test's pipeline to the next.
@@ -555,10 +583,9 @@ because they are only observable at the frontend:
   the same answer; the price is untyped MLX call sites, which is why they are
   kept thin. It covers `mlx.**`/`mlx_lm.**` only — not a place to park other
   unresolved imports.
-- MLX keeps freed buffers for reuse, and with varying batch shapes that cache
-  grew to ~7 GB beside a 3.4 GB model. `_release_buffers()` (`mx.clear_cache()`)
-  runs after every embed, rerank and generation; a new MLX call path must do the
-  same, or three models that fit in 32 GB stop fitting.
+- MLX keeps freed buffers for reuse, and with varying shapes that cache grew to
+  several GB beside a model. `_release_buffers()` (`mx.clear_cache()`) runs
+  after every generation; a new MLX call path must do the same.
 - The Qwen3.8 chat template treats an unset `enable_thinking` as *on*: it adds a
   reasoning instruction and the model streams raw reasoning into the answer with
   no `<think>` tag to strip. `MLXChatModel` passes `enable_thinking=False`;
@@ -637,7 +664,7 @@ behavior is:
 | a question is one trace, ended however the question ends (answered, failed, stopped, closed unread) | `tests/test_tracing.py`, plus `test_a_stop_during_retrieval_still_sends_the_questions_trace` in `test_streamlit_app.py` |
 | no test leaves tracing on | conftest's `_no_tracer_left_on`, after every test |
 | secrets (`.env`, `.env.*`, `.streamlit/secrets.toml`), the user's documents in `data/`, coverage's parallel data files and Claude Code worktrees stay out of git; `.env.example` and the three samples stay addable | `test_gitignore_keeps_secrets_and_your_documents_out_of_git` — the repo's `.gitignore` in a scratch repository made with no template, global excludes off |
-| the adapters implement their models' official recipes | `tests/test_models_live.py` (`-m models`, by hand on a Mac) — reproduces the model cards' published scores |
+| the real chat model and Voyage's API behave as the fakes assume | `tests/test_models_live.py` (`-m models`, by hand on a Mac with `VOYAGE_API_KEY`) |
 
 The cheap-imports, greedy-decoding and foreign-document rows each replaced a
 text rule and are strictly stronger than it: don't reintroduce one.
@@ -698,7 +725,7 @@ text rule and are strictly stronger than it: don't reintroduce one.
 - `RAGPipeline.__init__` checks `1 <= FETCH_K <= 1000` (a `RuntimeError`;
   `$vectorSearch` caps candidates at 10,000 and langchain-mongodb asks for ten
   per result), then calls `require_index()` before building any model, so a
-  fresh setup is told to run `rag ingest` without first loading ~22 GB. Three
+  fresh setup is told to run `rag ingest` without first loading ~15 GB. Three
   cases, each a `FileNotFoundError` naming the fix, checked in order: no
   collection of that name (a wrong `COLLECTION_NAME` is a *different*
   collection, and one that silently searched empty would answer every question
@@ -707,7 +734,7 @@ text rule and are strictly stronger than it: don't reintroduce one.
   index named `VECTOR_INDEX_NAME`. An unreachable cluster or a missing
   `MONGODB_URI` is `_client()`'s `RuntimeError`. Only then `open_store()`, the
   reranker, and the LLM. Keep that order.
-- Store failures are translated in `store_errors_as_runtime` (`ingest.py`): it
+- Store failures are translated in `provider_errors_as_runtime` (`ingest.py`): it
   wraps every store op — connecting, getting a handle, ingest's reads, deletes,
   adds and index management, the writer lock, and the query-time search —
   mapping `pymongo.errors.PyMongoError` and `bson.errors.BSONError` (not a

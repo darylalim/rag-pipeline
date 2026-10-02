@@ -37,7 +37,6 @@ from rag_pipeline import tracing as tracing_mod
 
 # The real factories, bound before `wired_env` swaps fakes in on the modules:
 # the tests below that are about the production path put these back.
-from rag_pipeline.ingest import build_embeddings
 from rag_pipeline.pipeline import build_chat_model
 
 
@@ -136,22 +135,22 @@ def test_a_machine_without_mlx_is_an_error_not_a_traceback(
 
 
 def test_a_model_missing_from_the_cache_is_an_error_not_a_traceback(
-    wired_env, capsys, monkeypatch, tmp_path
+    indexed, capsys, monkeypatch, tmp_path
 ):
-    """FileNotFoundError: a model that was never downloaded names the download.
+    """FileNotFoundError: a chat model that was never downloaded names the download.
 
-    Through `rag ingest`, because the embedding model is the first one a new
-    user needs. MLX is a stand-in -- the loader only needs its import to succeed
-    before it looks in the cache -- and the cache is an empty directory, so the
-    developer's own is not what answers. Nothing is fetched: conftest blocks
-    every socket, so a lookup that tried the network would fail differently.
+    Through `rag query`, the command that loads it. MLX is a stand-in -- the
+    loader only needs its import to succeed before it looks in the cache -- and
+    the cache is an empty directory, so the developer's own is not what
+    answers. Nothing is fetched: conftest blocks every socket, so a lookup that
+    tried the network would fail differently.
     """
     monkeypatch.setitem(sys.modules, "mlx_lm", types.ModuleType("mlx_lm"))
     monkeypatch.setattr(hf_constants, "HF_HUB_CACHE", str(tmp_path / "empty-hub"))
-    monkeypatch.setattr(ingest_mod, "build_embeddings", build_embeddings)
-    monkeypatch.setenv("EMBEDDING_MODEL", "some-org/never-downloaded")
+    monkeypatch.setattr(pipeline_mod, "build_chat_model", build_chat_model)
+    monkeypatch.setenv("CHAT_MODEL", "some-org/never-downloaded")
 
-    assert cli.main(["ingest"]) == 1
+    assert cli.main(["query", "anything"]) == 1
 
     err = capsys.readouterr().err
     assert err.startswith("Error: ")

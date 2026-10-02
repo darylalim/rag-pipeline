@@ -24,13 +24,6 @@ from typing import Any
 
 from rag_pipeline import mlx_models
 
-# The fake model's native embedding width.
-HIDDEN = 16
-
-# The fake vocabulary's special tokens: the ones the adapters look up by name,
-# given ids above the Unicode range so no character can collide with them.
-SPECIAL_IDS = {"<|endoftext|>": 0x110000, "yes": 0x110001, "no": 0x110002}
-
 
 class CharTokenizer:
     """One token per character, so ids decode back to the exact prompt text.
@@ -40,23 +33,11 @@ class CharTokenizer:
     makes that readable as a string assertion.
     """
 
-    pad_token_id = SPECIAL_IDS["<|endoftext|>"]
-
     def __init__(self) -> None:
         self.template_kwargs: list[dict[str, Any]] = []
 
-    def encode(self, text: str, add_special_tokens: bool = True) -> list[int]:
-        # The adapters append the pooled token themselves; relying on a
-        # tokenizer's post-processor to add it is the bug this guards against.
-        assert add_special_tokens is False
-        return [ord(c) for c in text]
-
     def decode(self, ids: list[int]) -> str:
-        names = {v: k for k, v in SPECIAL_IDS.items()}
-        return "".join(names.get(i) or chr(i) for i in ids)
-
-    def get_vocab(self) -> dict[str, int]:
-        return dict(SPECIAL_IDS)
+        return "".join(map(chr, ids))
 
     def apply_chat_template(
         self,
@@ -81,18 +62,8 @@ def decode(ids: list[int]) -> str:
 
 
 class FakeModel:
-    """The attributes the adapters read off a loaded Qwen3-VL model.
-
-    No ``lm_head`` on the language model: the checkpoints the adapters take tie
-    their output head to the embedding matrix, and mlx-lm leaves the attribute
-    off exactly then.
-    """
-
-    def __init__(self) -> None:
-        backbone = types.SimpleNamespace(embed_tokens=None, layers=[])
-        self.language_model = types.SimpleNamespace(
-            model=backbone, args=types.SimpleNamespace(hidden_size=HIDDEN)
-        )
+    """A loaded model, as far as the chat model can tell: it only hands the
+    model back to ``stream_generate``, so it needs no attributes at all."""
 
 
 @dataclass

@@ -1,41 +1,30 @@
-"""Tests for the local-model adapters, with no MLX and no model.
+"""Tests for the local chat-model adapter, with no MLX and no model.
 
 The project installs MLX only on Apple Silicon macOS, and the real checkpoints
 are about 22 GB, so everything here runs against a fake ``mlx_lm`` module
 injected into ``sys.modules`` (over the ``None`` that conftest's
 ``_no_real_models`` puts there) and a character-level fake tokenizer --
 conftest's ``fake_mlx``, from ``fake_mlx.py``. That leaves the MLX calls
-themselves -- the forward passes and ``stream_generate`` -- to
-``test_models_live.py``, and covers everything around them, which is where the
-contract lives: which weights load and how often, which errors come out, what
-text reaches the model, where it is cut, how results are ordered, that forward
-passes over one model never overlap, and that the generation lock is released
-however a stream ends -- with mlx-lm's own stream finished first.
-
-The embedder is built through ``ingest.build_embeddings`` rather than by name:
-that factory is its one sanctioned constructor (the ``embeddings-factory``
-rule), and going through it also covers the wiring production uses.
+themselves -- ``stream_generate`` -- to ``test_models_live.py``, and covers
+everything around them, which is where the contract lives: which weights load
+and how often, which errors come out, what text reaches the model, and that the
+generation lock is released however a stream ends -- with mlx-lm's own stream
+finished first.
 """
 
 from __future__ import annotations
 
 import gc
-import math
 import subprocess
 import sys
 import threading
-import time
-import types
 from collections.abc import Generator
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
 import huggingface_hub
 import pytest
 from huggingface_hub import constants as hf_constants
-from langchain_core.documents import Document
-from langchain_core.embeddings import Embeddings
 from langchain_core.messages import (
     AIMessage,
     ChatMessage,
@@ -46,19 +35,13 @@ from langchain_core.messages import (
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 
-from rag_pipeline import ingest as ingest_mod
 from rag_pipeline import mlx_models
-from rag_pipeline.config import Settings
 from rag_pipeline.mlx_models import (
     MLXChatModel,
-    QwenVLReranker,
     load_mlx_model,
     resolve_model_path,
 )
-from tests.fake_mlx import HIDDEN, FakeModel, decode, write_model
-
-_EMBED_TAIL = "<|im_end|>\n<|im_start|>assistant\n<|endoftext|>"
-_RERANK_TAIL = "<|im_end|>\n<|im_start|>assistant\n"
+from tests.fake_mlx import decode, write_model
 
 
 @pytest.fixture
@@ -69,16 +52,6 @@ def no_hub(monkeypatch):
         pytest.fail("the Hugging Face cache was consulted")
 
     monkeypatch.setattr(huggingface_hub, "snapshot_download", refuse)
-
-
-def _embedder(model_id: str, dimensions: int = HIDDEN) -> Embeddings:
-    return ingest_mod.build_embeddings(
-        Settings(embedding_model=model_id, embedding_dimensions=dimensions)
-    )
-
-
-def _reranker(model_id: str, top_n: int = 3) -> QwenVLReranker:
-    return QwenVLReranker(model_id=model_id, top_n=top_n)
 
 
 def _chat(model_id: str, max_tokens: int = 7) -> MLXChatModel:
@@ -214,12 +187,10 @@ def test_missing_mlx_wins_even_over_a_memoized_model(fake_mlx, model_dir, monkey
         load_mlx_model(model_dir)
 
 
-def test_weights_load_once_across_every_adapter(fake_mlx, model_dir):
-    """What keeps an app rebuild (after every ingest) from reloading 22 GB."""
+def test_weights_load_once_however_often_the_model_is_built(fake_mlx, model_dir):
+    """What keeps an app rebuild (after every ingest) from reloading 15 GB."""
     first = load_mlx_model(model_dir)
     for _ in range(2):
-        _embedder(model_dir)
-        _reranker(model_dir)
         _chat(model_dir)
 
     assert load_mlx_model(model_dir) is first
@@ -314,55 +285,21 @@ def test_a_failed_load_is_not_memoized(fake_mlx, model_dir):
     assert len(fake_mlx.loads) == 2
 
 
-_ADAPTERS = {
-    "embeddings": _embedder,
-    "reranker": _reranker,
-    "chat": _chat,
-}
-
-
-@pytest.mark.parametrize("build", _ADAPTERS.values(), ids=_ADAPTERS.keys())
-def test_no_adapter_construction_raises_value_error(fake_mlx, model_dir, build):
+def test_construction_never_raises_value_error(fake_mlx, model_dir):
     """mlx-lm reports an unsupported model as ValueError, which streamlit_app.py's
     pipeline-load guard does not catch: a traceback in place of its error."""
     fake_mlx.load_error = ValueError("Model type not supported.")
 
     with pytest.raises(RuntimeError):
-        build(model_dir)
+        _chat(model_dir)
 
 
-@pytest.mark.parametrize("build", _ADAPTERS.values(), ids=_ADAPTERS.keys())
-def test_an_uncached_model_fails_every_adapter_as_file_not_found(
-    fake_mlx, tmp_path, monkeypatch, build
-):
+def test_an_uncached_model_is_file_not_found(fake_mlx, tmp_path, monkeypatch):
     monkeypatch.setattr(hf_constants, "HF_HUB_CACHE", str(tmp_path / "hub"))
 
     with pytest.raises(FileNotFoundError, match="hf download"):
-        build("some-org/not-downloaded")
+        _chat("some-org/not-downloaded")
     assert fake_mlx.loads == []
-
-
-@pytest.mark.parametrize(
-    "build", [_embedder, _reranker], ids=["embeddings", "reranker"]
-)
-def test_a_model_of_the_wrong_family_is_a_runtime_error(fake_mlx, model_dir, build):
-    """A plain text model has no ``language_model`` wrapper to read."""
-    fake_mlx.load_result = (types.SimpleNamespace(), fake_mlx.tokenizer)
-
-    with pytest.raises(RuntimeError, match="does not look like"):
-        build(model_dir)
-
-
-def test_a_reranker_with_an_untied_output_head_is_refused(fake_mlx, model_dir):
-    """The score is read off the embedding matrix, which is the output head only
-    when the two are tied. With a separate ``lm_head`` it would still produce a
-    ranking -- a plausible, wrong one -- so construction refuses it instead."""
-    untied = FakeModel()
-    untied.language_model.lm_head = object()
-    fake_mlx.load_result = (untied, fake_mlx.tokenizer)
-
-    with pytest.raises(RuntimeError, match="untied output head"):
-        _reranker(model_dir)
 
 
 def test_importing_the_module_does_not_import_mlx():
@@ -386,366 +323,6 @@ def test_importing_the_module_does_not_import_mlx():
     ).stdout.strip()
 
     assert loaded == "rag_pipeline.mlx_models"
-
-
-# --- embeddings ---------------------------------------------------------------
-
-
-def test_a_template_without_the_user_turn_is_a_runtime_error(
-    fake_mlx, model_dir, monkeypatch
-):
-    """Without the slot the text would land after the generation prompt and be
-    pooled from a position the model was never trained to read -- plausible
-    vectors, no error -- so the embedder refuses the template at construction."""
-    render = fake_mlx.tokenizer.apply_chat_template
-
-    def drop_user(messages, **kwargs):
-        return render([m for m in messages if m["role"] != "user"], **kwargs)
-
-    monkeypatch.setattr(fake_mlx.tokenizer, "apply_chat_template", drop_user)
-
-    with pytest.raises(RuntimeError, match="does not include the user's text"):
-        _embedder(model_dir)
-
-
-@pytest.fixture
-def pooled(monkeypatch) -> list[list[list[int]]]:
-    """Replace the forward pass: record each batch, return a vector per prompt.
-
-    Each vector is ``[len(prompt)]``, so a test can tell which text a result
-    came from and whether the order survived batching.
-    """
-    batches: list[list[list[int]]] = []
-
-    def pool(_self, batch):
-        batches.append(batch)
-        return [[float(len(ids))] for ids in batch]
-
-    monkeypatch.setattr(mlx_models.QwenVLEmbeddings, "_pool", pool)
-    return batches
-
-
-def test_documents_and_queries_use_the_official_prompts(fake_mlx, model_dir, pooled):
-    """System turn = instruction, user turn = text, the generation prompt, then
-    one appended <|endoftext|> -- the token whose state is the vector. Documents
-    and questions take different instructions, as the model was trained."""
-    embedder = _embedder(model_dir)
-
-    embedder.embed_documents(["Alpha chunk."])
-    embedder.embed_query("What is alpha?")
-
-    doc, query = (decode(batch[0]) for batch in pooled)
-    assert doc == (
-        "<|im_start|>system\nRepresent the user's input.<|im_end|>\n"
-        "<|im_start|>user\nAlpha chunk.<|im_end|>\n"
-        "<|im_start|>assistant\n<|endoftext|>"
-    )
-    assert query == (
-        "<|im_start|>system\nRetrieve passages that answer this question.<|im_end|>\n"
-        "<|im_start|>user\nWhat is alpha?<|im_end|>\n"
-        "<|im_start|>assistant\n<|endoftext|>"
-    )
-
-
-def test_an_overlong_text_is_cut_but_the_prompt_tail_survives(
-    fake_mlx, model_dir, pooled, monkeypatch
-):
-    """Cutting the prompt from the right, as the official script does, would
-    drop the pooled token and read the vector from the middle of the text."""
-    monkeypatch.setattr(mlx_models, "_MAX_PROMPT_TOKENS", 150)
-    embedder = _embedder(model_dir)
-
-    embedder.embed_documents(["~" * 500])  # "~" appears nowhere in the template
-
-    (ids,) = pooled[0]
-    text = decode(ids)
-    kept = text.count("~")
-    assert len(ids) == 150
-    assert 0 < kept < 500
-    assert text.endswith("<|im_start|>user\n" + "~" * kept + _EMBED_TAIL)
-
-
-def test_embeddings_are_batched_by_eight_and_keep_their_order(
-    fake_mlx, model_dir, pooled
-):
-    texts: list[str] = ["t" * n for n in range(1, 21)]
-
-    vectors = _embedder(model_dir).embed_documents(texts)
-
-    assert [len(batch) for batch in pooled] == [8, 8, 4]
-    overhead = len(pooled[0][0]) - 1
-    assert vectors == [[float(overhead + n)] for n in range(1, 21)]
-
-
-def test_embedding_nothing_runs_no_forward_pass(fake_mlx, model_dir, pooled):
-    assert _embedder(model_dir).embed_documents([]) == []
-    assert pooled == []
-
-
-def test_every_embedding_call_empties_the_mlx_buffer_cache(fake_mlx, model_dir, pooled):
-    """Left alone, MLX's buffer cache grew to 7 GB beside a 3.4 GB model."""
-    embedder = _embedder(model_dir)
-
-    embedder.embed_documents(["a", "b"])
-    embedder.embed_query("c")
-
-    assert fake_mlx.cache_clears == 2
-
-
-@pytest.mark.parametrize(
-    "error",
-    [ValueError("[reshape] bad"), KeyError("x"), RuntimeError("[metal::malloc]")],
-)
-def test_a_failed_embedding_is_a_runtime_error(fake_mlx, model_dir, monkeypatch, error):
-    def pool(_self, _batch):
-        raise error
-
-    monkeypatch.setattr(mlx_models.QwenVLEmbeddings, "_pool", pool)
-    embedder = _embedder(model_dir)
-
-    with pytest.raises(RuntimeError, match="Embedding with") as info:
-        embedder.embed_query("q")
-
-    assert info.value.__cause__ is error
-    assert fake_mlx.cache_clears == 1  # released on failure too
-
-
-@pytest.mark.parametrize("dimensions", [0, -1, HIDDEN + 1])
-def test_dimensions_outside_the_model_width_are_a_runtime_error(
-    fake_mlx, model_dir, dimensions
-):
-    with pytest.raises(RuntimeError, match="EMBEDDING_DIMENSIONS"):
-        _embedder(model_dir, dimensions)
-
-
-@pytest.mark.parametrize("dimensions", [1, HIDDEN])
-def test_dimensions_at_the_ends_of_the_range_are_accepted(
-    fake_mlx, model_dir, dimensions
-):
-    _embedder(model_dir, dimensions)
-
-
-# --- reranking ----------------------------------------------------------------
-
-# Logits the fake forward pass gives each document, keyed by its text.
-_LOGITS = {"alpha": 2.0, "beta": -1.0, "gamma": 0.5, "delta": 3.5, "epsilon": 0.5}
-
-
-def _document_text(ids: list[int]) -> str:
-    text = decode(ids)
-    return text[text.index("<Document>:") + len("<Document>:") : -len(_RERANK_TAIL)]
-
-
-@pytest.fixture
-def scored(monkeypatch) -> list[list[list[int]]]:
-    """Replace the forward pass with a lookup in ``_LOGITS``; record batches."""
-    batches: list[list[list[int]]] = []
-
-    def forward(_self, batch):
-        batches.append(batch)
-        return [_LOGITS.get(_document_text(ids), 0.0) for ids in batch]
-
-    monkeypatch.setattr(QwenVLReranker, "_forward", forward)
-    return batches
-
-
-def _docs(*texts: str) -> list[Document]:
-    return [
-        Document(page_content=t, metadata={"source": f"{t}.md"}, id=f"id-{t}")
-        for t in texts
-    ]
-
-
-def test_the_reranker_prompt_is_the_official_one(fake_mlx, model_dir, scored):
-    """Byte for byte: spacing included, and no <think> block -- the text-only
-    Qwen3-Reranker's format moves the card example's logit from 1.77 to 1.28."""
-    _reranker(model_dir).compress_documents(_docs("alpha"), "Why overlap?")
-
-    assert decode(scored[0][0]) == (
-        "<|im_start|>system\nJudge whether the Document meets the requirements "
-        "based on the Query and the Instruct provided. Note that the answer can "
-        'only be "yes" or "no".<|im_end|>\n<|im_start|>user\n'
-        "<Instruct>: Given a search query, retrieve relevant candidates that "
-        "answer the query.<Query>:Why overlap?\n<Document>:alpha<|im_end|>\n"
-        "<|im_start|>assistant\n"
-    )
-
-
-def test_reranking_returns_top_n_best_first_with_scores(fake_mlx, model_dir, scored):
-    docs = _docs("alpha", "beta", "gamma", "delta", "epsilon")
-
-    ranked = _reranker(model_dir, top_n=3).compress_documents(docs, "q")
-
-    assert [d.page_content for d in ranked] == ["delta", "alpha", "gamma"]
-    for d in ranked:
-        logit = _LOGITS[d.page_content]
-        assert d.metadata["relevance_score"] == pytest.approx(
-            1 / (1 + math.exp(-logit))
-        )
-        assert d.metadata["source"] == f"{d.page_content}.md"
-        assert d.id == f"id-{d.page_content}"
-    # Copies: the retriever's documents are not annotated behind its back.
-    assert all("relevance_score" not in d.metadata for d in docs)
-
-
-def test_tied_scores_keep_the_retrievers_order(fake_mlx, model_dir, scored):
-    ranked = _reranker(model_dir, top_n=2).compress_documents(
-        _docs("epsilon", "gamma", "beta"), "q"
-    )
-
-    assert [d.page_content for d in ranked] == ["epsilon", "gamma"]
-
-
-def test_fewer_documents_than_top_n_returns_them_all(fake_mlx, model_dir, scored):
-    ranked = _reranker(model_dir, top_n=4).compress_documents(
-        _docs("beta", "alpha"), "q"
-    )
-
-    assert [d.page_content for d in ranked] == ["alpha", "beta"]
-
-
-def test_reranking_nothing_runs_no_forward_pass(fake_mlx, model_dir, scored):
-    assert _reranker(model_dir).compress_documents([], "q") == []
-    assert scored == []
-    assert fake_mlx.cache_clears == 0
-
-
-def test_reranking_batches_by_eight_in_length_order(fake_mlx, model_dir, monkeypatch):
-    """Similar lengths share a batch, so little padding is computed; every
-    score still lands on its own document.
-
-    Twenty candidates, as FETCH_K's default hands the reranker, so three
-    batches: a score written back to the wrong slot shows up only from the
-    second batch on, and only when every document scores differently.
-    """
-    texts = [f"doc{'.' * ((i * 7) % 20)}{i}" for i in range(20)]
-    own = {text: float(i) - 9.5 for i, text in enumerate(texts)}  # none is 0.0
-    scored: list[list[list[int]]] = []
-
-    def forward(_self, batch):
-        scored.append(batch)
-        return [own[_document_text(ids)] for ids in batch]
-
-    monkeypatch.setattr(QwenVLReranker, "_forward", forward)
-
-    ranked = _reranker(model_dir, top_n=20).compress_documents(_docs(*texts), "q")
-
-    assert [len(batch) for batch in scored] == [8, 8, 4]
-    flat = [len(ids) for batch in scored for ids in batch]
-    assert flat == sorted(flat)
-    assert [d.page_content for d in ranked] == sorted(
-        texts, key=own.__getitem__, reverse=True
-    )
-    for d in ranked:
-        assert d.metadata["relevance_score"] == pytest.approx(
-            1 / (1 + math.exp(-own[d.page_content]))
-        )
-    assert fake_mlx.cache_clears == 1
-
-
-def test_an_overlong_document_is_cut_but_the_prompt_tail_survives(
-    fake_mlx, model_dir, scored, monkeypatch
-):
-    """The answer position is the prompt's last token; losing the tail would
-    score the pair from the middle of the document."""
-    monkeypatch.setattr(mlx_models, "_MAX_PROMPT_TOKENS", 400)
-
-    _reranker(model_dir).compress_documents(_docs("~" * 1000), "q")
-
-    (ids,) = scored[0]
-    text = decode(ids)
-    kept = text.count("~")
-    assert len(ids) == 400
-    assert 0 < kept < 1000
-    assert text.endswith("<Document>:" + "~" * kept + _RERANK_TAIL)
-
-
-def test_a_query_too_long_to_leave_room_for_a_document_is_a_runtime_error(
-    fake_mlx, model_dir, scored, monkeypatch
-):
-    monkeypatch.setattr(mlx_models, "_MAX_PROMPT_TOKENS", 400)
-
-    with pytest.raises(RuntimeError, match="token limit"):
-        _reranker(model_dir).compress_documents(_docs("alpha"), "q" * 1000)
-    assert scored == []
-
-
-def test_a_failed_rerank_is_a_runtime_error(fake_mlx, model_dir, monkeypatch):
-    error = ValueError("[broadcast_shapes] bad")
-
-    def forward(_self, _batch):
-        raise error
-
-    monkeypatch.setattr(QwenVLReranker, "_forward", forward)
-
-    with pytest.raises(RuntimeError, match="Reranking with") as info:
-        _reranker(model_dir).compress_documents(_docs("alpha"), "q")
-
-    assert info.value.__cause__ is error
-    assert fake_mlx.cache_clears == 1
-
-
-def test_a_top_n_below_one_is_a_runtime_error(fake_mlx, model_dir):
-    with pytest.raises(RuntimeError, match="top_n"):
-        _reranker(model_dir, top_n=0)
-    assert fake_mlx.loads == []
-
-
-def test_forward_passes_over_one_model_are_serialized(fake_mlx, model_dir, monkeypatch):
-    """Every adapter over one set of weights shares one forward lock.
-
-    After an upload, ingest's new embedder starts while another session's
-    pipeline may still be embedding a question over the same weights, and MLX
-    documents no thread safety. Overlap is counted, not timed, so the result is
-    deterministic: any unguarded route -- a lock dropped, or one per adapter
-    rather than per model -- shows as a peak above one.
-    """
-    active = 0
-    peak = 0
-    guard = threading.Lock()
-
-    def enter() -> None:
-        nonlocal active, peak
-        with guard:
-            active += 1
-            peak = max(peak, active)
-        time.sleep(0.05)  # a window wide enough for an unguarded pass to enter
-        with guard:
-            active -= 1
-
-    def pool(_self, batch):
-        enter()
-        return [[1.0] for _ in batch]
-
-    def forward(_self, batch):
-        enter()
-        return [0.0 for _ in batch]
-
-    monkeypatch.setattr(mlx_models.QwenVLEmbeddings, "_pool", pool)
-    monkeypatch.setattr(QwenVLReranker, "_forward", forward)
-    embedders = [_embedder(model_dir), _embedder(model_dir)]
-    rerankers = [_reranker(model_dir), _reranker(model_dir)]
-    calls = [lambda e=e: e.embed_query("q") for e in embedders] + [
-        lambda r=r: r.compress_documents(_docs("alpha"), "q") for r in rerankers
-    ]
-    start = threading.Barrier(len(calls))
-
-    def run(call) -> None:
-        start.wait()
-        call()
-
-    # A thread each, or the barrier waits for good; result() raises here what
-    # any of them failed with, traceback and all. Not `with`: its exit joins the
-    # workers unbounded, so a pass stuck on the lock would hang here, not fail.
-    executor = ThreadPoolExecutor(max_workers=len(calls))
-    try:
-        passes = [executor.submit(run, call) for call in calls]
-        for future in passes:
-            future.result(timeout=10)
-    finally:
-        executor.shutdown(wait=False)
-
-    assert peak == 1
 
 
 # --- generation ---------------------------------------------------------------

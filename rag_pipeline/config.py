@@ -127,19 +127,16 @@ class Settings:
     # for what another few seconds would have connected.
     mongodb_timeout_ms: int = 10000
 
-    # Local embedding model (a Hugging Face repo id resolved from the local
-    # cache, or a path to a model directory), run with MLX at both ingest and
-    # query -- the same model must embed documents and questions for their
-    # vectors to compare. The adapter implements Qwen3-VL-Embedding's own
-    # prompt format and pooling, so another checkpoint of that family (e.g. the
-    # 8B) is a drop-in; an unrelated embedding model is not.
-    embedding_model: str = "mlx-community/Qwen3-VL-Embedding-2B-bf16"
+    # Voyage AI embedding model, called over its API at both ingest and query --
+    # the same model must embed documents and questions for their vectors to
+    # compare. Any Voyage text embedding model that accepts an output dimension
+    # works.
+    embedding_model: str = "voyage-4-large"
 
-    # The width of those vectors. Qwen3-VL-Embedding is Matryoshka-trained, so
-    # any width up to the model's native 2048 is a valid prefix of the full
-    # vector (re-normalized). Folded into the chunk fingerprint, and it sets the
-    # vector index's numDimensions: an index serves vectors of one width only.
-    embedding_dimensions: int = 2048
+    # The width of those vectors: 256, 512, 1024 or 2048, the widths Voyage
+    # returns. Folded into the chunk fingerprint, and it sets the vector
+    # index's numDimensions: an index serves vectors of one width only.
+    embedding_dimensions: int = 1024
 
     # Local generation model, run with mlx-lm (thinking disabled, greedy
     # decoding). Any mlx-lm chat checkpoint whose chat template accepts a system
@@ -165,12 +162,9 @@ class Settings:
     # relevant chunk the embedding search ranked just out of the top few.
     fetch_k: int = 20
 
-    # Local reranker. Qwen3-VL-Reranker scores each (question, candidate) pair
-    # jointly from its yes/no logits, which embedding similarity only
-    # approximates. Like the embedder, the adapter is specific to this model
-    # family -- and, reading those logits off the tied embedding matrix, to its
-    # tied-embedding checkpoints: the 2B, in any quantization.
-    rerank_model: str = "mlx-community/Qwen3-VL-Reranker-2B-bf16"
+    # Voyage AI reranker. It scores each (question, candidate) pair jointly,
+    # which embedding similarity only approximates.
+    rerank_model: str = "rerank-3"
 
     # Tracing, off while the endpoint is empty. Set, it is the base URL of a
     # self-hosted Phoenix (http://localhost:6006 for `phoenix serve`), and each

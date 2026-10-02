@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
@@ -578,6 +579,39 @@ def eval_settings(settings: Settings) -> Settings:
     return replace(settings, data_dir=EVAL_CORPUS, collection_name=EVAL_COLLECTION)
 
 
+def fit_eval_index(settings: Settings, timeout_s: float = 180.0) -> bool:
+    """Clear the eval's collection if its index holds vectors of another width.
+
+    Ingest refuses a width change -- for a user's collection, rightly, since
+    the fix (a new COLLECTION_NAME) is theirs to choose. The eval's collection
+    is the eval's alone, so a run after EMBEDDING_DIMENSIONS changed rebuilds it
+    instead: the index is dropped and waited out (Atlas drops it
+    asynchronously, and a new one of the same name cannot be created until it
+    is gone), then the chunks are deleted. Returns whether it did.
+    """
+    from rag_pipeline import ingest as ingest_mod
+
+    collection = ingest_mod._collection(settings)
+    with ingest_mod.provider_errors_as_runtime():
+        found = list(collection.list_search_indexes(settings.vector_index_name))
+        if not found:
+            return False
+        fields = (found[0].get("latestDefinition") or {}).get("fields", [])
+        widths = [f.get("numDimensions") for f in fields if f.get("type") == "vector"]
+        if widths == [settings.embedding_dimensions]:
+            return False
+        collection.drop_search_index(settings.vector_index_name)
+        deadline = time.monotonic() + timeout_s
+        while list(collection.list_search_indexes(settings.vector_index_name)):
+            if time.monotonic() > deadline:
+                raise RuntimeError(
+                    f"The eval's old vector index was not dropped within {timeout_s:.0f}s."
+                )
+            time.sleep(0.5)
+        collection.delete_many({})
+    return True
+
+
 def run(settings: Settings, *, save_baseline: bool = False) -> list[str]:
     """Score the pipeline built from `settings`, and return the report's lines.
 
@@ -603,6 +637,7 @@ def run(settings: Settings, *, save_baseline: bool = False) -> list[str]:
     # Incremental like any ingest: after the first run, only a changed corpus
     # file or a changed model or chunk setting re-embeds anything.
     settings = eval_settings(settings)
+    rebuilt = fit_eval_index(settings)
     ingest(settings)
     expected = {source for q in questions for source in q.sources}
     if missing := sorted(expected - indexed_sources(settings)):
@@ -628,6 +663,11 @@ def run(settings: Settings, *, save_baseline: bool = False) -> list[str]:
         raise RuntimeError(f"LangSmith failed during the run: {exc}") from exc
 
     lines = [
+        *(
+            ["The eval's index was rebuilt for the new EMBEDDING_DIMENSIONS."]
+            if rebuilt
+            else []
+        ),
         f"Experiment {results.experiment_name} on {dataset}, judged by {JUDGE_MODEL}:",
         *format_report(summary, dataset, read_baseline()),
         f"Details: {results.url}",

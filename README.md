@@ -1,10 +1,10 @@
 # RAG Pipeline
 
 A small, readable **Retrieval-Augmented Generation** pipeline built with
-[LangChain](https://docs.langchain.com) whose models run on an Apple Silicon
-Mac. Documents are embedded with **Qwen3-VL-Embedding**, stored and searched in
-**MongoDB Atlas** with Atlas Vector Search, reranked with **Qwen3-VL-Reranker**,
-and answered by **Qwen3.8-27B** — all three models running locally with
+[LangChain](https://docs.langchain.com). Documents are embedded with
+**Voyage AI**'s `voyage-4-large`, stored and searched in **MongoDB Atlas** with
+Atlas Vector Search, reranked with Voyage's `rerank-3`, and answered by
+**Qwen3.8-27B**, running locally on an Apple Silicon Mac with
 [MLX](https://github.com/ml-explore/mlx). It ships with a reusable core library,
 a CLI, and a Streamlit chat app — all sharing the same code.
 
@@ -42,18 +42,18 @@ questions and results there — but see [below](#tracing-with-phoenix) if an old
 ## Prerequisites
 
 - An **Apple Silicon Mac** (M1 or later) on **macOS 14** or newer. The project
-  targets MLX's Metal backend and declares MLX for macOS only, so the models run
-  only there. Linux can install the project and run its test suite — that is
-  what CI does — but not the models.
-- About **32 GB of unified memory**. The three models together hold about 22 GB
-  and peak near 24 GB while answering, against the roughly 26.8 GB macOS lets
-  the GPU use on a 32 GB machine — it fits, with little to spare. A 16 GB Mac
-  cannot hold the default chat model, which is about 15 GB on its own.
-- About **24 GB of disk** for the models (15 GB for the chat model, about
-  4.3 GB each for the embedder and the reranker), in the Hugging Face cache.
+  targets MLX's Metal backend and declares MLX for macOS only, so the chat model
+  runs only there. Linux can install the project and run its test suite — that
+  is what CI does — but not the chat model.
+- About **32 GB of unified memory**. The default chat model holds about 15 GB,
+  so a 16 GB Mac cannot run it.
+- About **15 GB of disk** for the chat model, in the Hugging Face cache.
 - [uv](https://docs.astral.sh/uv/) and Python 3.11+.
 - A **MongoDB Atlas** cluster. The free tier (M0) holds the index of a few
   thousand pages; [Setup](#setup) walks through creating one.
+- A **Voyage AI** API key, for embedding and reranking. Each account's first
+  200 million tokens per model are free, which covers indexing and querying a
+  personal corpus for a long time.
 - To run the tests: **Docker** (Docker Desktop on a Mac). The suite runs
   MongoDB's `atlas-local` image, so it needs no cluster of yours.
 
@@ -65,21 +65,25 @@ The optional [`rag eval`](#evaluation) needs two API keys besides.
 uv sync                      # create the venv and install dependencies
 ```
 
-Then download the three models, once:
+Then download the chat model, once:
 
 ```bash
-uvx --from huggingface_hub hf download mlx-community/Qwen3-VL-Embedding-2B-bf16
-uvx --from huggingface_hub hf download mlx-community/Qwen3-VL-Reranker-2B-bf16
 uvx --from huggingface_hub hf download mlx-community/Qwen3.8-27B-4bit
 ```
 
-They land in the Hugging Face cache (`~/.cache/huggingface/hub`, or wherever
+It lands in the Hugging Face cache (`~/.cache/huggingface/hub`, or wherever
 `HF_HOME`/`HF_HUB_CACHE` points — set it the same way for the download and for
-the app). Loading is **cache-only**: the pipeline never downloads a model. One
+the app). Loading is **cache-only**: the pipeline never downloads it. A model
 that is missing, or whose download stopped partway, fails with an error naming
 the exact `hf download` command, rather than starting a 15 GB download in the
-middle of a question. A model setting can also be a path to a model directory,
+middle of a question. `CHAT_MODEL` can also be a path to a model directory,
 which is used as-is.
+
+Then create a Voyage AI API key in the [Voyage AI dashboard](https://dashboard.voyageai.com)
+for `VOYAGE_API_KEY`, and **add a payment method** there. Without one the
+account is held to 3 requests and 10,000 tokens a minute — less than one ingest
+batch, so even a small corpus fails to index. With one, the standard limits
+(2,000 requests a minute) apply, and the free tokens are still used first.
 
 Then point it at a MongoDB Atlas cluster. In
 [Atlas](https://cloud.mongodb.com) (labels approximate):
@@ -94,10 +98,10 @@ Then point it at a MongoDB Atlas cluster. In
 4. On the cluster, **Connect → Drivers → Python** gives the connection string.
 
 ```bash
-cp .env.example .env         # then set MONGODB_URI in it, password filled in
+cp .env.example .env         # then set MONGODB_URI (password filled in) and VOYAGE_API_KEY
 ```
 
-`.env` is git-ignored, and the app never displays the URI. A free cluster that
+`.env` is git-ignored, and the app never displays either value. A free cluster that
 goes unused for a long time is paused; resume it in Atlas if the app suddenly
 cannot reach it. Everything else in `.env` is an optional override (see
 [Configuration](#configuration)).
@@ -112,11 +116,10 @@ uv run rag ingest
 
 Loads the `.md`/`.txt`/`.pdf` files under `data/` — recursively, matching the
 extension case-insensitively — splits them into overlapping chunks, embeds them
-with the local embedding model, and stores them in the Atlas collection
-`rag_db.rag_docs`. The first run creates that collection and its Atlas Vector
-Search index, and every run waits until what it wrote is searchable, so a
-question asked right after an ingest finds it. Ingest loads only the embedding
-model (about 3.4 GB), never the reranker or the chat model.
+with Voyage AI, and stores them in the Atlas collection `rag_db.rag_docs`. The
+first run creates that collection and its Atlas Vector Search index, and every
+run waits until what it wrote is searchable, so a question asked right after an
+ingest finds it. Ingest loads no local model.
 
 A file it cannot use is skipped rather than aborting the run: an unreadable one
 (bad encoding, corrupt PDF, permissions) warns on stderr, and one that yields no
@@ -125,8 +128,8 @@ a scanned, image-only PDF, whose text extraction returns empty without failing.
 
 Re-run it whenever the documents change. It is incremental: each document is
 fingerprinted, and only new, edited, or removed ones are re-embedded, so adding
-one file to a large corpus costs one file rather than the corpus — embedding
-runs at roughly nine 1000-character chunks a second. Afterwards the collection
+one file to a large corpus costs one file rather than the corpus, in time and
+in Voyage tokens. Afterwards the collection
 holds exactly what is in `data/`, so deletions and edits are picked up too,
 there are never duplicates, and any unrelated documents sharing the collection
 are left alone. Re-running with nothing changed makes no embedding calls at all.
@@ -151,9 +154,9 @@ uv run rag query "What is chunking and why do we overlap chunks?"
 ```
 
 Streams the grounded answer as the local model produces it, then prints the
-source files it drew from. Each `rag query` is a fresh process, so it loads all
-three models before it answers; for more than a question or two, the app, which
-keeps them loaded, is the faster route. Ctrl-C abandons an answer (exit status
+source files it drew from. Each `rag query` is a fresh process, so it loads the
+chat model before it answers; for more than a question or two, the app, which
+keeps it loaded, is the faster route. Ctrl-C abandons an answer (exit status
 130) once the model finishes the step it is on — a few seconds at most while
 it is still reading the prompt.
 
@@ -184,8 +187,8 @@ another website, say. Streamlit refuses it, but first looks up the external IP
 address, since a page served from that address is one it would allow. The
 request carries nothing about the app.
 
-Opening the app loads the three models, behind a spinner; after that they stay
-in memory for the life of the server, including across the index rebuilds an
+Opening the app loads the chat model, behind a spinner; after that it stays in
+memory for the life of the server, including across the index rebuilds an
 upload or a `rag ingest` triggers. Answers are generated one at a time: a
 question asked from a second tab while one is being answered waits for it to
 finish. The toolbar's **Stop** ends an answer where it is — the model stops
@@ -207,25 +210,25 @@ Measured on an M2 Max with 32 GB, using the default models and settings:
 
 | Step | Time |
 | ---- | ---- |
-| Loading the three models | about 10 s once the weights are in macOS's file cache; longer on a first load after a reboot, which reads them from disk |
-| Embedding documents (ingest) | about 9 chunks per second |
-| Embedding a question | about 30 ms |
+| Loading the chat model | about 6 s once the weights are in macOS's file cache; longer on a first load after a reboot, which reads them from disk |
+| Embedding documents (ingest) | about 435 chunks per second, in Voyage batches of 256 |
+| Embedding a question | about 0.18 s, a round trip to Voyage |
 | Searching the index in Atlas | about 0.4 s (median, M0 free cluster), against 0.07 s for the on-disk store of earlier versions: the round trip to the cluster |
-| Reranking the 20 candidates | about 2.5 s |
+| Reranking the 20 candidates | about 0.18 s, at Voyage |
 | First token of the answer | about 6–8 s with the default four 1000-character chunks (about 1k tokens of prompt) — the model reads the whole prompt, at 100–150 tokens per second, before it writes anything; about 15 s for the first answer after the models load, while MLX warms up |
 | The rest of the answer | about 17–21 tokens per second |
 
-So a question takes roughly 10–15 seconds, most of it before the first word
-appears (the app shows a spinner for that wait), and the first one after the
-models load nearer 20. Each `rag query` is a fresh process, so it pays for the
+So a question takes roughly 8–12 seconds, almost all of it the local chat
+model — most of that before the first word appears (the app shows a spinner for
+that wait) — and the first one after the model loads nearer 17. Each `rag query` is a fresh process, so it pays for the
 load and that slow first answer every time. The first-token wait scales with
 the retrieved context: each extra chunk (`RETRIEVAL_K`) or longer one
 (`CHUNK_SIZE`) adds a couple of seconds.
 
 Leave Docker Desktop closed while the models run. Its virtual machine reserves
-8 GB, and beside the models' 22 GB on a 32 GB Mac it pushes the chat model into
-swap: in one `rag eval` run, a single answer took 14 minutes instead of 17
-seconds. Docker is only needed to run the test suite.
+8 GB, and beside the chat model's 15 GB and the rest of a 32 GB Mac's load it
+can push the model into swap: in one `rag eval` run, with the local embedder and
+reranker loaded too, a single answer took 14 minutes instead of 17 seconds. Docker is only needed to run the test suite.
 
 ## Add your own documents
 
@@ -342,7 +345,7 @@ observability server that you run on your own machine:
 ```
 RAGPipeline                 CHAIN      the question, and the answer
 ├─ VectorStoreRetriever     RETRIEVER  the FETCH_K candidates the vector search returned
-├─ QwenVLReranker           RERANKER   those candidates in; the RETRIEVAL_K kept, with scores, out
+├─ VoyageAIRerank           RERANKER   those candidates in; the RETRIEVAL_K kept, with scores, out
 └─ generate                 CHAIN
    ├─ ChatPromptTemplate    PROMPT     the prompt, with the passages filled in
    └─ MLXChatModel          LLM        the messages, the answer, token counts, finish reason
@@ -414,11 +417,11 @@ environment:
 | ------------------- | ------------------ | ------- |
 | `CHAT_MODEL`        | `mlx-community/Qwen3.8-27B-4bit` | Generation model, run with mlx-lm (thinking off, greedy decoding); any mlx-lm chat checkpoint whose chat template accepts a system turn works (Gemma 2's, for one, rejects it, and every question then fails) |
 | `MAX_TOKENS`        | `1024`             | Maximum length of a generated answer, in tokens; an answer cut off there ends with a note saying so |
-| `EMBEDDING_MODEL`   | `mlx-community/Qwen3-VL-Embedding-2B-bf16` | Embedding model (ingest + query); must be a Qwen3-VL-Embedding checkpoint, since the adapter implements that family's prompt format and pooling |
-| `EMBEDDING_DIMENSIONS` | `2048`          | Width of the stored vectors, up to the model's native 2048: a narrower one is the full vector's re-normalized prefix (Matryoshka); a change needs a new `COLLECTION_NAME` |
+| `EMBEDDING_MODEL`   | `voyage-4-large`   | Voyage AI embedding model (ingest + query); any Voyage text embedding model that accepts an output dimension. A change re-embeds everything |
+| `EMBEDDING_DIMENSIONS` | `1024`          | Width of the stored vectors: 256, 512, 1024 or 2048, the widths Voyage returns; a change needs a new `COLLECTION_NAME` |
 | `RETRIEVAL_K`       | `4`                | Chunks kept after reranking and put in the prompt; each adds a couple of seconds before the first token |
 | `FETCH_K`           | `20`               | Candidates retrieved before reranking |
-| `RERANK_MODEL`      | `mlx-community/Qwen3-VL-Reranker-2B-bf16` | Reranker; must be a Qwen3-VL-Reranker checkpoint with tied embeddings — the 2B, bf16 or quantized — since the adapter scores off the tied embedding matrix |
+| `RERANK_MODEL`      | `rerank-3`         | Voyage AI reranker |
 | `CHUNK_SIZE`        | `1000`             | Characters per chunk |
 | `CHUNK_OVERLAP`     | `200`              | Overlap between adjacent chunks |
 | `DATA_DIR`          | `./data`           | Source documents |
@@ -514,21 +517,25 @@ correctly, so that has a suite of its own:
 uv run pytest -m models
 ```
 
-These tests load the real checkpoints (an Apple Silicon Mac with the three
-models downloaded and the memory to hold them; about a minute on an M2 Max). They reproduce the embedding and
-reranker model cards' published scores — a subtly wrong prompt format or pooling
-step still produces plausible vectors and sensible-looking rankings, so this is
-the only check that notices — confirm that batching does not change a result
-and that the chat model reports why it stopped (the `MAX_TOKENS` note reads it),
-and run an ingest-and-answer pass over `data/`. They skip, rather than fail,
-when MLX or a model is missing — and the ingest-and-answer pass skips when the
-sample document its question is about is no longer in `data/`. A plain
-`uv run pytest` deselects them
-(`addopts = ["-m", "not models"]`), so it never loads a model. Run this suite by
-hand, since CI cannot, whenever what the fakes stand in for may have moved:
-after changing anything in `mlx_models.py`, after a `uv.lock` change that moves
-`mlx`, `mlx-lm`, `mlx-metal`, `transformers`, `tokenizers` or `huggingface-hub`,
-and after re-downloading a model. A run that skipped a test has not checked it.
+These tests load the real chat model (an Apple Silicon Mac with it downloaded
+and the memory to hold it) and call Voyage AI's real API (with
+`VOYAGE_API_KEY`, for a fraction of a cent): about a minute on an M2 Max. They
+check that the Voyage factories embed documents and questions the right way
+round, at the configured width, and that the reranker puts the relevant passage
+first; that the chat model streams a grounded answer with no reasoning in it
+and reports why it stopped (the `MAX_TOKENS` note reads it); and run an
+ingest-and-answer pass over `data/` on the test container. They are the only
+tests allowed onto the network, and the only ones that keep `VOYAGE_API_KEY`.
+They skip, rather than fail, when MLX, the chat model or the key is missing —
+and the ingest-and-answer pass skips when the sample document its question is
+about is no longer in `data/`. A plain `uv run pytest` deselects them
+(`addopts = ["-m", "not models"]`), so it never loads a model or calls an API.
+Run this suite by hand, since CI cannot, whenever what the fakes stand in for
+may have moved: after changing anything in `mlx_models.py` or the factories,
+after a `uv.lock` change that moves `mlx`, `mlx-lm`, `mlx-metal`,
+`transformers`, `tokenizers`, `huggingface-hub`, `voyageai` or
+`langchain-voyageai`, and after re-downloading the model. A run that skipped a
+test has not checked it.
 
 Coverage is measured on demand rather than in CI, and carries no threshold — a
 number to keep green invites tests that execute code without asserting anything:
@@ -622,14 +629,12 @@ evals/           rag eval's corpus/ (a fictional handbook), questions.json about
 
 ## How it works
 
-- **Local embeddings** (Qwen3-VL-Embedding-2B) embed documents at ingest and
-  questions at query; the *same* model must embed both for their vectors to
-  compare, so a single factory (`build_embeddings()`) is shared by ingest and
-  query. The adapter follows the model's official recipe: an instruction as the
-  system turn, the text as the user turn, then one appended `<|endoftext|>`
-  token whose final hidden state, normalized, is the vector. Documents and
-  questions get different instructions, as the model's own retrieval examples
-  do.
+- **Voyage AI embeddings** (`voyage-4-large`, 1024-wide) embed documents at
+  ingest and questions at query; the *same* model must embed both for their
+  vectors to compare, so a single factory (`build_embeddings()`) is shared by
+  ingest and query. Documents and questions are embedded asymmetrically, as
+  Voyage's `input_type` asks. The clients retry a rate limit or a timeout with
+  backoff, five attempts in all, and give up on a stalled call after a minute.
 - **MongoDB Atlas** (`langchain-mongodb`) stores the chunks with their vectors,
   and an Atlas Vector Search index — created by `rag ingest`, with the two
   fields searches filter on — finds the nearest ones to a question. Every chunk
@@ -638,11 +643,10 @@ evals/           rag eval's corpus/ (a fictional handbook), questions.json about
   from, or cited. The factory that opens the store (`open_store()`) lives in
   `ingest.py` and is imported by the query side, so both open it the same way,
   and the whole process shares one MongoDB client.
-- **Local reranking** (Qwen3-VL-Reranker-2B) sharpens retrieval: vector search
-  casts a wide net (`FETCH_K` candidates), then the reranker scores each
-  candidate against the question *jointly* — as the model's probability of
-  answering "yes" to whether the passage meets the query — which embedding
-  similarity only approximates, and keeps the top `RETRIEVAL_K`. This is the
+- **Voyage AI reranking** (`rerank-3`) sharpens retrieval: vector search casts
+  a wide net (`FETCH_K` candidates), then the reranker scores each candidate
+  against the question *jointly*, which embedding similarity only
+  approximates, and keeps the top `RETRIEVAL_K`. This is the
   single query-time factory that lives in `pipeline.py` rather than `ingest.py`,
   because reranking has no ingest-side counterpart.
 - **Local generation** (Qwen3.8-27B, 4-bit, via `mlx-lm`) is prompted to answer
@@ -655,17 +659,15 @@ evals/           rag eval's corpus/ (a fictional handbook), questions.json about
   `answer()` — for library callers who just want the finished string — is a join
   over the same path.
 
-Each model's weights load once per process, however many times the pipeline is
-rebuilt: the app rebuilds after every ingest, and ingest builds its own embedder,
-and both reuse what is already in memory rather than loading second copies.
+The chat model's weights load once per process, however many times the
+pipeline is rebuilt: the app rebuilds after every ingest, and reuses what is
+already in memory rather than loading a second copy.
 
-Swapping a model is a one-line change in `.env` only within its family — any
-mlx-lm chat checkpoint whose template takes a system turn for `CHAT_MODEL` (the
-grounding prompt is one), another Qwen3-VL-Embedding checkpoint for
-`EMBEDDING_MODEL`, and another tied-embedding Qwen3-VL-Reranker checkpoint (the
-2B, in any quantization) for `RERANK_MODEL`. A different embedding or
-reranking family is a code change in `mlx_models.py`, because each adapter
-implements its family's own prompt format and scoring. Swapping the vector store
+Swapping a model is a one-line change in `.env`: any mlx-lm chat checkpoint
+whose template takes a system turn for `CHAT_MODEL` (the grounding prompt is
+one), and any Voyage embedding model or reranker for `EMBEDDING_MODEL` and
+`RERANK_MODEL`. Another provider's embedder or reranker is a code change in the
+factories, `build_embeddings()` and `build_reranker()`. Swapping the vector store
 is a code change too: `open_store()` in `ingest.py` is the single place the
 vector store is constructed, so it is the main place to edit — though the
 incremental bookkeeping in `ingest()`, the index management and the writer lock
@@ -681,7 +683,7 @@ enforces them across every `.py` file git does not ignore, added or not:
 | Rule                 | Forbids                                                        | Why |
 | -------------------- | -------------------------------------------------------------- | --- |
 | `store-factory`      | constructing the vector store (`MongoDBAtlasVectorSearch(...)`, `MongoDBAtlasVectorSearch.from_*(...)` or `MongoClient(...)`) outside `ingest.py`, `tests/` included — `tests/conftest.py`, which administers the test container, excepted | the store's identity is (`MONGODB_URI`, database, collection, vector index, embedding function); ingest and query must open it the same way, through the one client the process shares |
-| `embeddings-factory` | constructing an embedding model (`QwenVLEmbeddings(...)` or `HuggingFaceEmbeddings(...)`) outside `ingest.py`, `tests/` included — the class definition itself excepted | the same model must embed documents and questions; in tests, inject a fake instead |
+| `embeddings-factory` | constructing an embedding model (`VoyageAIEmbeddings(...)` or `HuggingFaceEmbeddings(...)`) outside `ingest.py`, `tests/` included — a class definition of that name excepted | the same model must embed documents and questions; in tests, inject a fake instead |
 | `no-suppressions`    | a suppression in source that ruff or ty honours: `noqa` (in any case, and in ruff's and flake8's file-level forms), ruff's `ignore[…]`, `file-ignore[…]` and `disable[…]`, isort's `skip`, `skip_file`, `off` and `split`, `ty: ignore` and `type: ignore` (with or without codes), and `@no_type_check` — though not `# fmt:` directives, under which the linter still reports everything | fix the finding instead |
 
 Two documentation rules ride along: every `Settings` field must appear in both

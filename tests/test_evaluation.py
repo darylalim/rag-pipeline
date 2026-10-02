@@ -8,6 +8,7 @@ fakes. What `langsmith.evaluate` itself does with these is LangSmith's to test.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -17,6 +18,7 @@ from typing import Any
 import anthropic
 import httpx2
 import pytest
+from langchain_core.embeddings import DeterministicFakeEmbedding
 from langchain_core.language_models import FakeListChatModel
 from langsmith.evaluation.evaluator import EvaluationResult
 from langsmith.utils import LangSmithError
@@ -570,3 +572,23 @@ def test_a_missing_key_stops_the_run_before_anything_loads(monkeypatch, settings
 
     with pytest.raises(RuntimeError, match=f"^{key} is not set"):
         ev.run(settings)
+
+
+def test_the_eval_index_is_rebuilt_for_a_new_width_and_kept_otherwise(
+    settings, fake_embeddings
+):
+    """The eval's collection is the eval's alone, so a width change rebuilds it
+    where ingest would refuse a user's collection: the old index is dropped and
+    waited out, the old chunks deleted, and the next ingest builds afresh."""
+    evaluated = ev.eval_settings(settings)
+    ingest_mod.ingest(evaluated, embeddings=fake_embeddings)
+
+    assert ev.fit_eval_index(evaluated) is False, "same width: nothing to rebuild"
+
+    narrower = dataclasses.replace(evaluated, embedding_dimensions=16)
+    assert ev.fit_eval_index(narrower) is True
+    assert ingest_mod._collection(narrower).count_documents({}) == 0
+
+    ingest_mod.ingest(narrower, embeddings=DeterministicFakeEmbedding(size=16))
+    expected = {s for q in ev.load_questions() for s in q.sources}
+    assert expected <= ingest_mod.indexed_sources(narrower)

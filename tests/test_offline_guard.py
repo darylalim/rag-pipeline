@@ -1,11 +1,12 @@
 """conftest's guards are the offline guarantee -- assert they actually hold.
 
 A test that forgets to inject a fake must *fail*, not quietly run a real model.
-With the models local, a network block alone would never notice: weights
-already in the Hugging Face cache load without opening a socket. So
-``_no_real_models`` makes MLX unimportable, and ``_offline`` separately blocks
-every socket, for whatever still reaches for the network -- a download,
-telemetry, Chroma's default embedder. Either one silently loosening reads as
+Two kinds of model, two guards. The chat model is local: weights already in the
+Hugging Face cache load without opening a socket, so a network block alone
+would never notice, and ``_no_real_models`` makes MLX unimportable. The
+embedder and the reranker are Voyage AI's API: ``_no_real_store`` removes
+``VOYAGE_API_KEY``, so their factories stop before any request, and
+``_offline`` blocks the socket besides. Any of these silently loosening reads as
 green everywhere else, so each route to a real model is tripped here on purpose
 -- every factory, and both entry points that build one when a fake is left out
 -- and the socket block is checked on its own. So is the tracing guard: an
@@ -46,6 +47,21 @@ def _assert_stopped_by_the_mlx_guard(
     assert model_id in str(excinfo.value)
 
 
+def _assert_stopped_by_the_key_guard(
+    excinfo: pytest.ExceptionInfo[RuntimeError], _model_id: str
+) -> None:
+    # The factory refuses before building a client, so no request was made.
+    assert excinfo.type is RuntimeError
+    assert str(excinfo.value).startswith("VOYAGE_API_KEY is not set")
+
+
+_GUARD_OF = {
+    "embedding_model": _assert_stopped_by_the_key_guard,
+    "rerank_model": _assert_stopped_by_the_key_guard,
+    "chat_model": _assert_stopped_by_the_mlx_guard,
+}
+
+
 # --- the model guard ---------------------------------------------------------
 
 
@@ -67,23 +83,24 @@ def test_mlx_cannot_be_imported(module):
 def test_every_model_factory_is_stopped_by_the_guard(
     settings, module: ModuleType, factory: str, setting: str
 ):
-    """Each factory reaches the loader, and the loader stops at the MLX import.
+    """Each factory is stopped by its guard: Voyage's by the missing key, the
+    chat model's at the MLX import.
 
     Run against the real default model ids, which may well be fully cached on
-    the machine running this: the guard has to fire before the cache is looked
-    at, or it protects only the machines that never downloaded anything.
+    the machine running this: the MLX guard has to fire before the cache is
+    looked at, or it protects only the machines that never downloaded anything.
     """
     with pytest.raises(RuntimeError) as excinfo:
         getattr(module, factory)(settings)
 
-    _assert_stopped_by_the_mlx_guard(excinfo, getattr(settings, setting))
+    _GUARD_OF[setting](excinfo, getattr(settings, setting))
 
 
 def test_an_ingest_without_injected_embeddings_is_stopped(settings):
     with pytest.raises(RuntimeError) as excinfo:
         ingest_mod.ingest(settings)
 
-    _assert_stopped_by_the_mlx_guard(excinfo, settings.embedding_model)
+    _assert_stopped_by_the_key_guard(excinfo, settings.embedding_model)
 
 
 @pytest.mark.parametrize(
@@ -114,7 +131,7 @@ def test_a_pipeline_missing_any_one_fake_is_stopped(
     with pytest.raises(RuntimeError) as excinfo:
         RAGPipeline(settings, **fakes)
 
-    _assert_stopped_by_the_mlx_guard(excinfo, getattr(settings, setting))
+    _GUARD_OF[setting](excinfo, getattr(settings, setting))
 
 
 @pytest.mark.parametrize(("marked", "hidden"), [(False, True), (True, False)])

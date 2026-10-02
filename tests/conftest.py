@@ -156,6 +156,8 @@ _ATLAS_IMAGE = "mongodb/mongodb-atlas-local:8.0.17"
 # Credentials and other variables a developer's environment (or .env) holds
 # that no test may inherit.
 _CREDENTIALS = ("MONGODB_URI", "ANTHROPIC_API_KEY", "VOYAGE_API_KEY")
+# What a test marked `models` keeps: the live tests call Voyage's API.
+_LIVE_CREDENTIALS = ("VOYAGE_API_KEY",)
 
 
 def _await_search_ready(uri: str, timeout_s: float = 180.0) -> None:
@@ -464,15 +466,21 @@ def _reset_store_client():
 
 
 @pytest.fixture(autouse=True)
-def _no_real_store(monkeypatch):
+def _no_real_store(request, monkeypatch):
     """Remove the developer's credentials -- a real ``MONGODB_URI`` above all.
 
     config.py loads .env at import, so a developer's real cluster is in
     os.environ for every test; one that forgot ``atlas`` would otherwise write
     into it. Only the ``atlas`` fixture sets ``MONGODB_URI``, to the container.
     ``_offline`` is the second guard: a real cluster is not on loopback.
+
+    Tests marked ``models`` keep ``VOYAGE_API_KEY``: they call Voyage's real
+    API, by hand, on purpose. Never ``MONGODB_URI``.
     """
+    live = request.node.get_closest_marker("models") is not None
     for name in _CREDENTIALS:
+        if live and name in _LIVE_CREDENTIALS:
+            continue
         monkeypatch.delenv(name, raising=False)
 
 
@@ -581,15 +589,18 @@ def _no_tracer_left_on():
 
 
 @pytest.fixture(autouse=True)
-def _offline(monkeypatch):
+def _offline(request, monkeypatch):
     """Fail any test that opens a socket to a host other than this machine.
 
     The store is the atlas-local container, reached on loopback, and the models
     load from local files, so nothing in the suite has a reason to connect
     anywhere else: such a connection means something is downloading (a model),
     phoning home, or reaching a real cluster, and it fails the test that made
-    it. Unix sockets -- Docker's own API -- stay open.
+    it. Unix sockets -- Docker's own API -- stay open. Tests marked ``models``
+    are exempt: they call Voyage's API, and run only by hand (``-m models``).
     """
+    if request.node.get_closest_marker("models"):
+        return
     connect = socket.socket.connect
     connect_ex = socket.socket.connect_ex
     create_connection = socket.create_connection

@@ -23,18 +23,20 @@ from typing import Any
 
 import huggingface_hub.constants as hf_constants
 import pytest
+import voyageai.error
 from langchain_core.documents import Document
 from langchain_core.documents.compressor import BaseDocumentCompressor
 from langchain_core.embeddings import DeterministicFakeEmbedding, Embeddings
 from langchain_core.language_models import FakeListChatModel
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableLambda
+from langchain_voyageai import VoyageAIEmbeddings, VoyageAIRerank
 
 from rag_pipeline import ingest as ingest_mod
 from rag_pipeline import mlx_models
 from rag_pipeline import pipeline as pipeline_mod
 from rag_pipeline.config import Settings
-from rag_pipeline.mlx_models import MLXChatModel, QwenVLReranker
+from rag_pipeline.mlx_models import MLXChatModel
 from rag_pipeline.pipeline import (
     RAGPipeline,
     build_chat_model,
@@ -185,12 +187,12 @@ def test_a_complete_index_gets_past_the_guards_to_the_models(settings, fake_embe
 
     They inject no models and expect FileNotFoundError, which would prove
     nothing about ordering if a pipeline with no models injected never reached
-    a model at all. Over a complete index it does, and under conftest's MLX
-    block that is the loader's RuntimeError.
+    a model at all. Over a complete index it does: the first factory it reaches
+    is Voyage's embedder, which conftest has left without a key.
     """
     ingest_mod.ingest(settings, embeddings=fake_embeddings)
 
-    with pytest.raises(RuntimeError, match="MLX"):
+    with pytest.raises(RuntimeError, match="VOYAGE_API_KEY is not set"):
         RAGPipeline(settings)
 
 
@@ -587,23 +589,87 @@ def test_build_reranker_caps_at_retrieval_k(settings, monkeypatch):
     retrieve() does no slicing of its own, so a factory that passed FETCH_K (or
     a literal) here would put every candidate into each prompt and citation
     list -- and every other test would miss it, since they all inject a fake
-    reranker. The stub is the least a Qwen3-VL-Reranker checkpoint provides for
-    construction: a backbone, and a vocabulary with "yes" and "no" in it.
+    reranker. Built for real; constructing it makes no call.
     """
-    requested = _stub_weights(
-        monkeypatch,
-        SimpleNamespace(language_model=SimpleNamespace(model=None)),
-        SimpleNamespace(get_vocab=lambda: {"yes": 1, "no": 2}, pad_token_id=0),
-    )
+    monkeypatch.setenv("VOYAGE_API_KEY", "pa-test")
     configured = dataclasses.replace(
-        settings, rerank_model="some-org/some-reranker", retrieval_k=3, fetch_k=9
+        settings, rerank_model="rerank-test", retrieval_k=3, fetch_k=9
     )
 
     reranker = build_reranker(configured)
 
-    assert isinstance(reranker, QwenVLReranker)
-    assert (reranker.model_id, reranker.top_n) == ("some-org/some-reranker", 3)
-    assert requested == ["some-org/some-reranker"]
+    assert isinstance(reranker, VoyageAIRerank)
+    assert (reranker.model, reranker.top_k) == ("rerank-test", 3)
+
+
+def test_the_voyage_clients_retry_and_time_out(settings, monkeypatch):
+    """langchain-voyageai builds its clients with one attempt and no timeout: a
+    rate-limited call (HTTP 429) would fail the question at once, and a stalled
+    one would hang it forever. The factories replace them."""
+    monkeypatch.setenv("VOYAGE_API_KEY", "pa-test")
+    embeddings = ingest_mod.build_embeddings(settings_at_a_voyage_width(settings))
+    reranker = build_reranker(settings)
+    assert isinstance(embeddings, VoyageAIEmbeddings)
+    assert isinstance(reranker, VoyageAIRerank)
+
+    for client in (embeddings._client, reranker.client):
+        assert client.max_retries > 1
+        assert client._params["request_timeout"] is not None
+
+
+def test_the_reranker_returns_the_candidates_themselves_in_voyages_order(
+    settings, monkeypatch
+):
+    """Voyage's order and scores, on the documents as retrieved -- ids kept.
+
+    langchain-voyageai's own reranker rebuilds each document without its id,
+    which is what ties a reranked chunk to the stored one in a trace, and adds
+    a total_tokens key to its metadata. Voyage's response is faked at the one
+    call the subclass makes, so this runs offline.
+    """
+    monkeypatch.setenv("VOYAGE_API_KEY", "pa-test")
+    reranker = build_reranker(settings)
+    candidates = [
+        Document(
+            page_content=f"chunk {i}", id=f"a.md:{i}:h", metadata={"source": "a.md"}
+        )
+        for i in range(3)
+    ]
+    response = SimpleNamespace(
+        results=[
+            SimpleNamespace(index=2, relevance_score=0.9),
+            SimpleNamespace(index=0, relevance_score=0.4),
+        ],
+        total_tokens=42,
+    )
+    monkeypatch.setattr(type(reranker), "_rerank", lambda _self, _docs, _q: response)
+
+    ranked = list(reranker.compress_documents(candidates, "which chunk?"))
+
+    assert [d.id for d in ranked] == ["a.md:2:h", "a.md:0:h"]
+    assert [d.metadata for d in ranked] == [
+        {"source": "a.md", "relevance_score": 0.9},
+        {"source": "a.md", "relevance_score": 0.4},
+    ]
+    assert candidates[2].metadata == {"source": "a.md"}, "a candidate was changed"
+
+
+def settings_at_a_voyage_width(settings: Settings) -> Settings:
+    """The fixture's width is the fake embedder's, which Voyage does not offer."""
+    return dataclasses.replace(settings, embedding_dimensions=1024)
+
+
+def test_build_embeddings_asks_for_the_configured_width(settings, monkeypatch):
+    monkeypatch.setenv("VOYAGE_API_KEY", "pa-test")
+
+    embeddings = ingest_mod.build_embeddings(
+        dataclasses.replace(
+            settings, embedding_model="voyage-test", embedding_dimensions=512
+        )
+    )
+
+    assert isinstance(embeddings, VoyageAIEmbeddings)
+    assert (embeddings.model, embeddings.output_dimension) == ("voyage-test", 512)
 
 
 # --- failures ----------------------------------------------------------------
@@ -860,6 +926,49 @@ def _fail_pipeline_model_not_cached(
     )
 
 
+def _fail_ingest_without_voyage_key(
+    settings, fake_embeddings, fake_reranker, monkeypatch, tmp_path
+):
+    # No embeddings injected: production's factory needs the key first.
+    ingest_mod.ingest(settings)
+
+
+def _fail_pipeline_width_voyage_lacks(
+    settings, fake_embeddings, fake_reranker, monkeypatch, tmp_path
+):
+    # The fixture's 32 is the fake's width, not one Voyage returns; refused when
+    # the pipeline loads, not when the first question is embedded.
+    ingest_mod.ingest(settings, embeddings=fake_embeddings)
+    monkeypatch.setenv("VOYAGE_API_KEY", "pa-test")
+    RAGPipeline(settings, reranker=fake_reranker)
+
+
+def _fail_pipeline_retrieval_k_below_one(
+    settings, fake_embeddings, fake_reranker, monkeypatch, tmp_path
+):
+    ingest_mod.ingest(settings, embeddings=fake_embeddings)
+    monkeypatch.setenv("VOYAGE_API_KEY", "pa-test")
+    RAGPipeline(
+        dataclasses.replace(settings, retrieval_k=0),
+        embeddings=fake_embeddings,
+        llm=FakeListChatModel(responses=["unused"]),
+    )
+
+
+def _fail_retrieve_on_a_voyage_error(
+    settings, fake_embeddings, fake_reranker, monkeypatch, tmp_path
+):
+    # What a Voyage outage, or a rate limit its retries did not outlast, looks
+    # like from inside: voyageai's own type, outside the union.
+    ingest_mod.ingest(settings, embeddings=fake_embeddings)
+    RAGPipeline(
+        settings,
+        embeddings=_failing_embeddings(voyageai.error.RateLimitError("rate limited")),
+        llm=FakeListChatModel(responses=["unused"]),
+        reranker=fake_reranker,
+    ).retrieve("apples")
+
+
 def _ingested_pipeline(settings, fake_embeddings, llm, reranker) -> RAGPipeline:
     """A pipeline over a freshly ingested index, generating through `llm`."""
     ingest_mod.ingest(settings, embeddings=fake_embeddings)
@@ -1052,6 +1161,30 @@ def _fail_stream_answer_on_empty_response(
             FileNotFoundError,
             "hf download some-org/never-downloaded",
             id="pipeline-model-not-cached",
+        ),
+        pytest.param(
+            _fail_ingest_without_voyage_key,
+            RuntimeError,
+            "VOYAGE_API_KEY is not set",
+            id="ingest-without-voyage-key",
+        ),
+        pytest.param(
+            _fail_pipeline_width_voyage_lacks,
+            RuntimeError,
+            "not a width Voyage offers",
+            id="pipeline-width-voyage-lacks",
+        ),
+        pytest.param(
+            _fail_pipeline_retrieval_k_below_one,
+            RuntimeError,
+            "RETRIEVAL_K",
+            id="pipeline-retrieval-k-below-one",
+        ),
+        pytest.param(
+            _fail_retrieve_on_a_voyage_error,
+            RuntimeError,
+            "Voyage AI request failed",
+            id="retrieve-voyage-error",
         ),
         pytest.param(
             _fail_retrieve_on_embedding_error,

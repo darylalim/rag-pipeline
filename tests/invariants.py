@@ -130,22 +130,23 @@ RULES = [
     Rule(
         name="embeddings-factory",
         # tests/ is covered too: nothing in tests should build a real embedding
-        # model, and the adapter's own tests reach it through build_embeddings()
+        # model, and the factory's own tests reach it through build_embeddings()
         # like everyone else. The offline guarantee does not rest on this rule
-        # -- conftest's `_no_real_models` does, because it catches the realistic
-        # version of the mistake (a forgotten `embeddings=` argument, which
-        # names no banned symbol at all). This rule is authoring-time feedback
-        # for the deliberate spelling. `class QwenVLEmbeddings(` is excluded by
-        # the second lookbehind: the definition in mlx_models.py is where the
-        # name has to appear, and it builds nothing.
+        # -- conftest's `_no_real_store` and `_offline` do, because they catch
+        # the realistic version of the mistake (a forgotten `embeddings=`
+        # argument, which names no banned symbol at all: the factory then finds
+        # no VOYAGE_API_KEY). This rule is authoring-time feedback for the
+        # deliberate spelling. `class VoyageAIEmbeddings(` is excluded by the
+        # second lookbehind: a subclass definition names the class and builds
+        # nothing.
         applies=lambda p: p.endswith(".py") and p != "rag_pipeline/ingest.py",
         pattern=re.compile(
             r"(?<![\w.])(?<!class )(?:\w+\.)*"
-            r"(?:QwenVLEmbeddings|HuggingFaceEmbeddings)\s*\("
+            r"(?:VoyageAIEmbeddings|HuggingFaceEmbeddings)\s*\("
         ),
         scan_comments=False,
         message=(
-            "Constructing an embedding model (QwenVLEmbeddings/"
+            "Constructing an embedding model (VoyageAIEmbeddings or "
             "HuggingFaceEmbeddings) inline. Route through build_embeddings() in "
             "rag_pipeline/ingest.py; in tests, inject DeterministicFakeEmbedding "
             "instead."

@@ -8,17 +8,19 @@ build a single pipeline and reuse it across queries.
 from __future__ import annotations
 
 import json
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from contextlib import closing
 from dataclasses import dataclass
 from typing import Any, TypedDict, cast
 
+from langchain_core.callbacks import Callbacks
 from langchain_core.documents import Document
 from langchain_core.documents.compressor import BaseDocumentCompressor
 from langchain_core.embeddings import Embeddings
 from langchain_core.language_models import BaseChatModel
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import Runnable
+from langchain_voyageai import VoyageAIRerank
 from openinference.semconv.trace import (
     DocumentAttributes,
     OpenInferenceMimeTypeValues,
@@ -30,15 +32,17 @@ from opentelemetry import context as otel_context
 from opentelemetry import trace
 from opentelemetry.trace import Span, Status, StatusCode
 from opentelemetry.util.types import AttributeValue
+from pydantic import SecretStr
 
-from rag_pipeline.config import Settings
+from rag_pipeline.config import Settings, require_env_key
 from rag_pipeline.ingest import (
     OWN_CHUNKS,
     open_store,
+    provider_errors_as_runtime,
     require_index,
-    store_errors_as_runtime,
+    voyage_clients,
 )
-from rag_pipeline.mlx_models import MLXChatModel, QwenVLReranker
+from rag_pipeline.mlx_models import MLXChatModel
 
 # Grounding prompt: the model must answer from the retrieved context only, and
 # admit when the context does not contain the answer. This is what turns a
@@ -123,8 +127,8 @@ def source_excerpts(docs: list[Document]) -> list[Excerpt]:
 # installs a provider (rag_pipeline.tracing); the attribute names are
 # OpenInference's, which is what Phoenix renders a trace from.
 
-# The metadata key a LangChain reranker scores its documents under -- the
-# convention QwenVLReranker follows too.
+# The metadata key a LangChain reranker scores its documents under, Voyage's
+# included.
 _SCORE_KEY = "relevance_score"
 
 _TEXT = OpenInferenceMimeTypeValues.TEXT.value
@@ -253,16 +257,63 @@ def build_chat_model(settings: Settings) -> BaseChatModel:
     return MLXChatModel(model_id=settings.chat_model, max_tokens=settings.max_tokens)
 
 
+class _VoyageRerank(VoyageAIRerank):
+    """Voyage's reranker, returning the candidates themselves, ids included.
+
+    langchain-voyageai rebuilds each document it returns from its text and
+    metadata alone, so the id -- ``source:index:content_hash``, what ties a
+    reranked chunk to the stored one in a trace -- is lost, and a
+    ``total_tokens`` key is added to every chunk's metadata. Here each kept
+    document is the candidate as retrieved, with only the score added, under
+    the key every reranker uses.
+    """
+
+    def compress_documents(
+        self,
+        documents: Sequence[Document],
+        query: str,
+        callbacks: Callbacks | None = None,
+    ) -> Sequence[Document]:
+        if not documents:
+            return []
+        ranked = self._rerank(documents, query)
+        return [
+            documents[result.index].model_copy(
+                update={
+                    "metadata": {
+                        **documents[result.index].metadata,
+                        _SCORE_KEY: result.relevance_score,
+                    }
+                }
+            )
+            for result in ranked.results
+        ]
+
+
 def build_reranker(settings: Settings) -> BaseDocumentCompressor:
-    """Construct the local reranker.
+    """Construct the reranker, Voyage AI's.
 
     Here, not in ingest.py: reranking is a query-only stage with no ingest-side
     counterpart, so the shared-factory reason that keeps build_embeddings in
     ingest.py doesn't apply — it sits beside build_chat_model, both query-time
-    model factories. ``top_n`` is the reranker's own cap, so it returns exactly
-    retrieval_k docs and ``retrieve()`` needs no manual slice.
+    model factories. ``top_k`` is the reranker's own cap, so it returns exactly
+    retrieval_k docs and ``retrieve()`` needs no manual slice. RuntimeError,
+    never ValueError, for a missing key or a cap below one: this runs on the
+    app's pipeline-load path, and Voyage would refuse the cap only at the first
+    question.
     """
-    return QwenVLReranker(model_id=settings.rerank_model, top_n=settings.retrieval_k)
+    key = require_env_key("VOYAGE_API_KEY", "Reranking uses Voyage AI")
+    if settings.retrieval_k < 1:
+        raise RuntimeError(
+            f"RETRIEVAL_K must be at least 1, not {settings.retrieval_k}."
+        )
+    reranker = _VoyageRerank(
+        model=settings.rerank_model,
+        top_k=settings.retrieval_k,
+        voyage_api_key=SecretStr(key),
+    )
+    reranker.client, reranker.aclient = voyage_clients(key)
+    return reranker
 
 
 # The largest FETCH_K a search accepts: $vectorSearch caps its candidates at
@@ -290,7 +341,7 @@ class RAGPipeline:
                 f"FETCH_K must be between 1 and {_MAX_FETCH_K}, not {settings.fetch_k}."
             )
         # Before any model is built: a missing, misnamed or empty index is
-        # reported without first loading ~22 GB of weights to find out.
+        # reported without first loading ~15 GB of weights to find out.
         require_index(settings)
 
         self.settings = settings
@@ -335,7 +386,7 @@ class RAGPipeline:
         given and what it kept, with their scores: the step whose choices
         decide what the model is shown.
         """
-        with store_errors_as_runtime():
+        with provider_errors_as_runtime():
             candidates = self._retriever.invoke(question)
             with _tracer().start_as_current_span(
                 type(self._reranker).__name__,

@@ -19,20 +19,23 @@ from collections import Counter, defaultdict
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Literal, cast, get_args
 
 import bson.errors
 import pymongo.errors
+import voyageai
+import voyageai.error
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_mongodb import MongoDBAtlasVectorSearch
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_voyageai import VoyageAIEmbeddings
+from pydantic import SecretStr
 from pymongo import MongoClient, ReturnDocument
 from pymongo.collection import Collection
 from pymongo.operations import SearchIndexModel
 
 from rag_pipeline.config import Settings, require_env_key
-from rag_pipeline.mlx_models import QwenVLEmbeddings
 
 # File extensions we know how to read into text.
 SUPPORTED_SUFFIXES = {".md", ".txt", ".pdf"}
@@ -71,6 +74,35 @@ _LOCK_POLL_S = 1.0
 _ADD_SLICE = 256
 
 
+# The widths Voyage's embedding models can return (their `output_dimension`).
+_VoyageWidth = Literal[256, 512, 1024, 2048]
+_VOYAGE_WIDTHS: tuple[int, ...] = get_args(_VoyageWidth)
+
+# Voyage's clients default to one attempt and no timeout: a rate-limited
+# request (HTTP 429) fails at once, and a stalled one waits forever. Voyage
+# recommends exponential backoff, which its client applies -- to rate limits,
+# unavailability and timeouts -- when given more attempts; the last failure is
+# re-raised as itself, so it still reaches provider_errors_as_runtime.
+_VOYAGE_ATTEMPTS = 5
+_VOYAGE_TIMEOUT_S = 60.0
+
+
+def voyage_clients(api_key: str) -> tuple[voyageai.Client, voyageai.AsyncClient]:
+    """Voyage clients that retry and time out, for both Voyage models.
+
+    langchain-voyageai builds its own with the library's defaults and offers no
+    way to change them, so the factories replace them with these.
+    """
+    return (
+        voyageai.Client(
+            api_key=api_key, max_retries=_VOYAGE_ATTEMPTS, timeout=_VOYAGE_TIMEOUT_S
+        ),
+        voyageai.AsyncClient(
+            api_key=api_key, max_retries=_VOYAGE_ATTEMPTS, timeout=_VOYAGE_TIMEOUT_S
+        ),
+    )
+
+
 def build_embeddings(settings: Settings) -> Embeddings:
     """Construct the embedding model.
 
@@ -78,16 +110,28 @@ def build_embeddings(settings: Settings) -> Embeddings:
     *must* be identical for indexing and querying -- vectors from different
     models are not comparable. Both stages import this single factory.
 
-    Qwen3-VL-Embedding is trained asymmetrically -- documents and questions are
-    embedded under different instructions -- and the adapter applies them itself
-    (``embed_documents`` at ingest, ``embed_query`` at retrieval), so neither
-    stage passes one here. Cheap to call again: the weights load once per
-    process, so the app's ingest after an upload reuses the model its pipeline
-    already holds instead of loading a second copy.
+    Voyage embeds documents and questions asymmetrically, and langchain-voyageai
+    asks for each itself (``input_type="document"`` from ``embed_documents`` at
+    ingest, ``"query"`` from ``embed_query`` at retrieval), so neither stage
+    passes one here. RuntimeError, never ValueError, for a missing key or a
+    width Voyage does not offer: this runs on the app's pipeline-load path.
     """
-    return QwenVLEmbeddings(
-        settings.embedding_model, dimensions=settings.embedding_dimensions
+    key = require_env_key("VOYAGE_API_KEY", "Embeddings come from Voyage AI")
+    width = settings.embedding_dimensions
+    if width not in _VOYAGE_WIDTHS:
+        raise RuntimeError(
+            f"EMBEDDING_DIMENSIONS={width} is not a width Voyage offers: "
+            f"{', '.join(map(str, _VOYAGE_WIDTHS))}."
+        )
+    embeddings = VoyageAIEmbeddings(
+        model=settings.embedding_model,
+        output_dimension=cast(_VoyageWidth, width),
+        voyage_api_key=SecretStr(key),
+        # One request per slice of adds, so a slice is one call to retry.
+        batch_size=_ADD_SLICE,
     )
+    embeddings._client, embeddings._aclient = voyage_clients(key)
+    return embeddings
 
 
 # One MongoClient per (URI, timeout) for the life of the process. A client is a
@@ -113,7 +157,7 @@ def _client(settings: Settings) -> MongoClient[dict[str, Any]]:
     with _clients_lock:
         client = _clients.get(key)
         if client is None:
-            with store_errors_as_runtime():
+            with provider_errors_as_runtime():
                 client = MongoClient(
                     uri,
                     serverSelectionTimeoutMS=settings.mongodb_timeout_ms,
@@ -138,13 +182,13 @@ def _collection(settings: Settings) -> Collection[dict[str, Any]]:
     where every caller gets its handle.
     """
     client = _client(settings)
-    with store_errors_as_runtime():
+    with provider_errors_as_runtime():
         return client[settings.mongodb_db][settings.collection_name]
 
 
 def _meta(settings: Settings) -> Collection[dict[str, Any]]:
     client = _client(settings)
-    with store_errors_as_runtime():
+    with provider_errors_as_runtime():
         return client[settings.mongodb_db][_META_COLLECTION]
 
 
@@ -184,12 +228,13 @@ def open_store(
 
 
 @contextmanager
-def store_errors_as_runtime() -> Iterator[None]:
-    """Translate MongoDB failures into the RuntimeError the frontends catch.
+def provider_errors_as_runtime() -> Iterator[None]:
+    """Translate MongoDB and Voyage AI failures into the RuntimeError the frontends catch.
 
-    Wraps every store op on both sides: connecting, ingest's reads, deletes,
-    adds and index management, and the search at query. pymongo's and bson's
-    exception types sit outside the ``FileNotFoundError | RuntimeError |
+    Wraps every call to either service on both sides: connecting, ingest's
+    reads, deletes, adds (which embed) and index management, and the search
+    (which embeds the question) and rerank at query. voyageai's, pymongo's and
+    bson's exception types sit outside the ``FileNotFoundError | RuntimeError |
     ValueError`` union both frontends handle. Everything becomes a
     RuntimeError, never a ValueError -- a store failure while the app loads its
     pipeline must land in the branch ``streamlit_app.py`` catches *below* its
@@ -198,11 +243,14 @@ def store_errors_as_runtime() -> Iterator[None]:
     pymongo's ``ConfigurationError``, so it lands there too.
 
     ``bson.errors.BSONError`` is not a ``PyMongoError``, so it has its own arm.
-    Model failures need no arm: the adapters in ``mlx_models`` already raise
-    inside the union.
+    A Voyage failure arrives here only after its retries (``voyage_clients``).
+    The local chat model needs no arm: its adapter already raises inside the
+    union.
     """
     try:
         yield
+    except voyageai.error.VoyageError as exc:
+        raise RuntimeError(f"Voyage AI request failed: {exc}") from exc
     except (pymongo.errors.PyMongoError, bson.errors.BSONError) as exc:
         # Keyed off the message, not the type: a vector of the wrong width is an
         # ordinary OperationFailure, raised at search time.
@@ -248,7 +296,7 @@ def index_version(settings: Settings) -> str:
     RuntimeError -- an unreachable cluster, a missing ``MONGODB_URI`` -- which
     the app reads inside the guard that already catches it.
     """
-    with store_errors_as_runtime():
+    with provider_errors_as_runtime():
         stamp = _meta(settings).find_one({"_id": _version_id(settings)})
     # `.get` plus a type check: a stamp edited by hand reads as "no version"
     # rather than as a KeyError escaping the caught union into a crash page.
@@ -261,7 +309,7 @@ def require_index(settings: Settings) -> None:
 
     The query path's guards, here rather than in the pipeline so they can use
     the raw collection, which needs no embedding model: a fresh setup should be
-    told to run ``rag ingest`` without first loading ~22 GB of local models to
+    told to run ``rag ingest`` without first loading the ~15 GB chat model to
     find that out. Three cases, each a ``FileNotFoundError`` naming the fix, and
     none of them creates anything:
 
@@ -276,7 +324,7 @@ def require_index(settings: Settings) -> None:
     An unreachable cluster is the RuntimeError ``_client`` raises.
     """
     collection = _collection(settings)
-    with store_errors_as_runtime():
+    with provider_errors_as_runtime():
         if settings.collection_name not in collection.database.list_collection_names(
             filter={"name": settings.collection_name}
         ):
@@ -306,7 +354,7 @@ def indexed_sources(settings: Settings) -> set[str]:
     paths: needs no model, creates nothing (``distinct`` over a collection that
     does not exist is simply empty).
     """
-    with store_errors_as_runtime():
+    with provider_errors_as_runtime():
         sources = _collection(settings).distinct("source", OWN_CHUNKS)
     return {str(source) for source in sources}
 
@@ -744,12 +792,12 @@ class _WriterLock:
 def _writer_lock(settings: Settings) -> Iterator[_WriterLock]:
     """Hold the collection's ingest lock for the body, failing inside the union."""
     lock = _WriterLock(settings)
-    with store_errors_as_runtime():
+    with provider_errors_as_runtime():
         lock.acquire()
     try:
         yield lock
     finally:
-        with store_errors_as_runtime():
+        with provider_errors_as_runtime():
             lock.release()
 
 
@@ -786,9 +834,9 @@ def ingest(settings: Settings, embeddings: Embeddings | None = None) -> int:
     between runs must be picked up without being announced.
 
     Reaching that state costs one embedding pass per *changed* document rather
-    than per document. Embedding runs locally at roughly nine chunks a second,
-    and the app re-ingests on every upload, so embedding the whole corpus each
-    time would make adding one file cost as much as indexing all of them.
+    than per document. Embedding is a paid call to Voyage AI, and the app
+    re-ingests on every upload, so embedding the whole corpus each time would
+    make adding one file cost as much as indexing all of them.
     Unchanged documents keep the vectors they already have; changed and removed
     ones have their chunks dropped first, so a file's old text can never outlive
     it in the index.
@@ -804,10 +852,8 @@ def ingest(settings: Settings, embeddings: Embeddings | None = None) -> int:
     same corpus report the same number. ``embeddings`` is injectable so tests can
     substitute a lightweight fake; production callers leave it as None.
     """
-    # Built before the lock: loading the model takes seconds, which no other
-    # writer should wait on, and a model that is missing or fails to load then
-    # fails before anything is written. Cheap when this process already holds
-    # it (the app, after its first load).
+    # Built before the lock, so a missing key or a width Voyage does not offer
+    # fails before anything is written, and no other writer waits on it.
     embedder = embeddings or build_embeddings(settings)
 
     # One writer at a time per collection (see _WriterLock), held across the
@@ -841,7 +887,7 @@ def ingest(settings: Settings, embeddings: Embeddings | None = None) -> int:
 
         store = open_store(settings, embedder)
         collection = _collection(settings)
-        with store_errors_as_runtime():
+        with provider_errors_as_runtime():
             # The fingerprints are what decide the work, so they are what is read.
             indexed: dict[str, set[str]] = defaultdict(set)
             chunk_counts: Counter[str] = Counter()

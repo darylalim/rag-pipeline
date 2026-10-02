@@ -325,13 +325,13 @@ VIOLATIONS = [
     ),
     pytest.param(
         "streamlit_app.py",
-        "e = QwenVLEmbeddings(m, dimensions=32)",
+        "e = VoyageAIEmbeddings(model=m, output_dimension=1024)",
         id="inline-embeddings",
     ),
     pytest.param(
         # Qualified by its module, the construction is still a construction.
         "rag_pipeline/pipeline.py",
-        "e = mlx_models.QwenVLEmbeddings(m, dimensions=d)",
+        "e = langchain_voyageai.VoyageAIEmbeddings(model=m)",
         id="qualified-embeddings",
     ),
     pytest.param(
@@ -480,22 +480,22 @@ ALLOWED = [
     ),
     pytest.param(
         "rag_pipeline/ingest.py",
-        "return QwenVLEmbeddings(m, dimensions=d)",
+        "embeddings = VoyageAIEmbeddings(model=m, output_dimension=w)",
         id="ingest-builds-the-embedder",
     ),
     pytest.param(
-        # The definition has to spell the name followed by a paren, and builds
-        # nothing -- without the rule's `class ` lookbehind the adapter module
-        # itself would fail the sweep.
-        "rag_pipeline/mlx_models.py",
-        "class QwenVLEmbeddings(Embeddings):",
+        # A class definition spells the name followed by a paren, and builds
+        # nothing -- the rule's `class ` lookbehind lets it through, in a file
+        # the rule otherwise covers.
+        "tests/fake_voyage.py",
+        "class VoyageAIEmbeddings(Embeddings):",
         id="the-embedder-class-definition",
     ),
     pytest.param(
-        # Naming the class is not building it: the adapter's tests patch its
-        # methods this way.
-        "tests/test_mlx_models.py",
-        'monkeypatch.setattr(mlx_models.QwenVLEmbeddings, "_pool", pool)',
+        # Naming the class is not building it: the factory's tests check what
+        # it returns this way.
+        "tests/test_pipeline.py",
+        "assert isinstance(embeddings, VoyageAIEmbeddings)",
         id="referencing-the-embedder-class",
     ),
     # Prose describing a rule must not trip it, or the rule cannot be documented.
