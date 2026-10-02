@@ -21,9 +21,17 @@ from rag_pipeline.config import Settings
 
 logger = logging.getLogger(__name__)
 
+# Wide, because most of the page is evidence: an answer is followed by every
+# passage it was generated from, and in the centered column those stacked into
+# a scroll several screens long, with the sides of the display left empty.
 st.set_page_config(
-    page_title="RAG Pipeline", page_icon=":material/search:", layout="centered"
+    page_title="RAG Pipeline", page_icon=":material/search:", layout="wide"
 )
+
+# Passages side by side in the retrieved-passages panel. Two, because a passage
+# is a paragraph or more of prose: a third column narrows each to a few words a
+# line. Below 640px Streamlit stacks the columns again.
+_PASSAGE_COLUMNS = 2
 
 # Initialized here rather than beside the replay loop: the sidebar runs first and
 # already writes this key, so a reader added there would otherwise KeyError on
@@ -313,15 +321,26 @@ def _render_sources(excerpts: list[Excerpt]) -> None:
     "I don't know based on the provided documents" the same panel is the
     evidence that the documents really lack the answer, and telling a refusal
     apart from an answer would take a guess at the model's wording.
+
+    Laid out a row at a time, rather than dealt into columns, so rank reads left
+    to right and then down, and the cards in a row share one height.
     """
     if excerpts:
         with st.expander(
             f"Retrieved passages ({len(excerpts)})",
             icon=":material/description:",
         ):
-            for rank, excerpt in enumerate(excerpts, start=1):
-                st.caption(f"{rank}. `{excerpt['source']}`")
-                st.text(excerpt["text"])
+            for start in range(0, len(excerpts), _PASSAGE_COLUMNS):
+                row = excerpts[start : start + _PASSAGE_COLUMNS]
+                # Not strict: an odd last passage leaves its row's second column
+                # empty, so it keeps the width of the cards above it.
+                columns = st.columns(_PASSAGE_COLUMNS)
+                for rank, (column, excerpt) in enumerate(
+                    zip(columns, row, strict=False), start=start + 1
+                ):
+                    with column.container(border=True, height="stretch"):
+                        st.caption(f"{rank}. `{excerpt['source']}`")
+                        st.text(excerpt["text"])
 
 
 # Replay the conversation so far.
