@@ -157,7 +157,9 @@ text. The sidebar shows the active configuration and accepts
 
 ### What to expect
 
-Measured from Singapore against an M0 Atlas cluster, with the default settings:
+Typical timings with the default settings and an M0 (free) Atlas cluster. Most
+of each is network latency, so yours will vary with your distance to the
+cluster and the APIs:
 
 | Step | Time |
 | ---- | ---- |
