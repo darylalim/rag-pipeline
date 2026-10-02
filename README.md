@@ -1,33 +1,18 @@
 # RAG Pipeline
 
-A small, readable **Retrieval-Augmented Generation** pipeline built with
+A small, readable **retrieval-augmented generation** pipeline built with
 [LangChain](https://docs.langchain.com). Documents are embedded with
-**Voyage AI**'s `voyage-4-large`, stored and searched in **MongoDB Atlas** with
-Atlas Vector Search, reranked with Voyage's `rerank-3`, and answered by
-**Claude Sonnet 5.5**. It ships with a reusable core library, a CLI, and a
-Streamlit chat app — all sharing the same code.
+**Voyage AI** (`voyage-4-large`), stored and searched in **MongoDB Atlas**
+Vector Search, reranked with Voyage (`rerank-3`), and answered by
+**Claude Sonnet 5.5**. A core library, a CLI and a Streamlit chat app share the
+same code.
 
 ![The Streamlit chat app answering a question from the sample documents, citing its source, with the active models in the sidebar](docs/chat-app.png)
 
 ```
 Ingest (once):   data/ ──load──▶ split ──embed──▶ store (MongoDB Atlas + vector index)
-Query (per Q):   question ──embed──▶ search ──rerank──▶ [top-k chunks + question] ──▶ Claude ──▶ grounded answer + sources
+Query (per Q):   question ──embed──▶ search ──rerank──▶ [top-k chunks + question] ──▶ Claude ──▶ answer + sources
 ```
-
-Everything but the code runs as a service, so your documents leave the
-machine: their text and vectors are stored in a MongoDB Atlas cluster — a free
-one is enough — reached through `MONGODB_URI`, Voyage AI embeds them and every
-question, and each question goes to Voyage's reranker with its candidate
-passages and to Anthropic's API with the passages kept. Those three accounts
-are all it needs; the optional [`rag eval`](#evaluation), which scores the
-pipeline, adds a LangSmith one. The chat app sends nothing else:
-`.streamlit/config.toml`
-switches off Streamlit's usage statistics, which its browser front end would
-otherwise send to Streamlit, and its first-run prompt for an email address, and
-keeps the app to this machine — though
-Streamlit can still look up the machine's external IP address (see
-[below](#3-or-use-the-chat-app)). [Tracing](#tracing-with-langsmith) is off
-unless you turn it on; on, every question is also sent to LangSmith.
 
 **Contents** — [Prerequisites](#prerequisites) · [Setup](#setup) ·
 [Usage](#usage) · [Add your own documents](#add-your-own-documents) ·
@@ -36,57 +21,70 @@ unless you turn it on; on, every question is also sent to LangSmith.
 [Project structure](#project-structure) · [How it works](#how-it-works) ·
 [Invariants](#invariants)
 
+### What leaves your machine
+
+Every model is a hosted API, so your documents do too:
+
+- **MongoDB Atlas** stores their text and vectors.
+- **Voyage AI** embeds every document and question, and reranks each question's
+  candidate passages.
+- **Anthropic** receives each question with the passages kept for it.
+- **LangSmith** receives traces only if you [turn tracing on](#tracing-with-langsmith),
+  and the eval corpus only when you run [`rag eval`](#evaluation).
+
+The chat app sends nothing else: `.streamlit/config.toml` turns off Streamlit's
+usage statistics and its first-run email prompt, and binds the app to this
+machine (with one caveat, [below](#3-or-use-the-chat-app)).
+
 ## Prerequisites
 
 - [uv](https://docs.astral.sh/uv/) and Python 3.11+, on macOS or Linux. No GPU
-  and no model download: every model is an API.
-- A **MongoDB Atlas** cluster. The free tier (M0) holds the index of a few
-  thousand pages; [Setup](#setup) walks through creating one.
-- A **Voyage AI** API key, for embedding and reranking. Each account's first
-  200 million tokens per model are free, which covers indexing and querying a
-  personal corpus for a long time.
-- An **Anthropic** API key, for the answers. At the default settings a question
-  costs about half a US cent (a few thousand tokens in, a few hundred out).
-- To run the tests: **Docker** (Docker Desktop on a Mac). The suite runs
-  MongoDB's `atlas-local` image, so it needs no cluster of yours.
-
-The optional [`rag eval`](#evaluation) needs a LangSmith API key besides.
+  and no model downloads.
+- A **MongoDB Atlas** cluster. The free tier (M0) holds an index of a few
+  thousand pages.
+- A **Voyage AI** API key, for embedding and reranking. The first 200 million
+  tokens per model are free.
+- An **Anthropic** API key, for the answers. A question costs about half a US
+  cent at the default settings.
+- **Docker**, to run the tests (they use MongoDB's `atlas-local` image, not your
+  cluster).
+- A **LangSmith** API key, only for [`rag eval`](#evaluation) or
+  [tracing](#tracing-with-langsmith).
 
 ## Setup
 
-```bash
-uv sync                      # create the venv and install dependencies
-```
+1. **Install dependencies:**
 
-Create an Anthropic API key in the [Claude Console](https://platform.claude.com)
-for `ANTHROPIC_API_KEY`.
+   ```bash
+   uv sync
+   ```
 
-Then create a Voyage AI API key in the [Voyage AI dashboard](https://dashboard.voyageai.com)
-for `VOYAGE_API_KEY`, and **add a payment method** there. Without one the
-account is held to 3 requests and 10,000 tokens a minute — less than one ingest
-batch, so even a small corpus fails to index. With one, the standard limits
-(2,000 requests a minute) apply, and the free tokens are still used first.
+2. **Get an Anthropic key** in the [Claude Console](https://platform.claude.com).
 
-Then point it at a MongoDB Atlas cluster. In
-[Atlas](https://cloud.mongodb.com) (labels approximate):
+3. **Get a Voyage AI key** in the [Voyage AI dashboard](https://dashboard.voyageai.com)
+   and **add a payment method**. Without one the account is limited to 3
+   requests and 10,000 tokens a minute, which is less than one ingest batch. The
+   free tokens are still used first.
 
-1. Create a project, then a **Free** (M0) cluster.
-2. Under **Security → Database Access**, add a database user with a password
-   (an autogenerated one avoids characters that need escaping in a URI) and
-   the **Read and write to any database** role — enough for `rag ingest` to
-   create its collection and vector index, and no more.
-3. Under **Security → Network Access**, add your current IP address. (Not
-   `0.0.0.0/0`, which lets anyone on the internet try the password.)
-4. On the cluster, **Connect → Drivers → Python** gives the connection string.
+4. **Create an Atlas cluster** in [Atlas](https://cloud.mongodb.com) (labels
+   approximate):
+   1. Create a project, then a **Free** (M0) cluster.
+   2. Under **Security → Database Access**, add a user with an autogenerated
+      password and the **Read and write to any database** role.
+   3. Under **Security → Network Access**, add your current IP address (not
+      `0.0.0.0/0`).
+   4. On the cluster, **Connect → Drivers → Python** shows the connection string.
 
-```bash
-cp .env.example .env         # then set MONGODB_URI (password filled in), VOYAGE_API_KEY and ANTHROPIC_API_KEY
-```
+5. **Fill in `.env`:**
 
-`.env` is git-ignored, and the app never displays any of the three. A free cluster that
-goes unused for a long time is paused; resume it in Atlas if the app suddenly
-cannot reach it. Everything else in `.env` is an optional override (see
-[Configuration](#configuration)).
+   ```bash
+   cp .env.example .env    # set MONGODB_URI (with the password), VOYAGE_API_KEY, ANTHROPIC_API_KEY
+   ```
+
+`.env` is git-ignored, and the app never displays the keys. Everything else in
+it is an optional override (see [Configuration](#configuration)). Atlas pauses
+a free cluster that sits unused for a long time; resume it there if the app
+cannot connect.
 
 ## Usage
 
@@ -96,38 +94,28 @@ cannot reach it. Everything else in `.env` is an optional override (see
 uv run rag ingest
 ```
 
-Loads the `.md`/`.txt`/`.pdf` files under `data/` — recursively, matching the
-extension case-insensitively — splits them into overlapping chunks, embeds them
-with Voyage AI, and stores them in the Atlas collection `rag_db.rag_docs`. The
-first run creates that collection and its Atlas Vector Search index, and every
-run waits until what it wrote is searchable, so a question asked right after an
-ingest finds it. Ingest never calls Claude.
+Loads the `.md`/`.txt`/`.pdf` files under `data/` (recursively, any extension
+case), splits them into overlapping chunks, embeds them, and stores them in
+`rag_db.rag_docs`. The first run creates the collection and its vector index.
+Every run waits until its writes are searchable, so you can ask about them
+straight away.
 
-A file it cannot use is skipped rather than aborting the run: an unreadable one
-(bad encoding, corrupt PDF, permissions) warns on stderr, and one that yields no
-text is dropped silently. The silent case is the one to know about — it includes
-a scanned, image-only PDF, whose text extraction returns empty without failing.
-
-Re-run it whenever the documents change. It is incremental: each document is
-fingerprinted, and only new, edited, or removed ones are re-embedded, so adding
-one file to a large corpus costs one file rather than the corpus, in time and
-in Voyage tokens. Afterwards the collection
-holds exactly what is in `data/`, so deletions and edits are picked up too,
-there are never duplicates, and any unrelated documents sharing the collection
-are left alone. Re-running with nothing changed makes no embedding calls at all.
-
-Changing `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS`, `CHUNK_SIZE` or
-`CHUNK_OVERLAP` re-embeds everything, since all four change what the stored
-vectors represent. A change to the vectors' *width* (`EMBEDDING_DIMENSIONS`) also
-needs a new `COLLECTION_NAME`: a vector index serves one width only. Ingest
-checks this before it deletes anything and stops with an error saying so.
-
-One ingest writes to a collection at a time. A second one — a terminal `rag
-ingest` while the app is indexing an upload, or another machine — waits for the
-first rather than writing alongside it, because two writers at once would each
-delete what the other just added. The lock is a lease held in Atlas itself, so
-it covers every process and machine, and an ingest that dies holds it for at
-most five minutes.
+- **Incremental.** Only new, edited or removed files are re-embedded. Afterwards
+  the collection holds exactly what is in `data/`: no duplicates, and nothing
+  left over from deleted files. A re-run with no changes makes no embedding
+  calls.
+- **Scoped.** Unrelated documents that share the collection are never read or
+  deleted.
+- **Resilient.** An unreadable file (bad encoding, corrupt PDF, permissions) is
+  skipped with a warning. A file with no text is skipped **silently**, which
+  includes scanned, image-only PDFs.
+- **Settings-aware.** Changing `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS`,
+  `CHUNK_SIZE` or `CHUNK_OVERLAP` re-embeds everything. Changing
+  `EMBEDDING_DIMENSIONS` also needs a new `COLLECTION_NAME`, because a vector
+  index serves one width. Ingest checks this before deleting anything.
+- **One writer at a time.** A second ingest on the same collection (from the
+  terminal, the app or another machine) waits for the first. The lock is a lease
+  stored in Atlas, so an ingest that crashes releases it within five minutes.
 
 ### 2. Ask questions from the terminal
 
@@ -135,10 +123,9 @@ most five minutes.
 uv run rag query "What is chunking and why do we overlap chunks?"
 ```
 
-Streams the grounded answer as Claude writes it, then prints the source files
-it drew from. Ctrl-C abandons an answer (exit status 130) and ends the request
-to Claude with it, so an abandoned answer stops being generated — and billed —
-there.
+Streams the answer, then lists the source files it drew on. Ctrl-C stops the
+answer (exit status 130) and closes the request to Claude, so the rest is
+neither generated nor billed.
 
 ### 3. Or use the chat app
 
@@ -146,273 +133,204 @@ there.
 uv run streamlit run streamlit_app.py
 ```
 
-A browser chat UI over the same pipeline, streaming each answer token by token,
-with a sidebar showing the active configuration and a per-answer panel of the
-retrieved passages themselves — so a claim can be checked against the text it
-was generated from, not just against a filename.
+A browser chat over the same pipeline. Answers stream in, each with a panel of
+the passages it was generated from, so you can check a claim against its source
+text. The sidebar shows the active configuration and accepts
+[uploads](#add-your-own-documents).
 
 ![An answer with its retrieved passages open: the first passage holds the sentence the answer paraphrases](docs/retrieved-passages.png)
 
-Only this machine can reach it. Streamlit otherwise listens on every network
-interface, and the app has no login: anyone on your network could ask it about
-your documents, read the passages it retrieves, or upload files into `data/` to
-be indexed. So `.streamlit/config.toml` sets `server.address` to `127.0.0.1`,
-the address Streamlit then prints and opens. That also skips a request Streamlit
-otherwise makes at startup when run headless (`--server.headless true`): it asks
-checkip.amazonaws.com for the machine's external IP address, to print it. To
-open the app to your network deliberately, pass `--server.address 0.0.0.0` —
-which, headless, brings that request back. One case makes that request
-whatever the address: a connection to the app from another origin — a page on
-another website, say. Streamlit refuses it, but first looks up the external IP
-address, since a page served from that address is one it would allow. The
-request carries nothing about the app.
-
-Opening the app connects to the index and the model APIs, behind a spinner;
-after that the connections are kept for the life of the server, including
-across the index rebuilds an upload or a `rag ingest` triggers. The toolbar's
-**Stop** ends an answer where it is — the request to Claude ends there and
-then, so the rest is neither generated nor billed — and the turn stays in the
-history, marked as interrupted.
-
-Editing `streamlit_app.py` does not rerun it: `.streamlit/config.toml` turns
-Streamlit's file watcher off, because on every run it walks every loaded module,
-which with this many libraries loaded is wasted work on every turn. While
-working on the app itself, run it with
-`uv run streamlit run streamlit_app.py --server.fileWatcherType auto`.
-
-The sidebar also takes uploads, so the whole loop — add a document, index it,
-ask about it — can happen in the browser. See below.
+- **Stop** ends an answer immediately, closing the request to Claude. The turn
+  stays in the history, marked as interrupted.
+- **Connections** to the index and the models are made once, on first load, and
+  kept for the life of the server, including across re-indexing.
+- **Local only.** The app has no login, so `.streamlit/config.toml` binds it to
+  `127.0.0.1`. Pass `--server.address 0.0.0.0` to open it to your network on
+  purpose.
+- **External IP lookup.** Streamlit sometimes asks `checkip.amazonaws.com` for
+  this machine's external IP address: at headless startup when bound to
+  `0.0.0.0`, and whenever a page from another origin connects (Streamlit refuses
+  that connection). The request carries nothing about the app.
+- **No auto-reload.** `.streamlit/config.toml` also turns off the file watcher,
+  which would walk every loaded module on every run. When editing
+  `streamlit_app.py`, add `--server.fileWatcherType auto`.
 
 ### What to expect
 
-Measured from a Mac in Singapore, against an M0 (free) Atlas cluster, using the
-default models and settings:
+Measured from Singapore against an M0 Atlas cluster, with the default settings:
 
 | Step | Time |
 | ---- | ---- |
-| Connecting (`rag query`, or the app's first load) | about 1.3 s: the Atlas connection and its first round trip |
-| Embedding documents (ingest) | about 435 chunks per second, in Voyage batches of 256 |
-| Embedding a question | about 0.18 s, a round trip to Voyage |
-| Searching the index in Atlas | about 0.4 s (median), against 0.07 s for the on-disk store of earlier versions: the round trip to the cluster |
-| Reranking the 20 candidates | about 0.18 s, at Voyage |
-| First word of the answer | about 0.9 s after retrieval, 1.4 s after the question (median of five) |
-| The whole answer | about 2 s for a typical answer of a few sentences |
+| Connecting (`rag query`, or the app's first load) | ~1.3 s |
+| Embedding documents (ingest) | ~435 chunks/s, in batches of 256 |
+| Embedding a question | ~0.18 s |
+| Vector search in Atlas | ~0.4 s (median) |
+| Reranking 20 candidates | ~0.18 s |
+| First word of the answer | ~1.4 s after the question (median of five) |
+| Whole answer | ~2 s for a few sentences |
 
-So a question takes about 2 seconds end to end, against 8–12 seconds when an
-earlier version ran a 27-billion-parameter model on the Mac itself, and the
-first word arrives in under a second and a half. Most of what remains is three
-network round trips before Claude starts — embedding, search, rerank — so a
-cluster in a region near you matters more than any setting here.
+Most of the wait is three network round trips before Claude starts (embed,
+search, rerank), so an Atlas region near you matters more than any setting.
 
 ## Add your own documents
 
-Two routes, same result:
+Use either route:
 
-- **From the app** — drag `.md`/`.txt`/`.pdf` files onto **Add documents** in the
-  sidebar and click **Add to index**. They are written into `data/` and the index
-  is refreshed on the spot — incrementally, as above — so the answer to your next
-  question already includes them, with no reload and no terminal. This also works
-  before any index exists, which is how a fresh checkout can be brought up
-  entirely from the browser. A file whose name already exists in `data/` replaces
-  it, so re-uploading a corrected document updates it rather than leaving both
-  versions retrievable.
-- **From the filesystem** — drop files into `data/` (the three sample files are
-  just a starter corpus — delete them if you like; the one live test that asks
-  about them skips without them), then re-run `uv run rag ingest`.
+- **From the app.** Drag `.md`/`.txt`/`.pdf` files onto **Add documents** in the
+  sidebar and click **Add to index**. They are saved to `data/` and indexed
+  immediately, so your next question can use them. This works before any index
+  exists. A file with the same name as an existing one replaces it.
+- **From the filesystem.** Put files in `data/` and run `uv run rag ingest`. The
+  three sample files are just a starter corpus, and you can delete them.
 
-Either way the CLI and the app immediately answer against the new content: they
-search the same Atlas collection, and the app reloads its pipeline when the
-corpus fingerprint `rag ingest` stamps beside the collection changes.
+Either way, the CLI and the app both see the new content right away. The app
+reloads its pipeline when the index changes.
 
-Your documents stay out of git: `.gitignore` ignores everything in `data/` but
-the three samples (and a `chroma_db/` left by an earlier version, which holds
-your documents' text too), so a `git add -A` commits neither (`git add -f` a
-file if you do mean to share it). Two exceptions. A document saved under a
-sample's name replaces a tracked file, which git commits like any other edit, so
-give yours names of their own. And a `DATA_DIR` pointed elsewhere inside the
-checkout is not covered: list it in `.git/info/exclude`. Their text is also
-stored in your Atlas cluster, which is as private as its access list and
-database users. Secrets beside the code
-are ignored too — `.env` and its variants such as `.env.local`, and
-Streamlit's `.streamlit/secrets.toml`; only the `.env.example` template is
-tracked.
+**Keeping documents private:**
 
-Uploaded filenames are treated as untrusted input: `save_upload()` reduces a name
-to its final path component and rejects unsupported suffixes before writing, so
-an upload cannot choose its own directory. Its docstring covers the details,
-including where that boundary deliberately stops.
+- `.gitignore` ignores everything in `data/` except the three samples. Saving
+  your own file under a sample's name overwrites a tracked file, so use your own
+  names. A `DATA_DIR` elsewhere inside the checkout is not ignored; add it to
+  `.git/info/exclude`.
+- `.env`, `.env.*` and `.streamlit/secrets.toml` are ignored too. Only
+  `.env.example` is tracked.
+- Upload filenames are untrusted: `save_upload()` keeps only the final path
+  component and rejects unsupported types, so an upload cannot pick its own
+  directory.
 
 ## Evaluation
 
-`rag eval` scores the pipeline on a fixed set of 50 questions, so a change — a
-model, a setting, a prompt — can be judged on every question at once rather than
-on one answer. The questions are about `evals/corpus/`, the engineering handbook
-of **Tallowmere**, a fictional freight-tracking company: 48 short documents
-(49 chunks at the default chunk size) on services, deploys, incidents and
-policies. `rag eval` indexes it into a collection of its own, `rag_eval`, beside
-your index; it never reads or retrieves your documents, and `rag ingest` never
-sees the corpus.
+`rag eval` scores the pipeline on 50 fixed questions, so the effect of a change
+(model, setting, prompt) shows up across all of them at once.
 
-The company is fictional so that a question can only be answered by retrieving
-the right passage: about real topics, a model can answer from what it already
-knows, whatever retrieval did. And the corpus is built to be easy to get wrong —
-four services documented alike with different values, a deprecated deployment
-guide that contradicts the current one, a customer SLA beside the internal
-SLOs — and large enough that vector search, which fetches `FETCH_K` = 20 chunks,
-has to choose. (The three sample documents in `data/` make 9 chunks, and on them
-every question scored 100%: nothing could fail.)
+The questions are about `evals/corpus/`, the engineering handbook of
+**Tallowmere**, a fictional freight-tracking company (48 documents, 49 chunks).
+`rag eval` indexes it into its own `rag_eval` collection and never touches your
+documents.
+
+- **Fictional**, so the model cannot answer from its own knowledge.
+- **Confusable**: four services documented alike with different values, a
+  deprecated deployment guide that contradicts the current one, and a customer
+  SLA next to internal SLOs.
+- **Large enough** that vector search, which fetches `FETCH_K` = 20 chunks, has
+  to choose. (The 9 chunks of the sample `data/` scored 100% on everything.)
 
 Each question gets four scores:
 
-| Score | Passes when | Judged by |
-| ----- | ----------- | --------- |
-| `retrieval_hit` | a file the answer should come from is among the chunks in the prompt (not scored for the 5 questions the documents cannot answer) | the pipeline's own output |
-| `retrieval_rank` | not a pass or fail: 1 divided by the rank of the first chunk from such a file — 1 for first, ½ for second, 0 if none — averaged into a mean reciprocal rank. It shows a right file slipping down the prompt before `retrieval_hit` sees it drop out | the pipeline's own output |
-| `correct` | the answer matches the reference answer — or, for a question the documents cannot answer, says so rather than answering from general knowledge | Claude Opus 5.5 |
-| `grounded` | every claim in the answer is supported by the chunks it was generated from | Claude Opus 5.5 |
+| Score | Measures | Judged by |
+| ----- | -------- | --------- |
+| `retrieval_hit` | Whether a correct source file is among the chunks in the prompt (not scored for the 5 unanswerable questions) | The pipeline's output |
+| `retrieval_rank` | 1 ÷ the rank of the first chunk from a correct file (0 if none), averaged as mean reciprocal rank. Catches a right file slipping down before it drops out | The pipeline's output |
+| `correct` | Whether the answer matches the reference, or, for an unanswerable question, says it cannot answer | Claude Opus 5.5 |
+| `grounded` | Whether every claim is supported by the retrieved chunks | Claude Opus 5.5 |
 
-Beside the three keys the pipeline itself needs, it reads one of its own, in
-`.env` or the environment; and it uses `ANTHROPIC_API_KEY` twice over:
+It needs one more key than the pipeline does:
 
 | Variable | Used for |
 | -------- | -------- |
-| `LANGSMITH_API_KEY` | The questions are uploaded as a [LangSmith](https://smith.langchain.com) dataset, and each run is recorded there as an experiment, with every answer, its retrieved passages and the judge's reasoning |
-| `ANTHROPIC_API_KEY` | Claude Sonnet 5.5 answers, as in the app; Claude Opus 5.5 grades `correct` and `grounded` |
+| `LANGSMITH_API_KEY` | Uploading the questions as a [LangSmith](https://smith.langchain.com) dataset and recording each run as an experiment, with answers, passages and the judge's reasoning |
+| `ANTHROPIC_API_KEY` | Claude Sonnet 5.5 for the answers, and Claude Opus 5.5 for judging |
 
 ```bash
-uv run rag eval                    # score, and compare with the saved baseline
-uv run rag eval --save-baseline    # score, and save these scores as the baseline
+uv run rag eval                    # score, and compare with evals/baseline.json
+uv run rag eval --save-baseline    # score, and save as the new baseline
 ```
 
-A run indexes the corpus (only what changed, after the first run) and answers
-every question: about 7 minutes, judging included, and an estimated $1–2 of
-Anthropic API usage, almost all of it the judge. It prints each score, its change from the
-baseline in `evals/baseline.json`, and a link to the experiment in LangSmith.
-It stops before loading any model if a key is missing or the judge or LangSmith
-cannot be reached.
+A run takes about 7 minutes and costs about $1–2, mostly for the judge. It
+prints each score, the change from the baseline, and a link to the experiment.
+It checks the keys, the judge and LangSmith before loading any model.
 
-Some things to know:
-
-- **What leaves this machine** is the eval corpus, its questions, the passages
-  retrieved from it and the answers, sent to Voyage AI, Atlas, Anthropic and
-  LangSmith. Your own documents are never part of a run.
-- **Scores compare only within one question set and one judge.** The dataset's
-  name is derived from the questions' content, so editing `evals/questions.json`
-  starts a new dataset, and the report then declines to compare with a baseline
-  scored on the old one. The judge is fixed in code (`JUDGE_MODEL` in
-  `rag_pipeline/evaluation.py`) for the same reason, and never falls back to
-  another model when it declines to grade: a declined grade is recorded as
-  unscored.
-- **A baseline needs every question scored.** `--save-baseline` refuses a run in
-  which a question failed or a grade was declined.
-- **Every row of an experiment carries its question's whole trace** — the
-  search, the rerank and the prompt, nested under it — whatever
-  `LANGSMITH_TRACING` says, since the eval sends LangSmith those passages
-  anyway. It does not switch tracing on for anything else.
+- **Comparable only within one question set and one judge.** The dataset name is
+  a hash of the questions, so editing `evals/questions.json` creates a new
+  dataset and the report won't compare it with an old baseline. The judge is
+  fixed in code (`JUDGE_MODEL`) with no fallback model; a grade it declines is
+  recorded as unscored.
+- **A baseline needs every question scored.** `--save-baseline` refuses a run
+  with a failed question or a declined grade.
+- **Every experiment row includes the question's full trace**, whatever
+  `LANGSMITH_TRACING` is set to. Nothing outside the eval is traced.
 
 ## Tracing with LangSmith
 
-Optional, and off unless you turn it on. With it on, every question — from the
-terminal or the app — is recorded as one trace in
-[LangSmith](https://smith.langchain.com), LangChain's hosted observability
-service:
+Off by default. When it's on, each question, from the terminal or the app, is
+recorded as one trace in [LangSmith](https://smith.langchain.com):
 
 ```
 RAGPipeline                 chain      the question, and the answer
-├─ VectorStoreRetriever     retriever  the FETCH_K candidates the vector search returned
-├─ _VoyageRerank            retriever  those candidates in; the RETRIEVAL_K kept, with scores, out
+├─ VectorStoreRetriever     retriever  the FETCH_K candidates from vector search
+├─ _VoyageRerank            retriever  candidates in; the RETRIEVAL_K kept, with scores, out
 └─ generate                 chain
    ├─ ChatPromptTemplate    prompt     the prompt, with the passages filled in
-   └─ ClaudeChatModel       llm        the messages, the answer, token counts, why it stopped
+   └─ ClaudeChatModel       llm        messages, answer, token counts, stop reason
 ```
 
-Turn it on in `.env`, with an API key from LangSmith's settings page (the one
-`rag eval` uses, if you have set that up):
+To turn it on, add this to `.env`:
 
 ```bash
 LANGSMITH_TRACING=true
 LANGSMITH_API_KEY=lsv2_...
 ```
 
-Traces are filed under the `rag-pipeline` project (`LANGSMITH_PROJECT`), which
-the first one creates. The app's sidebar says when tracing is on. Set
-`LANGSMITH_ENDPOINT` too if your LangSmith account is in another region
-(`https://eu.api.smith.langchain.com` for the EU); it is LangSmith's own
-variable, read by its client. LangSmith's free plan includes 5,000 traces a
-month, about three months at 50 questions a day.
+Traces go to the `rag-pipeline` project (`LANGSMITH_PROJECT`), which is created
+on first use. The sidebar shows when tracing is on. For an EU account, also set
+`LANGSMITH_ENDPOINT=https://eu.api.smith.langchain.com`. The free plan's 5,000
+traces a month covers about 50 questions a day.
 
-- **A trace holds everything:** the question, every retrieved passage in full,
-  the prompt and the answer — all sent to LangSmith's cloud.
-- **Off means off.** `LANGSMITH_TRACING` is the one switch: the pipeline tells
-  LangSmith on every question whether to trace it, so a leftover
-  `LANGCHAIN_TRACING_V2=true` from an older `.env` — which LangSmith would
-  otherwise act on by itself — no longer sends anything. A value other than
-  `true` or `false` is refused rather than read as off.
-- **Stopping an answer is not a failure:** a Stop in the app, or Ctrl-C at the
-  terminal, ends the question's trace tagged `stopped`, with the partial answer
-  and no error. LangChain's own runs for the generation do show an error — the
-  model's always, and on Ctrl-C the `generate` chain's too — because LangChain
-  reports a closed or interrupted stream to its tracer as one.
-- **If LangSmith is unreachable, answers are unaffected.** Runs are sent from a
-  background thread, and failures are logged on stderr — so at a terminal a
-  warning can land in the middle of a streaming answer. What is still queued
-  when a `rag query` finishes is sent before it exits: with LangSmith refusing
-  connections that costs a fraction of a second, and with a network that drops
-  them silently about 10 seconds, which is as low as LangSmith's client goes.
-- **Only questions are traced.** Nothing in ingest is a LangChain run.
+- **A trace contains everything:** the question, every retrieved passage, the
+  prompt and the answer.
+- **Off means off.** `LANGSMITH_TRACING` is the only switch, so a leftover
+  `LANGCHAIN_TRACING_V2=true` sends nothing. Values other than `true`/`false`
+  are rejected.
+- **A stopped answer is not an error.** Its trace is tagged `stopped`, with the
+  partial answer. LangChain's own model run still shows an error, because
+  LangChain reports a closed stream that way.
+- **An unreachable LangSmith doesn't affect answers.** Traces are sent in the
+  background and failures are logged to stderr, which can interrupt a streaming
+  answer in the terminal. On exit, `rag query` waits at most about 10 seconds
+  to send what is still queued.
+- **Ingest is not traced.**
 
 ## Configuration
 
 `MONGODB_URI`, `VOYAGE_API_KEY` and `ANTHROPIC_API_KEY` are required (see
-[Setup](#setup)); they are credentials, not settings, so they have no default
-and the app never displays them. Every setting has a default and can be
-overridden in `.env` (see `.env.example`) or the environment:
+[Setup](#setup)). Keys are not settings: they have no default and never appear
+in the app or in error messages. Every setting below has a default, which you
+can override in `.env` (see `.env.example`) or the environment:
 
-| Variable            | Default            | Purpose |
-| ------------------- | ------------------ | ------- |
-| `CHAT_MODEL`        | `claude-sonnet-5-5` | Claude model that writes the answers. The request is built for Claude Sonnet 5.5 — its lowest thinking setting, `between_tools`, which other models refuse — so another model needs that request changed in `claude_model.py` |
-| `MAX_TOKENS`        | `1024`             | Maximum length of a generated answer, in tokens; an answer cut off there ends with a note saying so |
-| `EMBEDDING_MODEL`   | `voyage-4-large`   | Voyage AI embedding model (ingest + query); any Voyage text embedding model that accepts an output dimension. A change re-embeds everything |
-| `EMBEDDING_DIMENSIONS` | `1024`          | Width of the stored vectors: 256, 512, 1024 or 2048, the widths Voyage returns; a change needs a new `COLLECTION_NAME` |
-| `RETRIEVAL_K`       | `4`                | Chunks kept after reranking and put in the prompt; each adds input tokens to every question |
-| `FETCH_K`           | `20`               | Candidates retrieved before reranking |
-| `RERANK_MODEL`      | `rerank-3`         | Voyage AI reranker |
-| `CHUNK_SIZE`        | `1000`             | Characters per chunk |
-| `CHUNK_OVERLAP`     | `200`              | Overlap between adjacent chunks |
-| `DATA_DIR`          | `./data`           | Source documents |
-| `MONGODB_DB`        | `rag_db`           | Atlas database holding the index |
-| `COLLECTION_NAME`   | `rag_docs`         | Atlas collection holding the chunks and their vectors — must match between ingest and query |
-| `VECTOR_INDEX_NAME` | `vector_index`     | Atlas Vector Search index over them; `rag ingest` creates it — must match between ingest and query |
-| `MONGODB_TIMEOUT_MS` | `10000`           | How long to wait to reach the cluster before failing; generous because a paused free cluster resumes slowly |
-| `LANGSMITH_TRACING` | `false`            | `true` sends each question to LangSmith as one trace, with `LANGSMITH_API_KEY` (see [Tracing with LangSmith](#tracing-with-langsmith)); only `true` or `false` |
-| `LANGSMITH_PROJECT` | `rag-pipeline`     | LangSmith project the traces are filed under; the first trace creates it |
+| Variable | Default | Purpose |
+| -------- | ------- | ------- |
+| `CHAT_MODEL` | `claude-sonnet-5-5` | Claude model that writes the answers. The request uses Sonnet 5.5's `between_tools` thinking setting, which other models reject, so another model also needs `claude_model.py` changed |
+| `MAX_TOKENS` | `1024` | Maximum answer length in tokens. An answer cut off here ends with a note |
+| `EMBEDDING_MODEL` | `voyage-4-large` | Voyage embedding model for ingest and query. Must accept an output dimension. Changing it re-embeds everything |
+| `EMBEDDING_DIMENSIONS` | `1024` | Vector width: 256, 512, 1024 or 2048. Changing it needs a new `COLLECTION_NAME` |
+| `RETRIEVAL_K` | `4` | Chunks kept after reranking and put in the prompt |
+| `FETCH_K` | `20` | Candidates fetched by vector search before reranking |
+| `RERANK_MODEL` | `rerank-3` | Voyage reranker |
+| `CHUNK_SIZE` | `1000` | Characters per chunk |
+| `CHUNK_OVERLAP` | `200` | Characters shared by adjacent chunks |
+| `DATA_DIR` | `./data` | Folder of source documents |
+| `MONGODB_DB` | `rag_db` | Atlas database |
+| `COLLECTION_NAME` | `rag_docs` | Atlas collection for chunks and vectors. Must match between ingest and query |
+| `VECTOR_INDEX_NAME` | `vector_index` | Atlas Vector Search index, created by `rag ingest`. Must match between ingest and query |
+| `MONGODB_TIMEOUT_MS` | `10000` | How long to wait for the cluster. Generous, because a paused free cluster resumes slowly |
+| `LANGSMITH_TRACING` | `false` | `true` sends each question to LangSmith (see [Tracing](#tracing-with-langsmith)) |
+| `LANGSMITH_PROJECT` | `rag-pipeline` | LangSmith project for traces |
 
-API keys are not settings: they have no default, and are never shown in the
-app's sidebar or in an error. The three the pipeline reads are in
-[Setup](#setup); the one `rag eval` adds is under [Evaluation](#evaluation).
-
-The chat app's own Streamlit settings are in `.streamlit/config.toml`, each with
-a comment on why: usage statistics and the email prompt off
-([above](#rag-pipeline)), and the file watcher off and the server on loopback
-([the chat app](#3-or-use-the-chat-app)).
+Streamlit's own settings are in `.streamlit/config.toml`, each with a comment
+explaining it.
 
 ## Development
 
-[Ruff](https://docs.astral.sh/ruff/) (lint + format) and
-[ty](https://docs.astral.sh/ty/) (type check) are pinned in the dev dependency
-group and configured in `pyproject.toml`. The order below is the order CI runs
-them in.
-
 ### Linting and type checking
 
+[Ruff](https://docs.astral.sh/ruff/) and [ty](https://docs.astral.sh/ty/) are
+pinned in the dev dependencies and configured in `pyproject.toml`:
+
 ```bash
-uv run ruff check --fix .    # lint, applying safe fixes
+uv run ruff check --fix .    # lint (run before formatting: fixes can reorder code)
 uv run ruff format .         # format
 uv run ty check              # type check
 ```
-
-Run `ruff check` before `ruff format` — lint fixes can reorder code that
-formatting then tidies.
 
 ### Tests
 
@@ -420,108 +338,64 @@ formatting then tidies.
 uv run pytest
 ```
 
-The suite needs **Docker**, and **no API keys, no network and no Atlas cluster
-of yours**. It injects a deterministic fake embedding model, a fake
-reranker and a fake chat model, and runs a real Atlas Vector Search: MongoDB's
-`mongodb-atlas-local` image (about 1 GB, pulled on the first run), one container
-for the session and one database per test. The store is the one real part,
-because what matters about it — an index built asynchronously, writes that
-become searchable a moment later, pre-filters on declared fields — is exactly
-what a fake would have to get right. The full suite takes about four minutes on
-an M2 Max, most of it building a vector index per test. Without Docker, the
-tests that need the store fail with a message saying to start it. Four guards
-keep the rest honest:
+Needs **Docker**, but no API keys, network or Atlas cluster. The suite uses fake
+embedding, rerank and chat models, and a real Atlas Vector Search in MongoDB's
+`mongodb-atlas-local` image (about 1 GB, pulled on first run). The store is real
+because its behavior (asynchronous indexing, writes that become searchable a
+moment later, filter fields) is exactly what a fake would get wrong. It takes
+about four minutes on an M2 Max.
 
-- Your API keys and your own `MONGODB_URI` — a real cluster — are removed for
-  every test, so a test that forgets to inject a fake fails at the missing key
-  instead of calling a paid API; only the container's URI is ever set.
-- Every socket to a host other than this machine is blocked, so nothing reaches
-  a real cluster, a model API or anywhere else.
-- Tracing is forced off, whatever `.env` says, and your `LANGSMITH_API_KEY` is
-  removed with the other keys. A test that leaves a tracing context behind
-  fails, since every later test would otherwise inherit it.
+Guards keep the suite offline:
 
-The tests that check traces use LangSmith's real client with its HTTP replaced,
-recording every run it would send. The two that check what an actual process
-sends — that runs go out in batches, and what an unreachable LangSmith costs at
-exit — run in a subprocess against a stand-in LangSmith inside it, so the test
-process itself still opens no socket. The suite runs the same on a Mac as on Linux.
+- Your API keys and `MONGODB_URI` are removed for every test, so a test that
+  forgets to inject a fake fails instead of calling a paid API.
+- Sockets to any host but this machine are blocked.
+- Tracing is forced off, and a test that leaves a tracing context set fails.
 
-It covers the configuration, the loader and splitter, ingest idempotency and
-scoping, upload handling, an ingest→retrieve→generate round trip, the CLI as a
-terminal program, and the Streamlit app driven headlessly — so the frontend is
-covered by CI rather than by hand. The chat-model adapter in `claude_model.py`
-is tested the same way, through the real Anthropic SDK against a stand-in
-server: the request it sends, how it reads the stream, a refusal, a cut-off,
-error translation — and that stopping an answer closes its HTTP request.
-`CLAUDE.md` has the design behind the injection seam and what the app-level
-tests are there to guarantee.
+The suite covers configuration, loading and splitting, ingest idempotency and
+scoping, uploads, a full ingest → retrieve → generate round trip, the CLI, and
+the Streamlit app driven headlessly. `claude_model.py` is tested through the
+real Anthropic SDK against a stand-in server, including that stopping an answer
+closes its HTTP request. See `CLAUDE.md` for the design.
 
-What the fakes cannot check is whether the models themselves are driven
-correctly, so that has a suite of its own:
+**Live tests** check what the fakes can't — that the real APIs behave as
+assumed:
 
 ```bash
 uv run pytest -m live
 ```
 
-These tests call Anthropic's and Voyage AI's real APIs (with
-`ANTHROPIC_API_KEY` and `VOYAGE_API_KEY`, for a few cents a run): about a
-minute. They check that the Voyage factories embed documents and questions the
-right way round, at the configured width, and that the reranker puts the
-relevant passage first; that Claude streams a grounded answer with no reasoning
-in it, declines what the context does not say, and reports why it stopped (the
-`MAX_TOKENS` note reads it); and run an ingest-and-answer pass over `data/` on
-the test container. They are the only tests allowed onto the network, and the
-only ones that keep the API keys — never `MONGODB_URI`. They skip, rather than
-fail, when a key is missing — and the ingest-and-answer pass skips when the
-sample document its question is about is no longer in `data/`. A plain
-`uv run pytest` deselects them (`addopts = ["-m", "not live"]`), so it never
-calls an API. Run this suite by hand, since CI cannot, whenever what the fakes
-stand in for may have moved: after changing `claude_model.py` or the factories,
-and after a `uv.lock` change that moves `anthropic`, `voyageai` or
-`langchain-voyageai`. A run that skipped a test has not checked it.
+They call Anthropic's and Voyage's APIs (about a minute, a few cents) and skip
+when a key is missing. A plain `uv run pytest` and CI never run them, so run
+them by hand after changing `claude_model.py` or a model factory, or after a
+`uv.lock` change that moves `anthropic`, `voyageai` or `langchain-voyageai`. A
+skipped test has not been checked.
 
-Coverage is measured on demand rather than in CI, and carries no threshold — a
-number to keep green invites tests that execute code without asserting anything:
+**Coverage** is on demand, with no threshold:
 
 ```bash
 uv run pytest --cov=rag_pipeline --cov=streamlit_app --cov-report=term-missing
 ```
 
-The lines it reports uncovered should be the ones only a real terminal or a real
-API reaches: `cli.py`'s `if __name__ == "__main__"` guard, and the client
-construction in each factory that the injected fakes stand in for — which is
-what `-m live` is for.
+The uncovered lines should only be ones a real terminal or API reaches, which
+the live tests cover.
 
 ### Continuous integration
 
-`.github/workflows/ci.yml` checks every push — any branch — and every pull
-request with two jobs, and a third publishes [releases](#releases) from `main`:
+`.github/workflows/ci.yml` runs on every push and pull request:
 
-| Job       | Status check name                    | Runs |
-| --------- | ------------------------------------ | ---- |
-| `lint`    | `ruff + ty`                          | `ruff check`, `ruff format --check`, `ty check` |
-| `test`    | `pytest (py3.11)`, `pytest (py3.13)` | the pytest suite on the `requires-python` floor and the version `.python-version` pins |
-| `release` | `release`                            | on a push to `main`, after both: a GitHub release for a version that has none yet |
+| Job | Status check name | Runs |
+| --- | ----------------- | ---- |
+| `lint` | `ruff + ty` | `ruff check`, `ruff format --check`, `ty check` |
+| `test` | `pytest (py3.11)`, `pytest (py3.13)` | The test suite on the oldest supported and the pinned Python |
+| `release` | `release` | On a push to `main`, after both pass: a GitHub release for a new version |
 
-Both install with `uv sync --locked`, which fails if `uv.lock` has drifted from
-`pyproject.toml` — so a dependency added by hand without re-locking is caught
-rather than silently skipped.
+Jobs install with `uv sync --locked`, which fails if `uv.lock` is out of date
+with `pyproject.toml`. They run on Linux with no secrets. Nothing gates `main`;
+to require checks before merging, add a repository ruleset for the `lint` and
+`test` check names above.
 
-Both run on Linux. The tests need no secrets and call no model; Docker, which
-they do need for the atlas-local container, is preinstalled on the runners, and
-the image is pulled in a step of its own. The `live` tests are the part CI never
-runs.
-
-Every branch push gets CI immediately, so a branch that has been broken for
-several commits is visible before review rather than after. A pull request gets
-a second run, on the result of merging it into its base; for a fork's, which
-produces no push event here, that is the only run.
-
-Nothing gates `main` — it accepts direct pushes, and CI reports on the result
-rather than blocking it. To gate merges instead, add a repository ruleset
-requiring the three `lint` and `test` status check names in the table above. To
-run the same checks locally beforehand:
+To run the same checks locally:
 
 ```bash
 uv sync --locked && uv run ruff check . && uv run ruff format --check . && uv run ty check && uv run pytest
@@ -532,113 +406,95 @@ uv sync --locked && uv run ruff check . && uv run ruff format --check . && uv ru
 A release is a version bump pushed to `main`:
 
 ```bash
-uv version --bump minor    # or patch, major; updates pyproject.toml and uv.lock together
+uv version --bump minor    # or patch / major; updates pyproject.toml and uv.lock
 git commit -am "Release 0.2.0" && git push
 ```
 
-Once lint and tests pass on that push, the `release` job tags the commit
-`v0.2.0` and publishes a GitHub release listing the commits since the previous
-tag. Only `main`'s head releases, though: if another push has reached `main` by
-then, the release waits for a run that passes at the head, and is made from that
-commit — and a version bumped again in the meantime is never released on its
-own, its commits listed under the next one. On any push whose version already
-has a release the job stops there, and a push whose release failed is retried by
-the next push to `main`. A `v0.2.0` tag already on another commit (pushed by
-hand, or left by a deleted release) fails the job until the tag is deleted or
-the version bumped. Edit the version by hand and forget to re-lock, and CI fails
-at `uv sync --locked`, since `uv.lock` records it too. A pre-release version
-(`0.2.0rc1`) is published as a pre-release. Nothing is
-built or attached — GitHub adds the source archives itself, and the wheel would
-lack the chat app — and nothing goes to PyPI, where the name `rag-pipeline` is
-taken.
+When lint and tests pass, the `release` job tags the commit (`v0.2.0`) and
+publishes a GitHub release listing the commits since the last tag.
+
+- Only the head of `main` is released. If a newer push lands first, the release
+  waits for it.
+- A version that already has a release is skipped. A failed release is retried
+  on the next push to `main`.
+- An existing tag of the same name on a different commit fails the job until
+  you delete the tag or bump the version.
+- A pre-release version (`0.2.0rc1`) is published as a pre-release.
+- Nothing is built or uploaded to PyPI (the name `rag-pipeline` is taken there).
 
 ## Project structure
 
 ```
 rag_pipeline/
-  config.py      Settings, loaded from environment variables
-  ingest.py      load → split → embed → store (build_embeddings and open_store live here)
-  pipeline.py    RAGPipeline: open the index + models, stream_answer(...) / answer(...)
-  claude_model.py  Claude behind LangChain's chat-model interface
-  tracing.py     optional tracing to LangSmith: the client each question's trace is sent with
-  evaluation.py  rag eval: the questions as a LangSmith dataset, scored by Claude
-  cli.py         rag ingest | rag query "..." | rag eval
-streamlit_app.py Streamlit chat UI
-.streamlit/      config.toml: usage statistics, email prompt and file watcher off, loopback only
-data/            sample documents; add your own (git-ignored)
-docs/            the README's screenshots
-evals/           rag eval's corpus/ (a fictional handbook), questions.json about it, and baseline.json
+  config.py         Settings, loaded from environment variables
+  ingest.py         load → split → embed → store; build_embeddings() and open_store()
+  pipeline.py       RAGPipeline: retrieve, rerank, stream_answer() / answer()
+  claude_model.py   Claude behind LangChain's chat-model interface
+  tracing.py        the LangSmith client, when tracing is on
+  evaluation.py     rag eval: questions as a LangSmith dataset, judged by Claude
+  cli.py            rag ingest | rag query "..." | rag eval
+streamlit_app.py    Streamlit chat UI
+.streamlit/         config.toml: no telemetry or email prompt, no file watcher, localhost only
+data/               sample documents; add your own (git-ignored)
+docs/               README screenshots
+evals/              corpus/, questions.json and baseline.json for rag eval
 ```
 
 ## How it works
 
-- **Voyage AI embeddings** (`voyage-4-large`, 1024-wide) embed documents at
-  ingest and questions at query; the *same* model must embed both for their
-  vectors to compare, so a single factory (`build_embeddings()`) is shared by
-  ingest and query. Documents and questions are embedded asymmetrically, as
-  Voyage's `input_type` asks. The clients retry a rate limit or a timeout with
-  backoff, five attempts in all, and give up on a stalled call after a minute.
-- **MongoDB Atlas** (`langchain-mongodb`) stores the chunks with their vectors,
-  and an Atlas Vector Search index — created by `rag ingest`, with the two
-  fields searches filter on — finds the nearest ones to a question. Every chunk
-  this pipeline writes carries a marker, and every read, delete and search is
-  filtered on it, so a collection shared with other data is never read, deleted
-  from, or cited. The factory that opens the store (`open_store()`) lives in
-  `ingest.py` and is imported by the query side, so both open it the same way,
-  and the whole process shares one MongoDB client.
-- **Voyage AI reranking** (`rerank-3`) sharpens retrieval: vector search casts
-  a wide net (`FETCH_K` candidates), then the reranker scores each candidate
-  against the question *jointly*, which embedding similarity only
-  approximates, and keeps the top `RETRIEVAL_K`. This is the
-  single query-time factory that lives in `pipeline.py` rather than `ingest.py`,
-  because reranking has no ingest-side counterpart.
-- **Claude Sonnet 5.5** writes the answer, prompted to answer only from the
-  retrieved context and to cite its sources, which is what turns a general chat
-  model into a document-grounded question-answerer. Thinking is at its lowest
-  setting (with no tools in the request, none at all) and effort is low: an
-  answer from a few retrieved passages needs neither, and both add to the wait
-  before the first word. Claude takes no sampling parameters, so the same
-  question over the same context can be worded differently from one run to the
-  next; what keeps answers checkable is the grounding, and the cited passages
-  the app shows beside them. A question Claude declines is reported as declined,
-  never as an empty answer. Both frontends stream it: `stream_answer(question)` hands
-  back the retrieved sources and a lazy stream of the answer together, and
-  `answer()` — for library callers who just want the finished string — is a join
-  over the same path.
+- **Embedding.** Voyage `voyage-4-large` (1024 dimensions) embeds documents at
+  ingest and questions at query time, each with the matching `input_type`. Both
+  sides must use the same model, so they share one factory,
+  `build_embeddings()`. Calls are retried with backoff (five attempts) and time
+  out after a minute.
+- **Storage and search.** MongoDB Atlas stores chunks with their vectors, and a
+  Vector Search index finds the nearest ones. Every chunk carries an ownership
+  marker that every read, delete and search filters on, so other data in the
+  collection is never touched or cited. `open_store()` in `ingest.py` is the one
+  way to open the store, and the process shares one MongoDB client.
+- **Reranking.** Vector search fetches `FETCH_K` candidates; Voyage `rerank-3`
+  scores each against the question directly and keeps the top `RETRIEVAL_K`.
+  Its factory, `build_reranker()`, lives in `pipeline.py` because reranking has
+  no ingest side.
+- **Answering.** Claude Sonnet 5.5 answers only from the retrieved passages and
+  cites them. Thinking is at its lowest setting and effort is low, which keeps
+  the first word quick. Claude takes no sampling parameters, so wording can
+  vary between runs; the cited passages are what keep answers checkable. A
+  question Claude declines is reported as declined, never as an empty answer.
+- **Streaming.** `stream_answer(question)` returns the retrieved sources and a
+  lazy stream of the answer. `answer()` joins that stream for callers who want
+  a string. Stopping a stream closes the request to Claude, so generation and
+  billing stop too. LangChain's own Anthropic integration leaves the request
+  open, which is why `claude_model.py` has its own adapter.
 
-Stopping an answer — the app's Stop, Ctrl-C in `rag query` — closes its request
-to Claude, so generation, and billing, stop there rather than running on to
-`MAX_TOKENS`. LangChain's own Anthropic integration leaves that request open,
-which is why `claude_model.py` has an adapter of its own.
+**Swapping components:**
 
-Swapping a model is a one-line change in `.env` for any Voyage embedding model
-or reranker (`EMBEDDING_MODEL`, `RERANK_MODEL`); another Claude model for
-`CHAT_MODEL` also needs the request in `claude_model.py` changed to suit it. Another provider's embedder or reranker is a code change in the
-factories, `build_embeddings()` and `build_reranker()`. Swapping the vector store
-is a code change too: `open_store()` in `ingest.py` is the single place the
-vector store is constructed, so it is the main place to edit — though the
-incremental bookkeeping in `ingest()`, the index management and the writer lock
-also speak MongoDB's queries directly.
+- Another Voyage embedding model or reranker: change `EMBEDDING_MODEL` or
+  `RERANK_MODEL` in `.env`.
+- Another Claude model: change `CHAT_MODEL`, and adjust the request in
+  `claude_model.py`.
+- Another provider's embedder or reranker: edit `build_embeddings()` or
+  `build_reranker()`.
+- Another vector store: start with `open_store()` in `ingest.py`. The
+  bookkeeping in `ingest()`, the index management and the writer lock also use
+  MongoDB queries directly.
 
 ## Invariants
 
-A few of this project's rules are properties of the source *text* rather than of
-its behavior — they say some call never happens, so there is nothing to observe.
-Those live as data in `tests/invariants.py`, and `tests/test_invariants.py`
-enforces them across every `.py` file git does not ignore, added or not:
+Some rules say that a certain call never happens, so no test can observe them
+at runtime. They are kept as data in `tests/invariants.py` and checked by
+`tests/test_invariants.py` against every `.py` file that git does not ignore:
 
-| Rule                 | Forbids                                                        | Why |
-| -------------------- | -------------------------------------------------------------- | --- |
-| `store-factory`      | constructing the vector store (`MongoDBAtlasVectorSearch(...)`, `MongoDBAtlasVectorSearch.from_*(...)` or `MongoClient(...)`) outside `ingest.py`, `tests/` included — `tests/conftest.py`, which administers the test container, excepted | the store's identity is (`MONGODB_URI`, database, collection, vector index, embedding function); ingest and query must open it the same way, through the one client the process shares |
-| `embeddings-factory` | constructing an embedding model (`VoyageAIEmbeddings(...)` or `HuggingFaceEmbeddings(...)`) outside `ingest.py`, `tests/` included — a class definition of that name excepted | the same model must embed documents and questions; in tests, inject a fake instead |
-| `no-suppressions`    | a suppression in source that ruff or ty honours: `noqa` (in any case, and in ruff's and flake8's file-level forms), ruff's `ignore[…]`, `file-ignore[…]` and `disable[…]`, isort's `skip`, `skip_file`, `off` and `split`, `ty: ignore` and `type: ignore` (with or without codes), and `@no_type_check` — though not `# fmt:` directives, under which the linter still reports everything | fix the finding instead |
+| Rule | Forbids | Why |
+| ---- | ------- | --- |
+| `store-factory` | Constructing `MongoDBAtlasVectorSearch(...)`, `MongoDBAtlasVectorSearch.from_*(...)` or `MongoClient(...)` outside `ingest.py`, including in tests (except `tests/conftest.py`, which manages the test container) | Ingest and query must open the store the same way, through the one shared client |
+| `embeddings-factory` | Constructing `VoyageAIEmbeddings(...)` or `HuggingFaceEmbeddings(...)` outside `ingest.py`, including in tests (a class definition of that name is allowed) | Documents and questions must use the same model; tests inject a fake |
+| `no-suppressions` | Any suppression ruff or ty honours: `noqa` (any case, including file-level forms), ruff's `ignore[…]`, `file-ignore[…]` and `disable[…]`, isort's `skip`, `skip_file`, `off` and `split`, `ty: ignore`, `type: ignore`, and `@no_type_check`. `# fmt:` directives are allowed | Fix the finding instead |
 
-Two documentation rules ride along: every `Settings` field must appear in both
-`.env.example` and the configuration table above, and every rule in the table
-above must have its row — `test_every_setting_is_documented` and
-`test_every_rule_is_documented` are what catch either falling behind, since
-`ruff`, `ty` and the rest of the suite stay green against stale docs.
+Two documentation checks go with them: every `Settings` field needs a row in
+`.env.example` and in the [configuration table](#configuration)
+(`test_every_setting_is_documented`), and every rule needs a row in the table
+above (`test_every_rule_is_documented`).
 
-Everything else is asserted where the behavior is, because a test observes the
-property while a rule only matches spellings. See CLAUDE.md's *Enforcing the
-invariants* for those and for the reasoning behind the split.
+Everything else is tested through behavior, which catches cases a text rule
+would miss. See *Enforcing the invariants* in `CLAUDE.md`.
