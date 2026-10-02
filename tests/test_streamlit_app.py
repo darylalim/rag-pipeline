@@ -374,8 +374,8 @@ def test_a_failure_is_labelled_with_the_phase_that_raised(
     """An error turn names the step that failed, so it points at the right fix.
 
     The case that is easy to get wrong is generation failing before its first
-    piece. The local model reads the whole prompt before it produces anything,
-    so the app waits for that piece under a spinner of its own -- and a failure
+    piece. The model reads the whole prompt before it produces anything, so
+    the app waits for that piece under a spinner of its own -- and a failure
     during the wait has streamed nothing yet. It is still generation's: labelled
     "Retrieval failed", it would send the user to check an index that worked.
     """

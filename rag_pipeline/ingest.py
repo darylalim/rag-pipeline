@@ -136,7 +136,8 @@ def build_embeddings(settings: Settings) -> Embeddings:
 
 # One MongoClient per (URI, timeout) for the life of the process. A client is a
 # connection pool that always reads the server's current state, so -- unlike
-# a cached on-disk store -- it is never stale and must not be rebuilt per
+# the cached on-disk store of earlier versions -- it is never stale and must
+# not be rebuilt per
 # pipeline: closing one closes it under every pipeline still using it.
 # reset_store_cache() exists for the tests. The lock makes the lazy create
 # atomic, so two Streamlit sessions cannot each build one and leak the loser.

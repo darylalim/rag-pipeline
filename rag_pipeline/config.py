@@ -3,7 +3,7 @@
 Every tunable lives here and is sourced from environment variables (loaded from
 a local ``.env`` if present). Both the CLI and the Streamlit app build their
 ``Settings`` from :meth:`Settings.from_env`, so they always agree on which Atlas
-collection holds the index, which local models to load, and how documents are
+collection holds the index, which models to call, and how documents are
 chunked.
 """
 
@@ -138,10 +138,9 @@ class Settings:
     chunk_size: int = 1000
     chunk_overlap: int = 200
 
-    # Number of chunks kept after reranking and stuffed into the prompt. It is
-    # also what sets time-to-first-token: the local model reads the whole prompt
-    # (at roughly 100-150 tokens/s) before it writes, so every extra chunk adds
-    # a couple of seconds.
+    # Number of chunks kept after reranking and stuffed into the prompt. Each
+    # one is about 250 more input tokens on every question, paid for and read
+    # by the model before it writes.
     retrieval_k: int = 4
 
     # Candidates pulled from vector search before the reranker narrows them to

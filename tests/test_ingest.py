@@ -612,9 +612,9 @@ def test_reingest_embeds_nothing_when_no_document_changed(
 ):
     """The saving that justifies the fingerprint at all.
 
-    Embedding is a forward pass of a local model for every chunk, and the app
-    re-ingests on every upload, so re-ingesting an unchanged corpus must cost
-    nothing -- not even the width probe. Asserted on the embedder rather than
+    Embedding is a paid Voyage call for every chunk, and the app re-ingests on
+    every upload, so re-ingesting an unchanged corpus must cost nothing -- not
+    even the width probe. Asserted on the embedder rather than
     the returned count, which is deliberately the same both times.
     """
     ingest_mod.ingest(settings, embeddings=counting_embeddings)
@@ -695,10 +695,11 @@ def test_documents_are_embedded_in_the_same_order_every_run(
 ):
     """The same corpus reaches the embedder in the same order, run after run.
 
-    The order decides which chunks share a padded batch, and the local model's
-    bf16 arithmetic varies in the last bits with a batch's shape. In a set's
-    order -- which moves with each process's hash seed -- rebuilding the same
-    corpus would not reproduce its own vectors. Ten sources, so an unordered
+    The order decides which chunks share a request, and a model need not return
+    bit-identical vectors for a text batched beside different neighbours (the
+    local models of earlier versions did not). In a set's order -- which moves
+    with each process's hash seed -- rebuilding the same corpus would send
+    different requests every time. Ten sources, so an unordered
     run matching by chance is out of the question.
     """
     for i in range(8):

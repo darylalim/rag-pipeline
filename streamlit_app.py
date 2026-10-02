@@ -2,10 +2,9 @@
 
 Run with:  uv run streamlit run streamlit_app.py
 
-Uses the same Settings and RAGPipeline as the CLI. The pipeline (Atlas index
-+ local models) is cached with st.cache_resource, so it is built once per index
-version for the whole server rather than on every rerun; the models behind it
-load once per process however often it is rebuilt.
+Uses the same Settings and RAGPipeline as the CLI. The pipeline (the Atlas
+index and the model clients) is cached with st.cache_resource, so it is built
+once per index version for the whole server rather than on every rerun.
 """
 
 from __future__ import annotations

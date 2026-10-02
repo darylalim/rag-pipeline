@@ -95,7 +95,8 @@ def test_pipeline_requires_index(settings):
     """A fresh checkout is told to run `rag ingest`, without loading a model first.
 
     No models injected (see the module docstring): the FileNotFoundError is also
-    the proof that the check runs before the ~22 GB of local models would load.
+    the proof that the check runs before any model client is built (conftest
+    has removed the keys, so a factory reached first would fail differently).
     And looking must not create what it looked for -- an empty collection left
     behind would turn the next attempt's message into a different one.
     """
@@ -659,8 +660,8 @@ class _StopScript(BaseException):
 
 
 def _failing_embeddings(error: BaseException) -> Embeddings:
-    """Embeddings that fail as the local model does: its adapter has already
-    turned the failure into `error`."""
+    """Embeddings that fail as the real ones do: provider_errors_as_runtime has
+    already turned Voyage's failure into `error`."""
 
     class _Failing(Embeddings):
         def embed_documents(self, texts: list[str]) -> list[list[float]]:
@@ -731,9 +732,9 @@ def test_model_errors_pass_through_unchanged(
 # page.
 _FRONTEND_EXCEPTIONS = (FileNotFoundError, RuntimeError, ValueError)
 
-# How the local models fail by the time the pipeline sees them: already a
-# RuntimeError naming the model, from the adapter.
-_MODEL_FAILURE = "Generation with 'some-org/some-model' failed: [metal] out of memory"
+# How a model fails by the time the pipeline sees them: already a RuntimeError
+# naming the model, from the adapter.
+_MODEL_FAILURE = "Claude (claude-test) request failed: Error code: 529 - overloaded"
 
 
 def _fail_ingest_missing_data_dir(
@@ -941,7 +942,7 @@ def _ingested_pipeline(settings, fake_embeddings, llm, reranker) -> RAGPipeline:
 def _fail_retrieve_on_embedding_error(
     settings, fake_embeddings, fake_reranker, monkeypatch, tmp_path
 ):
-    # The question is embedded by the same local model at query time, so its
+    # The question is embedded by the same Voyage model at query time, so its
     # failure has to hold the same way as at ingest.
     ingest_mod.ingest(settings, embeddings=fake_embeddings)
     RAGPipeline(
@@ -1056,7 +1057,7 @@ def _fail_stream_answer_on_empty_response(
         pytest.param(
             _fail_ingest_on_embedding_error,
             RuntimeError,
-            "out of memory",
+            "overloaded",
             id="ingest-embedding-error",
         ),
         pytest.param(
@@ -1146,13 +1147,13 @@ def _fail_stream_answer_on_empty_response(
         pytest.param(
             _fail_retrieve_on_embedding_error,
             RuntimeError,
-            "out of memory",
+            "overloaded",
             id="retrieve-embedding-error",
         ),
         pytest.param(
             _fail_retrieve_on_rerank_error,
             RuntimeError,
-            "out of memory",
+            "overloaded",
             id="retrieve-rerank-error",
         ),
         pytest.param(
@@ -1164,13 +1165,13 @@ def _fail_stream_answer_on_empty_response(
         pytest.param(
             _fail_answer_on_model_error,
             RuntimeError,
-            "out of memory",
+            "overloaded",
             id="answer-model-error",
         ),
         pytest.param(
             _fail_stream_answer_on_model_error,
             RuntimeError,
-            "out of memory",
+            "overloaded",
             id="stream-answer-model-error",
         ),
         pytest.param(
