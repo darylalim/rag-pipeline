@@ -1,4 +1,4 @@
-"""A local RAG pipeline built with LangChain, Chroma, and MLX models.
+"""A RAG pipeline built with LangChain, MongoDB Atlas, and MLX models.
 
 The pipeline has two phases, with a hard boundary between them:
 
@@ -6,8 +6,8 @@ The pipeline has two phases, with a hard boundary between them:
     query:   embed question -> search -> rerank -> generate (rag_pipeline.pipeline)
 
 Every model runs locally with MLX (Apple Silicon), loaded from the Hugging Face
-cache, and the index is a Chroma collection persisted on disk, so nothing
-reaches the network at runtime.
+cache. The index lives in MongoDB Atlas -- chunks, their vectors, and an Atlas
+Vector Search index -- reached through MONGODB_URI.
 
 Configuration lives in rag_pipeline.config and is driven by environment
 variables so the same code backs both the CLI and the Streamlit app.

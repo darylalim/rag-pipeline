@@ -2,7 +2,7 @@
 
 Run with:  uv run streamlit run streamlit_app.py
 
-Uses the same Settings and RAGPipeline as the CLI. The pipeline (persisted index
+Uses the same Settings and RAGPipeline as the CLI. The pipeline (Atlas index
 + local models) is cached with st.cache_resource, so it is built once per index
 version for the whole server rather than on every rerun; the models behind it
 load once per process however often it is rebuilt.
@@ -37,11 +37,9 @@ st.session_state.setdefault("messages", [])
 # `rag ingest` against a running server strands another pipeline for the life
 # of the process.
 #
-# One entry. Every pipeline shares the process-wide models, so a rebuild only
-# reopens the collection and a second slot would save nothing worth keeping;
-# what it would keep is a pipeline opened *before* the last reset, whose Chroma
-# view does not see later writes. A corpus that changes and changes back mints
-# the old key again, and a second slot would answer it from that stale view.
+# One entry. Every pipeline shares the process-wide models and the process-wide
+# MongoDB client, so a rebuild only reopens the collection, and a second slot
+# would save nothing worth keeping.
 @st.cache_resource(max_entries=1, show_spinner="Loading the index and local models...")
 def load_pipeline(_settings: Settings, version: str) -> RAGPipeline:
     """Build the pipeline, cached until the indexed corpus changes.
@@ -49,13 +47,13 @@ def load_pipeline(_settings: Settings, version: str) -> RAGPipeline:
     `version` (the corpus fingerprint digest) is the cache key: it changes when
     `rag ingest` re-embeds the store, busting this cache. `_settings` is passed
     in — the leading underscore tells Streamlit not to hash it — so we don't
-    re-read the environment here. On a rebuild we clear chromadb's client cache
-    first: a cached client's search does not see writes made by another process
-    (a `rag ingest` from a terminal), so without it the fresh pipeline would
-    answer from the old index while `version` already names the new one.
+    re-read the environment here.
+
+    Nothing is reset first: the store is a live server, so the new pipeline
+    already searches the new index, and the client it shares must stay open --
+    the pipeline being replaced may still be answering in another session.
     """
     del version  # used only as the cache key; not needed in the body
-    reset_store_cache()
     return RAGPipeline(_settings)
 
 
@@ -157,10 +155,11 @@ def _import_failure() -> str:
 # that fixes it. A malformed setting is the one setup failure nothing can
 # proceed past, so it alone stops the script here: one of ours (CHUNK_SIZE=abc),
 # or one a library reads for itself as the pipeline's imports first load it —
-# chromadb validates its own settings then (CHROMA_SERVER_HTTP_PORT=abc), and
-# the OpenTelemetry SDK it imports refuses OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT=abc,
-# tracing on or off. Hence those imports here, inside the guard, rather than at
-# the top of the file, where either was a traceback in place of the whole page;
+# the OpenTelemetry SDK, which langsmith imports inside langchain-core, refuses
+# OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT=abc, tracing on or off, and huggingface_hub
+# refuses HF_HUB_ETAG_TIMEOUT=abc. Hence those imports here, inside the guard,
+# rather than at the top of the file, where either was a traceback in place of
+# the whole page;
 # nothing below works without them, the uploader included. The advice is to
 # restart, which picks up any fix: nearly all of these come from the server's
 # environment, fixed when it started (.env is read once, at import), and an
@@ -174,7 +173,6 @@ try:
         index_version,
         indexed_sources,
         ingest,
-        reset_store_cache,
         save_upload,
     )
     from rag_pipeline.pipeline import Excerpt, RAGPipeline, source_excerpts

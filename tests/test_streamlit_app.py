@@ -488,19 +488,20 @@ def test_an_uploaded_document_is_indexed_and_answerable(app, wired_env):
     )
 
 
-# The two states with nothing to query yet: a fresh checkout, with no persist
-# dir at all, and a persist dir holding no collection of the configured name --
-# never ingested into, or a COLLECTION_NAME that differs from the one that was.
+# The two states with nothing to query yet: no collection of the configured
+# name -- never ingested into, or a COLLECTION_NAME that differs from the one
+# that was -- and chunks with no vector index of the configured name to search
+# them by.
 NO_INDEX = [
     pytest.param(
-        lambda s: ("PERSIST_DIR", str(s.persist_dir / "no-such-index")),
-        "No index found at",
-        id="no-persist-dir",
+        lambda s: ("COLLECTION_NAME", "never_ingested"),
+        "nothing was ever ingested",
+        id="collection-never-ingested",
     ),
     pytest.param(
-        lambda s: ("COLLECTION_NAME", "never_ingested"),
-        "is empty",
-        id="collection-never-ingested",
+        lambda s: ("VECTOR_INDEX_NAME", "no_such_index"),
+        "VECTOR_INDEX_NAME",
+        id="no-vector-index",
     ),
 ]
 
@@ -573,51 +574,35 @@ def _count_store_resets(monkeypatch: pytest.MonkeyPatch) -> list[None]:
     return calls
 
 
-def test_every_pipeline_build_starts_from_a_fresh_store_client(app, monkeypatch):
-    """Each rebuild drops chromadb's client cache first, and a cache hit does not.
+def test_no_pipeline_build_closes_the_shared_store_client(app, monkeypatch):
+    """A rebuild, an upload's ingest and a rerun all leave the client open.
 
-    chromadb shares one System per persist directory per process, and its
-    vector view does not see writes another process makes afterwards. After a
-    `rag ingest` in a terminal, `index_version()` (read fresh) already names the
-    new corpus, so the pipeline is rebuilt -- but on the cached System it would
-    search the old index. The stale view does not reproduce within one process
-    (a System here sees writes made through any other), which is all this test
-    has, so the reset is counted instead: one per build, none on a rerun the
-    cache serves -- plus the one every ingest makes before it writes, since a
-    writer must not work from a stale view either.
+    Every pipeline in the process -- one per Streamlit session -- searches
+    through one MongoDB client, and the pipeline a rebuild replaces may still
+    be answering in another session. Closing the client (``reset_store_cache``)
+    on a rebuild would fail that session's next search. Nothing needs it
+    either: Atlas is a live server, so a client is never stale. (The app used to
+    reset Chroma's cached view before every build, which is why this is pinned.)
     """
     resets = _count_store_resets(monkeypatch)
 
     at = app.run()
-    assert len(resets) == 1, "the first pipeline was built on a cached client"
-
     at.chat_input[0].set_value("Why do chunks overlap?").run()
-    at.run()
-    assert len(resets) == 1, "a rerun rebuilt the pipeline the cache already held"
+    at = _upload(at, ("extra.md", b"An extra uploaded document.", "text/x-md"))
+    at.chat_input[0].set_value("Why do chunks overlap?").run()
 
-    _upload(at, ("extra.md", b"An extra uploaded document.", "text/x-md"))
-    # The upload's ingest, then the rebuild after it.
-    assert len(resets) == 3, "the rebuild after an upload reused the cached client"
+    assert not at.exception, [e.value for e in at.exception]
+    assert resets == [], "the app closed the store client a pipeline was using"
 
 
-def test_a_corpus_that_changes_back_is_rebuilt_not_served_stale(
-    app, wired_env, fake_embeddings, monkeypatch
+def test_a_corpus_that_changes_back_is_answered_from_the_current_index(
+    app, wired_env, fake_embeddings
 ):
-    """One pipeline is cached, not two, so an old key is rebuilt, not revived.
-
-    `index_version()` digests the corpus, so a corpus that changes and changes
-    back -- a file uploaded, then deleted by hand and re-ingested from a
-    terminal -- mints the first key again. A second cache slot would answer it
-    with the pipeline built for that key before the last reset, on a chromadb
-    System whose vector view misses the terminal's writes: it would search for
-    the deleted file's chunks and fail on ids that no longer exist. With one
-    slot the key misses and the pipeline is rebuilt on a fresh client.
-
-    As with the reset itself, the stale view needs a second process to show,
-    so the rebuild is what is counted. The answer is checked as well, for what
-    the user must see either way: the removed file gone from retrieval.
+    """`index_version()` digests the corpus, so a corpus that changes and
+    changes back -- a file uploaded, then deleted by hand and re-ingested from a
+    terminal -- mints the first key again. Whatever the cache serves for it,
+    the answer must come from the index as it is now: the removed file gone.
     """
-    resets = _count_store_resets(monkeypatch)
     at = app.run()
     at = _upload(at, ("zebra.md", _ZEBRA.encode(), "text/x-md"))
 
@@ -633,10 +618,6 @@ def test_a_corpus_that_changes_back_is_rebuilt_not_served_stale(
     assert "zebra.md" not in [e["source"] for e in assistant["sources"]], (
         "a removed document was still retrieved"
     )
-    # A build, the upload's ingest and the rebuild after it, the terminal's
-    # ingest, and the rebuild for the key the corpus came back to: one fewer
-    # would be that last pipeline served from cache.
-    assert len(resets) == 5, "the corpus's earlier pipeline was served from cache"
 
 
 def test_submitting_with_no_file_is_reported_not_indexed(app, monkeypatch):
@@ -760,7 +741,7 @@ def test_a_failed_rebuild_is_reported_not_raised(app, monkeypatch, exc):
         pytest.param("CHUNK_SIZE", "not-a-number", id="number"),
         # pathlib reports a `~user` with no home directory as a RuntimeError,
         # which this guard would let through as a crash page.
-        pytest.param("PERSIST_DIR", "~no_such_user_xyz/chroma", id="path"),
+        pytest.param("DATA_DIR", "~no_such_user_xyz/data", id="path"),
     ],
 )
 def test_a_malformed_setting_stops_before_the_sidebar(app, monkeypatch, var, value):
@@ -804,19 +785,16 @@ print(json.dumps(loads))
 @pytest.mark.parametrize(
     ("var", "value", "message"),
     [
-        # Refused by opentelemetry.sdk.trace as it is imported, which chromadb
-        # does -- so with tracing off too.
+        # Refused by opentelemetry.sdk.trace as it is imported, which langsmith
+        # (inside langchain-core) does -- so with tracing off too.
         pytest.param(
             "OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT",
             "abc",
             "OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT",
             id="opentelemetry",
         ),
-        # One of chromadb's own settings, which it validates as it is imported,
-        # and names by its field.
-        pytest.param(
-            "CHROMA_SERVER_HTTP_PORT", "abc", "chroma_server_http_port", id="chromadb"
-        ),
+        # huggingface_hub's, read as it is imported (through transformers).
+        pytest.param("HF_HUB_ETAG_TIMEOUT", "abc", "'abc'", id="huggingface-hub"),
         # numpy's message is int()'s own, naming only the value -- and a failed
         # numpy import cannot be repeated, which is what the reload checks.
         pytest.param("NUMPY_MADVISE_HUGEPAGE", "abc", "'abc'", id="numpy"),
@@ -827,8 +805,8 @@ def test_a_variable_refused_at_import_stops_before_the_sidebar(
 ):
     """The same stop, for a malformed variable a library reads for itself.
 
-    These are read once, as the pipeline's imports first load chromadb, and
-    refused there with a ValueError. Imported above the settings guard, that
+    These are read once, as the pipeline's imports first load their libraries,
+    and refused there with a ValueError. Imported above the settings guard, that
     was a traceback in place of the whole page on every load. Reloaded, it must
     stay the same message: the import is not tried again. The traceback is kept
     in the server's log, where the page no longer shows it. In a fresh
@@ -906,33 +884,28 @@ def test_a_tracing_setup_failure_is_reported_below_the_sidebar(
 def test_looking_for_a_missing_index_creates_nothing(app, settings, monkeypatch):
     """Reporting that there is no index must not leave an empty one behind.
 
-    Opening a Chroma client creates its directory, and the app looks for the
-    index on every rerun. A directory conjured that way would turn the next
-    check's "No index found ... run `rag ingest`" into a misleading "is empty",
-    and leave a stray store in whatever PERSIST_DIR a typo pointed at.
+    The app looks for the index on every rerun. A collection conjured by
+    looking would turn the next check's "nothing was ever ingested" into a
+    misleading "is empty", and leave a stray collection under whatever
+    COLLECTION_NAME a typo named.
     """
-    missing = settings.persist_dir / "no-such-index"
-    monkeypatch.setenv("PERSIST_DIR", str(missing))
+    monkeypatch.setenv("COLLECTION_NAME", "never_ingested")
     st.cache_resource.clear()
 
     at = app.run()
     at.run()
 
-    assert any("No index found at" in e.value for e in at.error)
-    assert not missing.exists(), "looking for the index created its directory"
+    assert any("nothing was ever ingested" in e.value for e in at.error)
+    names = ingest_mod._collection(settings).database.list_collection_names()
+    assert "never_ingested" not in names, "looking for the index created it"
 
 
-def test_a_broken_store_is_reported_on_every_rerun(app, monkeypatch, tmp_path):
-    """A store that fails to open says so every time, never as a crash page.
-
-    chromadb used to keep a store that failed to start cached, half-built, so
-    the next rerun died on a builtins AttributeError instead of the store
-    error -- the message and the traceback page taking turns, rerun by rerun.
-    """
-    broken = tmp_path / "broken-store"
-    broken.mkdir()
-    (broken / "chroma.sqlite3").write_bytes(b"not a database")
-    monkeypatch.setenv("PERSIST_DIR", str(broken))
+def test_an_unreachable_store_is_reported_on_every_rerun(app, monkeypatch):
+    """A cluster that cannot be reached -- paused, or this IP missing from its
+    access list -- says so on every rerun, below the sidebar, never as a crash
+    page: a client whose first contact failed is not kept for the next."""
+    monkeypatch.setenv("MONGODB_URI", "mongodb://127.0.0.1:1/?directConnection=true")
+    monkeypatch.setenv("MONGODB_TIMEOUT_MS", "200")
     st.cache_resource.clear()
 
     at = app
@@ -940,6 +913,7 @@ def test_a_broken_store_is_reported_on_every_rerun(app, monkeypatch, tmp_path):
         at = at.run()
         assert not at.exception, [e.value for e in at.exception]
         assert any("Vector store request failed" in e.value for e in at.error)
+        assert at.sidebar.file_uploader, "the uploader must stay reachable"
 
 
 def test_the_app_config_keeps_streamlit_local_and_quiet():

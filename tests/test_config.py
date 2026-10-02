@@ -24,24 +24,21 @@ def test_defaults(fresh_interpreter):
     so a default changed without its documentation already fails. A copy of
     every value here was a fourth place to change one, which the three-file
     recipe for a setting does not name. What stays pinned is what the documents
-    cannot show: that the paths are anchored to this checkout at run time (they
-    document `./data`), and that tracing starts off.
+    cannot show: that the data path is anchored to this checkout at run time
+    (it is documented as `./data`), and that tracing starts off.
 
-    The paths are read in an interpreter started in another directory: this one
-    runs from the checkout, where paths anchored to the working directory would
+    The path is read in an interpreter started in another directory: this one
+    runs from the checkout, where a path anchored to the working directory would
     come out the same.
     """
     result = fresh_interpreter(
         "import json\n"
         "from rag_pipeline.config import Settings\n"
-        "print(json.dumps([str(Settings().data_dir), str(Settings().persist_dir)]))\n"
+        "print(json.dumps(str(Settings().data_dir)))\n"
     )
 
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout.splitlines()[-1]) == [
-        str(_ROOT / "data"),
-        str(_ROOT / "chroma_db"),
-    ]
+    assert json.loads(result.stdout.splitlines()[-1]) == str(_ROOT / "data")
     # Empty: tracing is off unless asked for, so a fresh checkout sends nothing.
     assert Settings().phoenix_collector_endpoint == ""
 
@@ -54,14 +51,16 @@ def test_from_env_overrides(monkeypatch, tmp_path):
     monkeypatch.setenv("CHUNK_SIZE", "512")
     monkeypatch.setenv("EMBEDDING_DIMENSIONS", "256")
     monkeypatch.setenv("COLLECTION_NAME", "custom")
-    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("MONGODB_DB", "docs")
+    monkeypatch.setenv("VECTOR_INDEX_NAME", "docs_index")
+    monkeypatch.setenv("MONGODB_TIMEOUT_MS", "2500")
     monkeypatch.setenv("PHOENIX_COLLECTOR_ENDPOINT", "http://phoenix.internal:6006")
     monkeypatch.setenv("PHOENIX_PROJECT", "docs-qa")
     # Relative, so the resolution is observable: a path setting is fixed to an
     # absolute path when read, not reinterpreted against whatever directory a
     # later call happens to run in.
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("PERSIST_DIR", "index")
+    monkeypatch.setenv("DATA_DIR", "corpus")
 
     s = Settings.from_env()
 
@@ -75,15 +74,17 @@ def test_from_env_overrides(monkeypatch, tmp_path):
     assert s.chunk_size == 512
     assert s.embedding_dimensions == 256
     assert s.collection_name == "custom"
-    assert s.data_dir == tmp_path.resolve()
-    assert s.persist_dir == (tmp_path / "index").resolve()
+    assert s.mongodb_db == "docs"
+    assert s.vector_index_name == "docs_index"
+    assert s.mongodb_timeout_ms == 2500
+    assert s.data_dir == (tmp_path / "corpus").resolve()
     # Kept as given: the collector path is appended where spans are sent, so a
     # base URL and one naming a proxy prefix both mean what they say.
     assert s.phoenix_collector_endpoint == "http://phoenix.internal:6006"
     assert s.phoenix_project == "docs-qa"
 
 
-@pytest.mark.parametrize("var", ["DATA_DIR", "PERSIST_DIR"])
+@pytest.mark.parametrize("var", ["DATA_DIR"])
 def test_an_unusable_path_setting_is_a_value_error_naming_it(monkeypatch, var):
     """pathlib signals a `~user` with no home directory as a RuntimeError.
 

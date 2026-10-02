@@ -18,8 +18,8 @@ def cmd_ingest(settings: Settings) -> int:
     print(f"Ingesting documents from {settings.data_dir} ...")
     n_chunks = ingest(settings)
     print(
-        f"Indexed {n_chunks} chunks into collection "
-        f"'{settings.collection_name}' at {settings.persist_dir}"
+        f"Indexed {n_chunks} chunks into MongoDB Atlas, "
+        f"{settings.mongodb_db}.{settings.collection_name}"
     )
     print('Ready. Ask a question with:  rag query "..."')
     return 0
@@ -73,7 +73,7 @@ def cmd_eval(settings: Settings, save_baseline: bool) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="rag",
-        description="A local RAG pipeline built with LangChain, Chroma, and MLX models.",
+        description="A RAG pipeline built with LangChain, MongoDB Atlas, and MLX models.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 

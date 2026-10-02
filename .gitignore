@@ -23,7 +23,8 @@ htmlcov/
 # OS
 .DS_Store
 
-# Local Chroma index (PERSIST_DIR)
+# The local Chroma index of earlier versions, which held your documents' text;
+# the index is in MongoDB Atlas now, but a checkout may still have one.
 chroma_db/
 
 # Your own documents in data/, uploaded or dropped in, are yours rather than

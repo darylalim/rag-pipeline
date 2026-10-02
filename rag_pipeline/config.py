@@ -2,7 +2,7 @@
 
 Every tunable lives here and is sourced from environment variables (loaded from
 a local ``.env`` if present). Both the CLI and the Streamlit app build their
-``Settings`` from :meth:`Settings.from_env`, so they always agree on which Chroma
+``Settings`` from :meth:`Settings.from_env`, so they always agree on which Atlas
 collection holds the index, which local models to load, and how documents are
 chunked.
 """
@@ -111,12 +111,21 @@ class Settings:
     # Where source documents (.md/.txt/.pdf) are read from during ingest.
     data_dir: Path = _ROOT / "data"
 
-    # Where Chroma persists the index on disk, and the collection inside it.
-    # Together with the embedding model these are the store's identity: ingest
-    # and query must agree on all of them, or a query reads a wrong or empty
-    # collection.
-    persist_dir: Path = _ROOT / "chroma_db"
+    # The MongoDB Atlas database and collection holding the chunks, and the
+    # Atlas Vector Search index over them. With MONGODB_URI (a credential, so
+    # not a setting: see config.require_env_key) and the embedding model these
+    # are the store's identity: ingest and query must agree on all of them, or
+    # a query reads a wrong or empty collection. `rag ingest` creates the
+    # collection and the index; nothing else does.
+    mongodb_db: str = "rag_db"
     collection_name: str = "rag_docs"
+    vector_index_name: str = "vector_index"
+
+    # How long the MongoDB client waits to reach the cluster before an
+    # operation fails. Generous because a free cluster resumes slowly after
+    # being paused for inactivity, and a short wait would report "unreachable"
+    # for what another few seconds would have connected.
+    mongodb_timeout_ms: int = 10000
 
     # Local embedding model (a Hugging Face repo id resolved from the local
     # cache, or a path to a model directory), run with MLX at both ingest and
@@ -128,9 +137,8 @@ class Settings:
 
     # The width of those vectors. Qwen3-VL-Embedding is Matryoshka-trained, so
     # any width up to the model's native 2048 is a valid prefix of the full
-    # vector (re-normalized). Folded into the chunk fingerprint, because a
-    # Chroma collection fixes its width at the first insert and cannot serve
-    # vectors of another.
+    # vector (re-normalized). Folded into the chunk fingerprint, and it sets the
+    # vector index's numDimensions: an index serves vectors of one width only.
     embedding_dimensions: int = 2048
 
     # Local generation model, run with mlx-lm (thinking disabled, greedy
@@ -179,8 +187,10 @@ class Settings:
         """Build settings, letting environment variables override defaults."""
         return cls(
             data_dir=_env_path("DATA_DIR", cls.data_dir),
-            persist_dir=_env_path("PERSIST_DIR", cls.persist_dir),
+            mongodb_db=_env_str("MONGODB_DB", cls.mongodb_db),
             collection_name=_env_str("COLLECTION_NAME", cls.collection_name),
+            vector_index_name=_env_str("VECTOR_INDEX_NAME", cls.vector_index_name),
+            mongodb_timeout_ms=_env_int("MONGODB_TIMEOUT_MS", cls.mongodb_timeout_ms),
             embedding_model=_env_str("EMBEDDING_MODEL", cls.embedding_model),
             embedding_dimensions=_env_int(
                 "EMBEDDING_DIMENSIONS", cls.embedding_dimensions

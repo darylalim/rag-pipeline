@@ -147,14 +147,14 @@ def test_only_a_models_marked_test_may_import_mlx(request, hide_mlx, marked, hid
     "address",
     [
         pytest.param(("huggingface.co", 443), id="model-download"),
-        pytest.param(("127.0.0.1", 9), id="loopback"),
+        pytest.param(("cluster0.example.mongodb.net", 27017), id="an-atlas-cluster"),
+        pytest.param(("10.0.0.1", 27017), id="the-local-network"),
     ],
 )
 def test_create_connection_is_blocked(address):
     """The route every HTTP client takes, a Hugging Face download included.
 
-    Loopback included: nothing in the suite needs a socket any more, so the
-    block is blanket rather than an allowlist with holes to keep correct. It
+    Refused before the name is resolved, so not even a DNS lookup leaves. It
     raises RuntimeError rather than OSError on purpose -- httpcore turns an
     OSError into a ConnectError, which huggingface_hub catches and answers by
     falling back to the local cache, so an OSError would turn a blocked
@@ -170,9 +170,30 @@ def test_a_bare_socket_cannot_connect(method):
     sock = socket.socket()
     try:
         with pytest.raises(RuntimeError, match="network socket"):
-            getattr(sock, method)(("127.0.0.1", 9))
+            getattr(sock, method)(("10.0.0.1", 9))
     finally:
         sock.close()
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "localhost"])
+def test_this_machine_is_reachable(host):
+    """The one opening: the store is the atlas-local container, on loopback.
+
+    Nothing listens on port 9, so the connection is refused -- by the operating
+    system, which is the proof that the guard let it through.
+    """
+    with pytest.raises(ConnectionRefusedError):
+        socket.create_connection((host, 9), timeout=1)
+
+
+def test_the_developers_cluster_is_out_of_reach():
+    """config.py loads .env at import, so a developer's real MONGODB_URI is in
+    the environment before any test runs; `_no_real_store` takes it out, so a
+    test that forgets the `atlas` fixture cannot write into a real cluster."""
+    assert "MONGODB_URI" not in os.environ
+
+    with pytest.raises(RuntimeError, match="MONGODB_URI is not set"):
+        ingest_mod.index_version(Settings())
 
 
 # --- the tracing guard -------------------------------------------------------

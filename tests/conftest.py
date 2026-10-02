@@ -1,11 +1,18 @@
 """Shared pytest fixtures.
 
-Tests run against a real Chroma store -- an in-process ``PersistentClient``
-under a per-test temp directory, so there is no server, no container and no
-network. The models are the part that is never real: a deterministic fake
-embedding model, a fake reranker and a fake chat model are injected, because the
-real ones are multi-gigabyte MLX checkpoints (about 22 GB together) that only
-run on Apple Silicon.
+Tests run against a real Atlas Vector Search: MongoDB's ``mongodb-atlas-local``
+image (mongod plus mongot, the search process, so ``$vectorSearch`` and search
+indexes behave as on Atlas), one container for the session, started through
+Docker, and one database per test, dropped after it. A fake would have to
+reproduce exactly the behaviour that matters -- an index built asynchronously,
+writes that become searchable later, pre-filters on declared fields -- so the
+store is the one part that is real. The models are the part that is never
+real: a deterministic fake embedding model, a fake reranker and a fake chat
+model are injected, because the real ones are multi-gigabyte MLX checkpoints
+(about 22 GB together) that only run on Apple Silicon.
+
+The developer's own ``MONGODB_URI`` -- a real cluster -- is removed for every
+test (``_no_real_store``), and only the container's is ever set.
 
 Two autouse guards back that injection convention, since forgetting it is
 silent otherwise:
@@ -15,8 +22,9 @@ silent otherwise:
   instead of quietly loading weights from the local Hugging Face cache. With the
   models cached, no socket is involved, so a network block alone would not
   notice. Tests marked ``models`` (deselected by default) opt out of it.
-- ``_offline`` blocks every socket, so nothing -- a model download, telemetry,
-  Chroma's default ONNX embedder -- reaches the network. ``_no_tracing`` keeps
+- ``_offline`` blocks every socket to a host other than this machine, so
+  nothing -- a model download, telemetry, a real Atlas cluster -- is reached;
+  the container is on loopback. ``_no_tracing`` keeps
   tracing off whatever a developer's .env says, and ``_no_tracer_left_on``
   fails a test that leaves it on: an exporter is the one route out that the
   socket block cannot stop, because the tracing stack swallows the error.
@@ -31,7 +39,6 @@ import sys
 from collections.abc import Callable, Iterator
 
 import pytest
-from chromadb.config import Settings as ChromaSettings
 from langchain_core.documents.compressor import BaseDocumentCompressor
 from langchain_core.embeddings import DeterministicFakeEmbedding
 from langchain_core.language_models import FakeListChatModel
@@ -44,6 +51,8 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
     InMemorySpanExporter,
 )
 from opentelemetry.test.globals_test import reset_trace_globals
+from pymongo import MongoClient
+from pymongo.operations import SearchIndexModel
 
 from rag_pipeline import ingest as ingest_mod
 from rag_pipeline import mlx_models
@@ -140,16 +149,125 @@ def sample_data_dir(tmp_path):
     return root
 
 
+# --- the store: Atlas in a local container -----------------------------------
+
+# Pinned, so a new image cannot change the suite's results unannounced.
+_ATLAS_IMAGE = "mongodb/mongodb-atlas-local:8.0.17"
+# Credentials and other variables a developer's environment (or .env) holds
+# that no test may inherit.
+_CREDENTIALS = ("MONGODB_URI", "ANTHROPIC_API_KEY", "VOYAGE_API_KEY")
+
+
+def _await_search_ready(uri: str, timeout_s: float = 180.0) -> None:
+    """Block until the container's search process accepts and builds an index.
+
+    mongod answers first and mongot warms up seconds later; until then creating
+    a search index fails ("Error connecting to Search Index Management
+    service"). Building and querying a throwaway index is the readiness check:
+    the image logs no documented marker for it.
+    """
+    import time
+
+    client: MongoClient = MongoClient(uri, serverSelectionTimeoutMS=30000)
+    try:
+        probe = client["readiness_probe"]["probe"]
+        probe.insert_one({"_id": "p", "embedding": [1.0, 0.0]})
+        deadline = time.monotonic() + timeout_s
+        while True:
+            try:
+                probe.create_search_index(
+                    SearchIndexModel(
+                        definition={
+                            "fields": [
+                                {
+                                    "type": "vector",
+                                    "path": "embedding",
+                                    "numDimensions": 2,
+                                    "similarity": "cosine",
+                                }
+                            ]
+                        },
+                        name="probe",
+                        type="vectorSearch",
+                    )
+                )
+                break
+            except Exception:
+                if time.monotonic() > deadline:
+                    raise
+                time.sleep(1)
+        while not any(ix.get("queryable") for ix in probe.list_search_indexes("probe")):
+            if time.monotonic() > deadline:
+                raise RuntimeError("atlas-local never built its readiness index")
+            time.sleep(1)
+        client.drop_database("readiness_probe")
+    finally:
+        client.close()
+
+
+@pytest.fixture(scope="session")
+def atlas_uri() -> Iterator[str]:
+    """One atlas-local container for the session; yields its URI.
+
+    Session-scoped, so the start and mongot's warm-up are paid once.
+    ``directConnection=true`` because the image is a one-node replica set whose
+    member advertises a container-internal hostname a client outside cannot
+    resolve. Without Docker, every test that needs the store errors here, with
+    this message, rather than being skipped: a skipped store test is not a
+    passed one.
+    """
+    from docker.errors import DockerException
+    from testcontainers.core.container import DockerContainer
+
+    container = DockerContainer(_ATLAS_IMAGE).with_exposed_ports(27017)
+    try:
+        container.start()
+    except DockerException as exc:
+        pytest.fail(
+            f"The store tests need Docker, to run {_ATLAS_IMAGE}: {exc}. "
+            "Start Docker (Docker Desktop on a Mac) and run them again.",
+            pytrace=False,
+        )
+    try:
+        uri = (
+            f"mongodb://{container.get_container_host_ip()}:"
+            f"{container.get_exposed_port(27017)}/?directConnection=true"
+        )
+        _await_search_ready(uri)
+        yield uri
+    finally:
+        container.stop()
+
+
 @pytest.fixture
-def settings(sample_data_dir, tmp_path) -> Settings:
-    """Settings pointed at the sample data and an isolated, per-test index.
+def atlas(atlas_uri, monkeypatch, request) -> Iterator[str]:
+    """The container as this test's ``MONGODB_URI``; yields a fresh database name.
+
+    A database per test, dropped afterwards, so tests share the container but
+    nothing in it: each starts with no collection, no index and no lock.
+    """
+    database = f"test_{request.node.name[:40]}_{os.getpid()}_{id(request)}"
+    database = "".join(c if c.isalnum() or c == "_" else "_" for c in database)[:63]
+    monkeypatch.setenv("MONGODB_URI", atlas_uri)
+    yield database
+    reset_store_cache()
+    client: MongoClient = MongoClient(atlas_uri)
+    try:
+        client.drop_database(database)
+    finally:
+        client.close()
+
+
+@pytest.fixture
+def settings(sample_data_dir, atlas) -> Settings:
+    """Settings pointed at the sample data and an isolated, per-test database.
 
     EMBEDDING_DIMENSIONS matches the fake embedding width, or ingest's probe
     check would reject every run.
     """
     return Settings(
         data_dir=sample_data_dir,
-        persist_dir=tmp_path / "chroma",
+        mongodb_db=atlas,
         collection_name="test_docs",
         embedding_dimensions=_EMBED_SIZE,
         chunk_size=200,
@@ -292,17 +410,14 @@ def fresh_interpreter(tmp_path) -> Callable[..., subprocess.CompletedProcess[str
     from the environment once, as they are first imported, and this process
     imported all of them before the first test ran. Left out of the child are
     the developer's own settings -- this repo's (config.py's load_dotenv() has
-    put .env's in os.environ), OpenTelemetry's, and chromadb's, which it reads
-    under its field names, not all of them CHROMA_ ones (ALLOW_RESET) -- and
+    put .env's in os.environ, credentials included) and OpenTelemetry's -- and
     .env is switched off, or config.py would read it straight back in. So is
     what this package sets for itself as it is imported
     (TRANSFORMERS_NO_ADVISORY_WARNINGS): this process's import already put it
-    in os.environ, and inherited, it would answer for the child's own. The
-    working directory is the test's own, because chromadb reads a .env from
-    there for itself. MLX is made unimportable and PERSIST_DIR names an index
-    that does not exist, so the child can load no model and open no store,
-    which is also what keeps it offline: ``_offline`` cannot reach into another
-    process.
+    in os.environ, and inherited, it would answer for the child's own. MLX is
+    made unimportable and no MONGODB_URI is set, so the child can load no model
+    and open no store, which is also what keeps it offline: ``_offline`` cannot
+    reach into another process.
 
     Here rather than in one frontend's test file because both frontends have to
     survive what it shows.
@@ -313,13 +428,12 @@ def fresh_interpreter(tmp_path) -> Callable[..., subprocess.CompletedProcess[str
             name: value
             for name, value in os.environ.items()
             if name not in ENV_VARS
+            and name not in _CREDENTIALS
             and name != "TRANSFORMERS_NO_ADVISORY_WARNINGS"
-            and not name.startswith(("OTEL_", "CHROMA_"))
-            and name.lower() not in ChromaSettings.model_fields
+            and not name.startswith(("OTEL_", "LANGSMITH_", "LANGCHAIN_"))
         }
         child |= {
             "PYTHON_DOTENV_DISABLED": "1",
-            "PERSIST_DIR": str(tmp_path / "no-index"),
             "DATA_DIR": str(tmp_path / "data"),
             **env,
         }
@@ -342,13 +456,24 @@ def fresh_interpreter(tmp_path) -> Callable[..., subprocess.CompletedProcess[str
 
 @pytest.fixture(autouse=True)
 def _reset_store_client():
-    """Chroma caches one client System per persist directory per process, and a
-    cached System's vector view does not see writes another process made after
-    it was opened. Dropping the cache at each test boundary gives every test a
-    fresh System and lets an in-process re-ingest behave like a fresh CLI run."""
+    """Close the process's MongoDB clients at each test boundary, so every test
+    starts as a fresh process would and none inherits another's connection."""
     reset_store_cache()
     yield
     reset_store_cache()
+
+
+@pytest.fixture(autouse=True)
+def _no_real_store(monkeypatch):
+    """Remove the developer's credentials -- a real ``MONGODB_URI`` above all.
+
+    config.py loads .env at import, so a developer's real cluster is in
+    os.environ for every test; one that forgot ``atlas`` would otherwise write
+    into it. Only the ``atlas`` fixture sets ``MONGODB_URI``, to the container.
+    ``_offline`` is the second guard: a real cluster is not on loopback.
+    """
+    for name in _CREDENTIALS:
+        monkeypatch.delenv(name, raising=False)
 
 
 def _hide_mlx(node, monkeypatch) -> None:
@@ -457,17 +582,46 @@ def _no_tracer_left_on():
 
 @pytest.fixture(autouse=True)
 def _offline(monkeypatch):
-    """Fail any test that opens a socket, to any host.
+    """Fail any test that opens a socket to a host other than this machine.
 
-    Chroma runs in-process and the models load from local files, so nothing in
-    the suite has a reason to connect anywhere: a connection means something is
-    downloading (a model, Chroma's default ONNX embedder) or phoning home, and
-    either should fail the test that caused it.
+    The store is the atlas-local container, reached on loopback, and the models
+    load from local files, so nothing in the suite has a reason to connect
+    anywhere else: such a connection means something is downloading (a model),
+    phoning home, or reaching a real cluster, and it fails the test that made
+    it. Unix sockets -- Docker's own API -- stay open.
     """
+    connect = socket.socket.connect
+    connect_ex = socket.socket.connect_ex
+    create_connection = socket.create_connection
 
-    def blocked(*_args, **_kwargs):
-        raise RuntimeError("test opened a network socket; the suite must stay offline")
+    def local(address) -> bool:
+        return not isinstance(address, tuple) or address[0] in _LOOPBACK
 
-    monkeypatch.setattr(socket.socket, "connect", blocked)
-    monkeypatch.setattr(socket.socket, "connect_ex", blocked)
-    monkeypatch.setattr(socket, "create_connection", blocked)
+    def refuse(address):
+        raise RuntimeError(
+            f"test opened a network socket to {address[0]!r}; the suite may "
+            "only reach this machine"
+        )
+
+    def guarded_connect(self, address):
+        if not local(address):
+            refuse(address)
+        return connect(self, address)
+
+    def guarded_connect_ex(self, address):
+        if not local(address):
+            refuse(address)
+        return connect_ex(self, address)
+
+    def guarded_create_connection(address, *args, **kwargs):
+        if not local(address):
+            refuse(address)
+        return create_connection(address, *args, **kwargs)
+
+    monkeypatch.setattr(socket.socket, "connect", guarded_connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", guarded_connect_ex)
+    monkeypatch.setattr(socket, "create_connection", guarded_create_connection)
+
+
+# The hosts `_offline` lets a test reach: this machine, however it is spelled.
+_LOOPBACK = frozenset({"127.0.0.1", "::1", "localhost"})

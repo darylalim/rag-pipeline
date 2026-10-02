@@ -16,7 +16,7 @@ thought to enumerate. Enforced that way, and deliberately not in ``RULES``:
   ``test_ingest_preserves_foreign_documents_in_a_shared_collection`` notices a
   foreign document being deleted by any means, not only a literal wipe
 - cli.py's lazy imports -- ``test_importing_cli_does_not_load_the_heavy_stack``
-  imports the module in a subprocess and asserts chromadb/mlx never loaded,
+  imports the module in a subprocess and asserts pymongo/mlx never loaded,
   covering routes no list of import spellings would reach
 - the chat model decoding greedily --
   ``test_generation_is_greedy_with_thinking_off_and_explicit_max_tokens``
@@ -100,25 +100,30 @@ _GAP = r"[^\S\n]*"
 RULES = [
     Rule(
         name="store-factory",
-        # tests/ is covered too, unlike in earlier eras of this rule. open_store()
-        # reaches any collection a test needs to inspect or seed, and a client
-        # of a test's own is the same hazard it is anywhere: chromadb shares one
-        # System per persist directory per process, so a client asking for it
-        # with settings other than _client()'s is a builtins ValueError. The
-        # dotted prefix is allowed because `chromadb.PersistentClient(` is the
-        # ordinary spelling; a bare `Client(` is not matched, since every HTTP
-        # library has one.
-        applies=lambda p: p.endswith(".py") and p != "rag_pipeline/ingest.py",
+        # tests/ is covered too. A test inspects or seeds the store through
+        # ingest's own handles (_collection, open_store), so it sees exactly
+        # what the pipeline does -- the same URI, database and collection --
+        # and never a second client configured some other way. One exemption:
+        # conftest.py administers the atlas-local container itself (a readiness
+        # probe before any test, and each test's database dropped after it),
+        # which is not the pipeline's store and has no Settings to open it by.
+        # The dotted prefix is allowed because `pymongo.MongoClient(` is an
+        # ordinary spelling.
+        applies=lambda p: (
+            p.endswith(".py")
+            and p not in ("rag_pipeline/ingest.py", "tests/conftest.py")
+        ),
         pattern=re.compile(
-            r"(?<![\w.])(?:\w+\.)*(?:Chroma(?:\.from_\w+)?|PersistentClient)\s*\("
-            r"|(?<![\w.])chromadb\.Client\s*\("
+            r"(?<![\w.])(?:\w+\.)*"
+            r"(?:MongoDBAtlasVectorSearch(?:\.from_\w+)?|(?:Async)?MongoClient)\s*\("
         ),
         scan_comments=False,
         message=(
-            "Constructing the vector store inline (Chroma(...), Chroma.from_*(...), "
-            "chromadb.PersistentClient(...) or chromadb.Client(...)). A "
-            "collection's identity is (persist dir, collection name, embedding "
-            "function), so indexing and querying must go through open_store() in "
+            "Constructing the vector store inline (MongoDBAtlasVectorSearch(...), "
+            "MongoDBAtlasVectorSearch.from_*(...) or MongoClient(...)). The store's "
+            "identity is (MONGODB_URI, database, collection, vector index, "
+            "embedding function), and the process shares one client, so indexing "
+            "and querying must go through open_store() and _collection() in "
             "rag_pipeline/ingest.py."
         ),
     ),

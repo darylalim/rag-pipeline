@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import dataclasses
 import sys
+import time
 import types
 from types import SimpleNamespace
 from typing import Any
@@ -97,26 +98,30 @@ def test_pipeline_requires_index(settings):
 
     No models injected (see the module docstring): the FileNotFoundError is also
     the proof that the check runs before the ~22 GB of local models would load.
-    And looking must not create what it looked for -- an empty persist dir left
+    And looking must not create what it looked for -- an empty collection left
     behind would turn the next attempt's message into a different one.
     """
-    with pytest.raises(FileNotFoundError, match="No index found at"):
+    with pytest.raises(FileNotFoundError, match="nothing was ever ingested"):
         RAGPipeline(settings)
 
-    assert not settings.persist_dir.exists()
+    assert ingest_mod._collection(settings).database.list_collection_names() == []
 
 
 def _emptied(settings: Settings, embeddings: Embeddings) -> None:
     """Ingested, then every chunk of ours deleted: the collection still exists."""
     ingest_mod.ingest(settings, embeddings=embeddings)
-    store = ingest_mod.open_store(settings, embeddings)
-    store.delete(ids=store.get(where=ingest_mod.OWN_CHUNKS)["ids"])
+    ingest_mod._collection(settings).delete_many(ingest_mod.OWN_CHUNKS)
 
 
 def _foreign_only(settings: Settings, embeddings: Embeddings) -> None:
     """A collection of the configured name holding only someone else's records."""
-    ingest_mod.open_store(settings, embeddings).add_texts(
-        ["Somebody else's notes."], metadatas=[{"source": "theirs.md"}], ids=["theirs"]
+    ingest_mod._collection(settings).insert_one(
+        {
+            "_id": "theirs",
+            "text": "Somebody else's notes.",
+            "embedding": embeddings.embed_query("Somebody else's notes."),
+            "source": "theirs.md",
+        }
     )
 
 
@@ -132,7 +137,6 @@ def test_pipeline_rejects_empty_index(arrange, settings, fake_embeddings):
     returns them.
     """
     arrange(settings, fake_embeddings)
-    ingest_mod.reset_store_cache()
 
     with pytest.raises(FileNotFoundError, match="is empty"):
         RAGPipeline(settings)
@@ -152,26 +156,22 @@ def test_collection_mismatch_is_caught_by_the_missing_collection_guard(
     """Pins *which* guard rejects a COLLECTION_NAME mismatch, that rejecting it
     left no trace, and that the store it rejected was not actually broken.
 
-    A wrong COLLECTION_NAME names a collection that does not exist. The
-    `persist_dir` check cannot see that (the directory is populated), so `match=`
-    pins the collection guard; and the lookup must not conjure the collection
-    into existence -- the query path never creates one, or a second attempt
-    would meet the empty-index message instead of the one naming the mismatch.
-    The `reset_store_cache()` calls put each re-open in the state a real
-    `rag query` starts from.
+    A wrong COLLECTION_NAME names a collection that does not exist, in a
+    database that holds the right one, so `match=` pins the collection guard;
+    and the lookup must not conjure the collection into existence -- the query
+    path never creates one, or a second attempt would meet the empty-index
+    message instead of the one naming the mismatch.
     """
     ingest_mod.ingest(settings, embeddings=fake_embeddings)
-    ingest_mod.reset_store_cache()
 
     mismatched = dataclasses.replace(settings, collection_name="not_the_ingested_one")
     with pytest.raises(FileNotFoundError, match="nothing was ever ingested"):
         RAGPipeline(mismatched)
-    with pytest.raises(FileNotFoundError):
-        ingest_mod.open_store(mismatched, fake_embeddings, create=False)
+    names = ingest_mod._collection(settings).database.list_collection_names()
+    assert "not_the_ingested_one" not in names
 
     # And the correctly-named collection still retrieves: the failure above was
     # about the name, not a genuinely missing index.
-    ingest_mod.reset_store_cache()
     assert RAGPipeline(
         settings,
         embeddings=fake_embeddings,
@@ -189,7 +189,6 @@ def test_a_complete_index_gets_past_the_guards_to_the_models(settings, fake_embe
     block that is the loader's RuntimeError.
     """
     ingest_mod.ingest(settings, embeddings=fake_embeddings)
-    ingest_mod.reset_store_cache()
 
     with pytest.raises(RuntimeError, match="MLX"):
         RAGPipeline(settings)
@@ -198,32 +197,35 @@ def test_a_complete_index_gets_past_the_guards_to_the_models(settings, fake_embe
 def test_a_collection_that_vanishes_after_the_check_is_not_recreated(
     settings, fake_embeddings, fake_reranker, monkeypatch
 ):
-    """The query path opens the store with ``create=False``, whatever the guard saw.
+    """The query path creates nothing, whatever the guard saw.
 
-    In production the embedding model loads between the check and the open, so
-    the collection can go in between; created afresh, it would be an empty one
-    that answers every question "I don't know". Refused instead, as the error
-    naming the fix -- and nothing is left behind for the next attempt to find.
+    In production the embedding model loads between the check and the first
+    search, so the collection can go in between; created afresh, it would be an
+    empty one that answers every question "I don't know" -- and that a later
+    check would pass for the index. The search finds nothing, and nothing is
+    left behind for the next attempt's guard to find.
     """
     ingest_mod.ingest(settings, embeddings=fake_embeddings)
-    ingest_mod.reset_store_cache()
     check = pipeline_mod.require_index
 
     def check_then_vanish(s: Settings) -> None:
         check(s)
-        ingest_mod.open_store(s, fake_embeddings, create=False).delete_collection()
+        ingest_mod._collection(s).drop()
 
     monkeypatch.setattr(pipeline_mod, "require_index", check_then_vanish)
 
+    pipeline = RAGPipeline(
+        settings,
+        embeddings=fake_embeddings,
+        llm=FakeListChatModel(responses=["unused"]),
+        reranker=fake_reranker,
+    )
+
+    assert pipeline.retrieve("apples") == []
+    names = ingest_mod._collection(settings).database.list_collection_names()
+    assert settings.collection_name not in names
     with pytest.raises(FileNotFoundError, match="nothing was ever ingested"):
-        RAGPipeline(
-            settings,
-            embeddings=fake_embeddings,
-            llm=FakeListChatModel(responses=["unused"]),
-            reranker=fake_reranker,
-        )
-    with pytest.raises(FileNotFoundError):
-        ingest_mod.open_store(settings, fake_embeddings, create=False)
+        ingest_mod.require_index(settings)
 
 
 # --- retrieval ---------------------------------------------------------------
@@ -297,15 +299,28 @@ def test_retrieve_never_returns_a_foreign_document(
     The foreign record carries a `source` and a `content_hash`, so looking like
     one of ours is not enough: only the marker every chunk of ours carries
     counts. Queried with its exact text, which an unscoped search ranks first
-    (the control at the end).
+    (the control, checked first).
     """
     ingest_mod.ingest(settings, embeddings=fake_embeddings)
     text = "Zebra facts that no ingested file contains."
-    ingest_mod.open_store(settings, fake_embeddings).add_texts(
-        [text],
-        metadatas=[{"source": "zebra.md", "content_hash": "0" * 64}],
-        ids=["foreign"],
+    ingest_mod._collection(settings).insert_one(
+        {
+            "_id": "foreign",
+            "text": text,
+            "embedding": fake_embeddings.embed_query(text),
+            "source": "zebra.md",
+            "content_hash": "0" * 64,
+        }
     )
+
+    # The control first: an unscoped search must find the record, or the
+    # assertion below would pass only because Atlas had not indexed it yet --
+    # an insert becomes searchable asynchronously.
+    unscoped = ingest_mod.open_store(settings, fake_embeddings)
+    deadline = time.monotonic() + 60
+    while unscoped.similarity_search(text, k=1)[0].metadata.get("source") != "zebra.md":
+        assert time.monotonic() < deadline, "the foreign record never became searchable"
+        time.sleep(0.5)
 
     pipeline = RAGPipeline(
         settings,
@@ -317,8 +332,6 @@ def test_retrieve_never_returns_a_foreign_document(
 
     assert retrieved, "the pipeline's own chunks should still be retrieved"
     assert "zebra.md" not in unique_sources(retrieved)
-    unscoped = ingest_mod.open_store(settings, fake_embeddings, create=False)
-    assert unscoped.similarity_search(text, k=1)[0].metadata["source"] == "zebra.md"
 
 
 # --- generation --------------------------------------------------------------
@@ -701,21 +714,23 @@ def _fail_ingest_empty_corpus(
 def _fail_ingest_invalid_collection_name(
     settings, fake_embeddings, fake_reranker, monkeypatch, tmp_path
 ):
-    # Chroma rejects the name when the collection is created. The translation
-    # must make that a RuntimeError -- never chromadb's own type, and never a
-    # ValueError, which streamlit_app.py's pipeline-load guard does not catch.
+    # MongoDB refuses the name outright, as pymongo's InvalidName. The
+    # translation must make that a RuntimeError -- never pymongo's own type,
+    # and never a ValueError, which streamlit_app.py's pipeline-load guard does
+    # not catch.
     ingest_mod.ingest(
-        dataclasses.replace(settings, collection_name="x"), embeddings=fake_embeddings
+        dataclasses.replace(settings, collection_name="bad$name"),
+        embeddings=fake_embeddings,
     )
 
 
 def _fail_ingest_dimension_mismatch(
     settings, fake_embeddings, fake_reranker, monkeypatch, tmp_path
 ):
-    # Chroma takes whatever width the first insert has, so a model whose actual
-    # width disagrees with EMBEDDING_DIMENSIONS would be indexed without
-    # complaint under a fingerprint that claims the declared one. Ingest's own
-    # probe is the guard, and it raises before anything is written.
+    # MongoDB stores a vector of any width, so a model whose actual width
+    # disagrees with EMBEDDING_DIMENSIONS would be stored without complaint
+    # under a fingerprint that claims the declared one. Ingest's own probe is
+    # the guard, and it raises before anything is written.
     ingest_mod.ingest(
         dataclasses.replace(settings, embedding_dimensions=8),
         embeddings=DeterministicFakeEmbedding(size=16),
@@ -725,12 +740,11 @@ def _fail_ingest_dimension_mismatch(
 def _fail_ingest_collection_width_change(
     settings, fake_embeddings, fake_reranker, monkeypatch, tmp_path
 ):
-    # A collection keeps its width for good, so a narrower model cannot be
-    # indexed into it. Caught before the delete that would otherwise already
-    # have removed the chunks being replaced. EMBEDDING_MODEL changes along with
-    # the fake, as it would for real: that is what marks every source changed.
+    # The index serves one width, so a narrower model cannot be indexed into the
+    # collection. Caught before the delete that would otherwise already have
+    # removed the chunks being replaced. EMBEDDING_MODEL changes along with the
+    # fake, as it would for real: that is what marks every source changed.
     ingest_mod.ingest(settings, embeddings=fake_embeddings)
-    ingest_mod.reset_store_cache()
     ingest_mod.ingest(
         dataclasses.replace(
             settings, embedding_model="some-org/narrower-model", embedding_dimensions=16
@@ -747,11 +761,35 @@ def _fail_ingest_on_embedding_error(
     )
 
 
-def _fail_pipeline_missing_index(
+def _fail_pipeline_nothing_ingested(
     settings, fake_embeddings, fake_reranker, monkeypatch, tmp_path
 ):
     # No models injected: the guard must fire before any would be built.
-    RAGPipeline(dataclasses.replace(settings, persist_dir=tmp_path / "no-such-index"))
+    RAGPipeline(settings)
+
+
+def _fail_pipeline_missing_vector_index(
+    settings, fake_embeddings, fake_reranker, monkeypatch, tmp_path
+):
+    # Chunks, but no index to search them with: every question would find
+    # nothing, so this is refused before any model loads.
+    ingest_mod.ingest(settings, embeddings=fake_embeddings)
+    RAGPipeline(dataclasses.replace(settings, vector_index_name="no_such_index"))
+
+
+def _fail_pipeline_without_mongodb_uri(
+    settings, fake_embeddings, fake_reranker, monkeypatch, tmp_path
+):
+    monkeypatch.delenv("MONGODB_URI")
+    RAGPipeline(settings)
+
+
+def _fail_pipeline_unreachable_cluster(
+    settings, fake_embeddings, fake_reranker, monkeypatch, tmp_path
+):
+    # A paused cluster, or an IP missing from the access list, looks like this.
+    monkeypatch.setenv("MONGODB_URI", "mongodb://127.0.0.1:1/?directConnection=true")
+    RAGPipeline(dataclasses.replace(settings, mongodb_timeout_ms=200))
 
 
 def _fail_pipeline_missing_collection(
@@ -762,7 +800,6 @@ def _fail_pipeline_missing_collection(
         dataclasses.replace(settings, collection_name="other_docs"),
         embeddings=fake_embeddings,
     )
-    ingest_mod.reset_store_cache()
     RAGPipeline(settings)
 
 
@@ -770,27 +807,33 @@ def _fail_pipeline_empty_collection(
     settings, fake_embeddings, fake_reranker, monkeypatch, tmp_path
 ):
     _emptied(settings, fake_embeddings)
-    ingest_mod.reset_store_cache()
     RAGPipeline(settings)
 
 
 def _fail_pipeline_invalid_collection_name(
     settings, fake_embeddings, fake_reranker, monkeypatch, tmp_path
 ):
-    # A name Chroma would refuse to create is, on the read path, simply one that
-    # was never ingested into -- which must not surface as chromadb's error.
+    # A name MongoDB refuses fails on the read path too -- as a RuntimeError,
+    # never pymongo's own InvalidName.
     ingest_mod.ingest(settings, embeddings=fake_embeddings)
-    RAGPipeline(dataclasses.replace(settings, collection_name="x"))
+    RAGPipeline(dataclasses.replace(settings, collection_name="bad$name"))
 
 
 def _fail_pipeline_fetch_k_below_one(
     settings, fake_embeddings, fake_reranker, monkeypatch, tmp_path
 ):
-    # Chroma would refuse the search with a builtins TypeError, and only on the
-    # first question; no models injected, so this is also checked before any
-    # would load.
+    # $vectorSearch would refuse the search, and only on the first question; no
+    # models injected, so this is also checked before any would load.
     ingest_mod.ingest(settings, embeddings=fake_embeddings)
     RAGPipeline(dataclasses.replace(settings, fetch_k=0))
+
+
+def _fail_pipeline_fetch_k_above_the_cap(
+    settings, fake_embeddings, fake_reranker, monkeypatch, tmp_path
+):
+    # Ten candidates per result would pass $vectorSearch's 10,000 cap.
+    ingest_mod.ingest(settings, embeddings=fake_embeddings)
+    RAGPipeline(dataclasses.replace(settings, fetch_k=1001))
 
 
 def _fail_pipeline_without_mlx(
@@ -852,7 +895,7 @@ def _fail_retrieve_on_rerank_error(
 def _fail_retrieve_on_dimension_mismatch(
     settings, fake_embeddings, fake_reranker, monkeypatch, tmp_path
 ):
-    # A collection built by one model, queried by a narrower one: Chroma accepts
+    # A collection built by one model, queried by a narrower one: Atlas accepts
     # the open and fails the search. The message has to name the remedy (a new
     # COLLECTION_NAME), since nothing about the question was wrong.
     ingest_mod.ingest(settings, embeddings=fake_embeddings)
@@ -945,10 +988,28 @@ def _fail_stream_answer_on_empty_response(
             id="ingest-embedding-error",
         ),
         pytest.param(
-            _fail_pipeline_missing_index,
+            _fail_pipeline_nothing_ingested,
             FileNotFoundError,
-            "No index found at",
-            id="pipeline-missing-index",
+            "nothing was ever ingested",
+            id="pipeline-nothing-ingested",
+        ),
+        pytest.param(
+            _fail_pipeline_missing_vector_index,
+            FileNotFoundError,
+            "VECTOR_INDEX_NAME",
+            id="pipeline-missing-vector-index",
+        ),
+        pytest.param(
+            _fail_pipeline_without_mongodb_uri,
+            RuntimeError,
+            "MONGODB_URI is not set",
+            id="pipeline-without-mongodb-uri",
+        ),
+        pytest.param(
+            _fail_pipeline_unreachable_cluster,
+            RuntimeError,
+            "Vector store request failed",
+            id="pipeline-unreachable-cluster",
         ),
         pytest.param(
             _fail_pipeline_missing_collection,
@@ -964,8 +1025,8 @@ def _fail_stream_answer_on_empty_response(
         ),
         pytest.param(
             _fail_pipeline_invalid_collection_name,
-            FileNotFoundError,
-            "COLLECTION_NAME",
+            RuntimeError,
+            "Vector store request failed",
             id="pipeline-invalid-collection-name",
         ),
         pytest.param(
@@ -973,6 +1034,12 @@ def _fail_stream_answer_on_empty_response(
             RuntimeError,
             "FETCH_K",
             id="pipeline-fetch-k-below-one",
+        ),
+        pytest.param(
+            _fail_pipeline_fetch_k_above_the_cap,
+            RuntimeError,
+            "FETCH_K",
+            id="pipeline-fetch-k-above-the-cap",
         ),
         pytest.param(
             _fail_pipeline_without_mlx,
@@ -1039,7 +1106,7 @@ def test_failure_modes_stay_inside_the_frontend_exception_union(
 
     Individual tests above already cover most of these one at a time; this one
     exists to make the *union* the thing under test, so adding a fourth type
-    (or letting a chromadb or huggingface_hub exception escape untranslated,
+    (or letting a pymongo or huggingface_hub exception escape untranslated,
     which would drag that library into both frontends) fails here rather than
     at a user's terminal. `expected_type` is checked exactly, so a path can't
     drift to a different member of the union unnoticed -- and nothing on the

@@ -353,8 +353,9 @@ def test_the_chat_model_reports_why_it_stopped(chat):
 # --- the whole pipeline -------------------------------------------------------
 
 
-def test_ingest_then_answer_over_the_repo_corpus(tmp_path):
-    """The three models together, through the real factories, over data/."""
+def test_ingest_then_answer_over_the_repo_corpus(atlas):
+    """The three models together, through the real factories, over data/, in
+    the test's own database on the atlas-local container."""
     for model_id in (
         _DEFAULTS.embedding_model,
         _DEFAULTS.rerank_model,
@@ -366,10 +367,9 @@ def test_ingest_then_answer_over_the_repo_corpus(tmp_path):
     # models are driven correctly, so it is a skip, not a failure.
     if not (_DEFAULTS.data_dir / "rag_concepts.md").is_file():
         pytest.skip("data/rag_concepts.md is gone; this asks what only it answers")
-    settings = dataclasses.replace(_DEFAULTS, persist_dir=tmp_path / "chroma")
+    settings = dataclasses.replace(_DEFAULTS, mongodb_db=atlas)
 
     assert ingest_mod.ingest(settings) > 0
-    ingest_mod.reset_store_cache()
     result = RAGPipeline(settings).answer(
         "What chunk overlap is typically recommended?"
     )

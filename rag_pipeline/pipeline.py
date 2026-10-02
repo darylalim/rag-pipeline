@@ -1,6 +1,6 @@
 """Query phase: embed question -> search -> rerank -> generate a grounded answer.
 
-``RAGPipeline`` opens the persisted Chroma collection and the local models
+``RAGPipeline`` opens the Atlas Vector Search index and the local models
 once, then answers questions against them. Both the CLI and the Streamlit app
 build a single pipeline and reuse it across queries.
 """
@@ -265,6 +265,11 @@ def build_reranker(settings: Settings) -> BaseDocumentCompressor:
     return QwenVLReranker(model_id=settings.rerank_model, top_n=settings.retrieval_k)
 
 
+# The largest FETCH_K a search accepts: $vectorSearch caps its candidates at
+# 10,000, and langchain-mongodb asks for ten per result.
+_MAX_FETCH_K = 1000
+
+
 class RAGPipeline:
     """Loads the persisted index and answers questions against it."""
 
@@ -275,12 +280,15 @@ class RAGPipeline:
         llm: Runnable | None = None,
         reranker: BaseDocumentCompressor | None = None,
     ) -> None:
-        # Chroma refuses a search for fewer than one result with a builtins
-        # TypeError -- outside the union, and only on the first question, after
-        # every model had loaded. RuntimeError, not ValueError: this runs on the
-        # app's pipeline-load path, whose handler sits below the sidebar.
-        if settings.fetch_k < 1:
-            raise RuntimeError(f"FETCH_K must be at least 1, not {settings.fetch_k}.")
+        # $vectorSearch refuses a limit below 1, and considers ten candidates
+        # per result (langchain-mongodb's oversampling) up to its cap of 10,000
+        # -- but only when the first question is searched, after every model
+        # had loaded. RuntimeError, not ValueError: this runs on the app's
+        # pipeline-load path, whose handler sits below the sidebar.
+        if not 1 <= settings.fetch_k <= _MAX_FETCH_K:
+            raise RuntimeError(
+                f"FETCH_K must be between 1 and {_MAX_FETCH_K}, not {settings.fetch_k}."
+            )
         # Before any model is built: a missing, misnamed or empty index is
         # reported without first loading ~22 GB of weights to find out.
         require_index(settings)
@@ -290,16 +298,15 @@ class RAGPipeline:
         # Reopen the existing store via the shared factory, so the same
         # embedding model that indexed the documents also embeds queries.
         # `embeddings` and `llm` are injectable for tests; production leaves
-        # both as None and gets the local models. `create=False`, so the query
-        # path never creates a collection, even if one vanished since the check.
-        vectorstore = open_store(settings, embeddings, create=False)
+        # both as None and gets the local models. Opening it creates nothing.
+        vectorstore = open_store(settings, embeddings)
         # Retrieve a wide candidate set (fetch_k); the reranker below narrows it
         # to retrieval_k. Filtered to this pipeline's own chunks, like every
         # read at ingest, so a foreign record sharing the collection is never
         # retrieved or cited. `reranker` is injectable for tests alongside
         # `embeddings`/`llm`; production leaves it None and builds the real one.
         self._retriever = vectorstore.as_retriever(
-            search_kwargs={"k": settings.fetch_k, "filter": OWN_CHUNKS}
+            search_kwargs={"k": settings.fetch_k, "pre_filter": OWN_CHUNKS}
         )
         self._reranker = reranker or build_reranker(settings)
 
@@ -318,7 +325,7 @@ class RAGPipeline:
         candidate against the question jointly — narrows it to retrieval_k. Both
         calls are wrapped so a store failure, such as a query-time dimension
         mismatch against a collection built with another model, surfaces as the
-        RuntimeError both frontends catch rather than a raw chromadb exception.
+        RuntimeError both frontends catch rather than a raw pymongo exception.
         The models need no wrapping: their adapters already raise inside the
         union.
 

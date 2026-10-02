@@ -483,8 +483,8 @@ def test_setup_installs_one_provider_for_the_process(
 # while the provider is built, one after. An unknown compression was one until
 # OpenTelemetry 1.45, which logs it and sends uncompressed. Not
 # OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT: the SDK also reads that one as it is imported,
-# which chromadb does, so in the app a malformed one fails before tracing is
-# reached. And the exporter's own refusal, of a credential provider that is not
+# which langsmith (inside langchain-core) does, so in the app a malformed one
+# fails before tracing is reached. And the exporter's own refusal, of a credential provider that is not
 # installed: a RuntimeError already, but one that comes after the provider is
 # built, and names no variable.
 @pytest.mark.parametrize(

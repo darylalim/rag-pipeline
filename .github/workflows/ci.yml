@@ -46,7 +46,10 @@ jobs:
     # test's stacks; a job cancelled before that never names the test. It is
     # also all that ends a run whose stuck worker thread holds the interpreter
     # open, silently, after pytest has reported. GitHub's default is six hours.
-    timeout-minutes: 10
+    # Sized for the store tests: they run against MongoDB's atlas-local image
+    # (about 1 GB to pull) and build a real vector index per test -- about four
+    # minutes on an M2 Max, and a hosted runner is slower.
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -62,6 +65,12 @@ jobs:
 
       - name: Install dependencies
         run: uv sync --locked
+
+      # Pulled as its own step so the pull's time is not charged to the first
+      # store test, and a registry failure names itself. The tag is conftest's
+      # _ATLAS_IMAGE; Docker is preinstalled on ubuntu-latest.
+      - name: Pull the atlas-local image
+        run: docker pull mongodb/mongodb-atlas-local:8.0.17
 
       - name: Run tests
         run: uv run pytest

@@ -156,7 +156,7 @@ def test_the_sweep_covers_a_file_not_yet_added(
 ) -> None:
     """A new module is swept before it is added; what .gitignore names is not.
 
-    Listing only tracked files let a file that builds Chroma inline pass every
+    Listing only tracked files let a file that builds the store inline pass every
     local run until someone happened to `git add` it.
 
     Git's per-repository variables are cleared first. A hook that runs the suite
@@ -298,26 +298,29 @@ def test_gitignore_keeps_secrets_and_your_documents_out_of_git(
 
 VIOLATIONS = [
     pytest.param(
-        "streamlit_app.py", 'store = Chroma(collection_name="x")', id="inline-chroma"
+        "streamlit_app.py",
+        "store = MongoDBAtlasVectorSearch(collection=c, embedding=e)",
+        id="inline-vector-store",
     ),
     pytest.param(
         "streamlit_app.py",
-        "store = Chroma.from_documents(docs, embedding=e)",
-        id="chroma-classmethod-constructor",
+        "store = MongoDBAtlasVectorSearch.from_connection_string(uri, ns, e)",
+        id="vector-store-classmethod-constructor",
     ),
     pytest.param(
         "rag_pipeline/pipeline.py",
-        "client = chromadb.PersistentClient(path=p)",
-        id="inline-persistent-client",
+        "client = pymongo.MongoClient(uri)",
+        id="inline-mongo-client",
     ),
     pytest.param(
-        "streamlit_app.py", "client = chromadb.Client()", id="inline-chroma-client"
+        "streamlit_app.py", "client = AsyncMongoClient(uri)", id="inline-async-client"
     ),
     pytest.param(
         # tests/ is not exempt: a test that needs a collection opens it through
-        # open_store(), so a second, differently configured client never exists.
+        # ingest's own handles, so a second, differently configured client
+        # never exists.
         "tests/test_ingest.py",
-        "client = chromadb.PersistentClient(path=str(tmp_path))",
+        "client = MongoClient(os.environ['MONGODB_URI'])",
         id="store-in-tests",
     ),
     pytest.param(
@@ -343,7 +346,7 @@ VIOLATIONS = [
         # A quote in a comment opens no string. Masked as one, this triple
         # quote blanked everything up to the next, the construction included.
         "streamlit_app.py",
-        '# a """ in a comment\nstore = Chroma(collection_name="x")\n# and """',
+        '# a """ in a comment\nstore = MongoClient(uri)\n# and """',
         id="store-after-a-comment-that-quotes",
     ),
     pytest.param("rag_pipeline/config.py", "import os  # noqa: F401", id="suppression"),
@@ -459,12 +462,18 @@ VIOLATIONS = [
 ALLOWED = [
     pytest.param(
         "rag_pipeline/ingest.py",
-        "client = chromadb.PersistentClient(path=p)\nreturn Chroma(client=client)",
+        "client = MongoClient(uri)\nreturn MongoDBAtlasVectorSearch(collection=c)",
         id="ingest-is-the-factory-home",
     ),
     pytest.param(
-        # Only chromadb's Client is the store; a bare `Client(` belongs to every
-        # HTTP library, so the rule names the module rather than guess.
+        # The container's administration, not the pipeline's store.
+        "tests/conftest.py",
+        "client: MongoClient = MongoClient(atlas_uri)",
+        id="conftest-administers-the-container",
+    ),
+    pytest.param(
+        # Only MongoDB's client is the store; a bare `Client(` belongs to every
+        # HTTP library, so the rule names the class rather than guess.
         "streamlit_app.py",
         "http = httpx.Client(timeout=5)",
         id="another-librarys-client",
@@ -492,7 +501,7 @@ ALLOWED = [
     # Prose describing a rule must not trip it, or the rule cannot be documented.
     pytest.param(
         "streamlit_app.py",
-        "# Never construct Chroma(...) inline -- use open_store().",
+        "# Never construct MongoClient(...) inline -- use open_store().",
         id="comment-describing-store-rule",
     ),
     pytest.param(
@@ -505,10 +514,12 @@ ALLOWED = [
         # indentation hides it: the case that proves multi-line string masking
         # works, and not merely that the single-line kind above does.
         "streamlit_app.py",
-        'HELP = """\nchromadb.PersistentClient(path=p)\n"""',
+        'HELP = """\nMongoClient(uri)\n"""',
         id="store-inside-a-docstring",
     ),
-    pytest.param("README.md", "Never construct Chroma(...) inline.", id="not-python"),
+    pytest.param(
+        "README.md", "Never construct MongoClient(...) inline.", id="not-python"
+    ),
     # Near misses for the suppression rule: none silences a ruff or ty finding.
     pytest.param(
         "streamlit_app.py",
@@ -811,3 +822,14 @@ def test_every_env_var_actually_overrides_its_field(
     changed = getattr(Settings.from_env(), field.name)
 
     assert changed != default, f"{var} did not override {field.name}"
+
+
+def test_ci_pulls_the_image_the_store_tests_run() -> None:
+    """CI pulls conftest's atlas-local image as its own step. A tag changed in
+    one place and not the other would pull an image nothing runs, and the
+    tests would pull theirs again inside the first store test."""
+    from tests.conftest import _ATLAS_IMAGE
+
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+
+    assert f"docker pull {_ATLAS_IMAGE}\n" in workflow

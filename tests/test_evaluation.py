@@ -79,7 +79,7 @@ def test_eval_settings_swap_the_corpus_and_collection_but_keep_the_models(settin
 
     assert evaluated.data_dir == ev.EVAL_CORPUS
     assert evaluated.collection_name == ev.EVAL_COLLECTION != settings.collection_name
-    assert evaluated.persist_dir == settings.persist_dir
+    assert evaluated.mongodb_db == settings.mongodb_db
     assert evaluated.embedding_model == settings.embedding_model
     assert evaluated.chat_model == settings.chat_model
     assert evaluated.retrieval_k == settings.retrieval_k

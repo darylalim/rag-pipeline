@@ -1,8 +1,8 @@
 """Indexing phase: load -> split -> embed -> store.
 
 Run (via ``rag ingest``) whenever the documents in ``data/`` change. The
-expensive embedding step happens here; querying later just reopens the
-persisted Chroma collection.
+expensive embedding step happens here; querying later searches the MongoDB
+Atlas collection and the vector index this builds.
 """
 
 from __future__ import annotations
@@ -12,54 +12,63 @@ import io
 import os
 import sys
 import threading
+import time
 import unicodedata
+import uuid
 from collections import Counter, defaultdict
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path, PurePosixPath
+from typing import Any
 
-import chromadb
-import chromadb.errors
-from chromadb.api.shared_system_client import SharedSystemClient
-from chromadb.config import Settings as ChromaSettings
-from filelock import FileLock
-from langchain_chroma import Chroma
+import bson.errors
+import pymongo.errors
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
+from langchain_mongodb import MongoDBAtlasVectorSearch
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from pymongo import MongoClient, ReturnDocument
+from pymongo.collection import Collection
+from pymongo.operations import SearchIndexModel
 
-from rag_pipeline.config import Settings
+from rag_pipeline.config import Settings, require_env_key
 from rag_pipeline.mlx_models import QwenVLEmbeddings
 
 # File extensions we know how to read into text.
 SUPPORTED_SUFFIXES = {".md", ".txt", ".pdf"}
 
-# The marker every chunk this pipeline writes carries, and the where-filter for
-# every read, delete and search it makes -- so a collection shared with
-# unrelated records is never read, counted, deleted from or retrieved from. A
-# dedicated key matched by equality because Chroma has no `$exists`, and the
-# obvious stand-in, `{"content_hash": {"$ne": ""}}`, also matches records that
-# lack the key: a scoped delete built on it removes other people's documents.
-OWN_CHUNKS: chromadb.Where = {"ingested_by": "rag-pipeline"}
+# Every chunk this pipeline writes carries `ingested_by: "rag-pipeline"`, and
+# every read, delete and search it makes is filtered on it -- so a collection
+# shared with unrelated records is never read, counted, deleted from or
+# retrieved from. A dedicated marker matched by equality rather than "has a
+# content_hash": a foreign record could carry a field of that name, and a
+# scoped delete built on the guess would remove it. Spelled with `$eq` because
+# that is the form both a find and $vectorSearch's pre-filter accept.
+_OWNER = "rag-pipeline"
+OWN_CHUNKS: dict[str, Any] = {"ingested_by": {"$eq": _OWNER}}
 
-# The settings that choose which implementation chromadb builds for each part of
-# a client, pinned to chromadb's own defaults: the in-process store on SQLite.
-# Left to chromadb, each is read from the environment, where a CHROMA_API_IMPL
-# left over from another project swaps the store for an HTTP client -- every
-# ingest and question would then go to whatever server CHROMA_SERVER_HOST names
-# -- and one naming nothing importable fails as a builtins ValueError or
-# ImportError, outside every union the frontends catch. Read from chromadb's
-# model rather than listed here, so a field an upgrade adds is pinned too.
-_PINNED_IMPLS = {
-    name: field.default
-    for name, field in ChromaSettings.model_fields.items()
-    if name.endswith("_impl")
-}
+# The fields of a stored chunk, beside its metadata (which langchain-mongodb
+# writes as top-level fields: `source`, `content_hash`, `ingested_by`).
+_TEXT_KEY = "text"
+_EMBEDDING_KEY = "embedding"
 
-# The collection-metadata key holding the corpus digest (see index_version).
-# Metadata rather than a reserved record, because Chroma cannot store a record
-# without an embedding -- and one with a made-up vector could be retrieved.
-_VERSION_KEY = "rag_index_version"
+# Bookkeeping that is not a chunk -- the corpus digest and the writer lock --
+# lives in a collection of its own beside the chunks, keyed by the chunks'
+# collection name, so it can never be retrieved, counted or deleted as one.
+_META_COLLECTION = "rag_pipeline_meta"
+
+# Not settings: internal bounds on waits for Atlas's own asynchronous work,
+# named so the related values stay one value each.
+_INDEX_POLL_TIMEOUT_S = 180.0
+_INDEX_POLL_INTERVAL_S = 0.25
+# The writer lock's lease. Renewed after every slice of adds, so it only has to
+# outlast one slice (and the index build); a writer that dies holds the lock no
+# longer than this.
+_LOCK_LEASE_S = 300
+_LOCK_POLL_S = 1.0
+# Chunks embedded and written per slice: small enough that an interrupted run
+# keeps most of its progress and the lock is renewed often.
+_ADD_SLICE = 256
 
 
 def build_embeddings(settings: Settings) -> Embeddings:
@@ -81,155 +90,126 @@ def build_embeddings(settings: Settings) -> Embeddings:
     )
 
 
-# chromadb's per-directory System cache is a class-level dict with no lock of
-# its own. Building a client inserts a System, starts it, then reads it back
-# from that dict several times; a clear from another thread in between -- one
-# Streamlit session's pipeline rebuild while another session opens a client --
-# surfaces as a builtins KeyError, or an AttributeError off a System that thread
-# never finished starting, both outside the caught union. Every construction
-# goes through _client() (the store-factory rule) and every clear through
-# reset_store_cache(), so holding this around both is complete.
-_system_cache_lock = threading.Lock()
+# One MongoClient per (URI, timeout) for the life of the process. A client is a
+# connection pool that always reads the server's current state, so -- unlike
+# a cached on-disk store -- it is never stale and must not be rebuilt per
+# pipeline: closing one closes it under every pipeline still using it.
+# reset_store_cache() exists for the tests. The lock makes the lazy create
+# atomic, so two Streamlit sessions cannot each build one and leak the loser.
+_clients: dict[tuple[str, int], MongoClient[dict[str, Any]]] = {}
+_clients_lock = threading.Lock()
 
 
-def _client(settings: Settings) -> chromadb.ClientAPI:
-    """A Chroma client on ``persist_dir``; every one this package opens is built here.
+def _client(settings: Settings) -> MongoClient[dict[str, Any]]:
+    """The process's client for ``MONGODB_URI``; every one is built here.
 
-    Cheap to call repeatedly: chromadb shares one underlying System per persist
-    directory within a process, provided every client asks for it with equal
-    settings (unequal ones are a builtins ValueError, outside every union we
-    catch), which is what routing them all through here guarantees. The settings
-    object is nonetheless new each call, because PersistentClient mutates the
-    one it is handed. Telemetry is off so an in-process store has no reason to
-    reach the network, and ``_PINNED_IMPLS`` keeps it in-process whatever the
-    environment says.
-
-    A failed open empties chromadb's cache before re-raising. chromadb caches a
-    directory's System *before* starting it, so one whose start failed (a
-    corrupt or unreadable ``chroma.sqlite3``) would stay cached half-built: the
-    next client on that path would be handed it, and chromadb's own cleanup of
-    it raises a builtins AttributeError -- in the app, a crash page on every
-    other rerun where the store error belongs.
-
-    Opening a client creates ``persist_dir``, and a database in it, if either is
-    missing -- which is why every read path checks ``_has_store`` first.
+    ``MongoClient(...)`` connects lazily, so a paused cluster, an IP missing
+    from the Atlas access list, or wrong credentials would otherwise surface
+    deep inside an ingest or a question. The ``ping`` on creation reports them
+    where the store is first opened, and a client whose ping failed is not kept.
     """
-    with _system_cache_lock:
-        try:
-            return chromadb.PersistentClient(
-                path=str(settings.persist_dir),
-                settings=ChromaSettings(anonymized_telemetry=False, **_PINNED_IMPLS),
-            )
-        except Exception:
-            SharedSystemClient.clear_system_cache()
-            raise
+    uri = require_env_key("MONGODB_URI", "The index is stored in MongoDB Atlas")
+    key = (uri, settings.mongodb_timeout_ms)
+    with _clients_lock:
+        client = _clients.get(key)
+        if client is None:
+            with store_errors_as_runtime():
+                client = MongoClient(
+                    uri,
+                    serverSelectionTimeoutMS=settings.mongodb_timeout_ms,
+                    appname="rag-pipeline",
+                )
+                try:
+                    client.admin.command("ping")
+                except BaseException:
+                    client.close()
+                    raise
+            _clients[key] = client
+    return client
 
 
-def _has_store(settings: Settings) -> bool:
-    """Whether ``persist_dir`` already holds a Chroma database.
+def _collection(settings: Settings) -> Collection[dict[str, Any]]:
+    """The collection holding the chunks, for bookkeeping that needs no model.
 
-    The read paths' guard, checked before any client opens. The directory alone
-    is not enough: opening a client writes a fresh ``chroma.sqlite3`` into
-    whatever directory it is given, so a read path that checked only for the
-    directory would still create a store in one that exists for another reason
-    -- pre-created, or a PERSIST_DIR pointed at an unrelated folder -- and then
-    report it "empty" rather than missing. The file name is chromadb's own,
-    fixed for every persistent client.
+    Getting a handle creates nothing: MongoDB creates a collection only on its
+    first write, and only ``ingest`` writes. Getting one can still fail -- a
+    database or collection name MongoDB refuses is pymongo's ``InvalidName``,
+    raised here rather than at the first operation -- so it is translated here,
+    where every caller gets its handle.
     """
-    return (settings.persist_dir / "chroma.sqlite3").is_file()
+    client = _client(settings)
+    with store_errors_as_runtime():
+        return client[settings.mongodb_db][settings.collection_name]
 
 
-def _collection(settings: Settings) -> chromadb.Collection:
-    """The raw collection, for bookkeeping that needs no embedding model.
-
-    ``get_collection`` never creates, so a read cannot conjure an empty
-    collection into existence -- a missing one raises
-    ``chromadb.errors.NotFoundError``. No embedding function: chromadb's default
-    is an ONNX model it downloads on first use, and nothing done through this
-    handle should ever embed.
-    """
-    return _client(settings).get_collection(
-        settings.collection_name, embedding_function=None
-    )
+def _meta(settings: Settings) -> Collection[dict[str, Any]]:
+    client = _client(settings)
+    with store_errors_as_runtime():
+        return client[settings.mongodb_db][_META_COLLECTION]
 
 
 def _no_collection(settings: Settings) -> FileNotFoundError:
     """The error for a query against a collection that was never ingested into."""
     return FileNotFoundError(
-        f"Index at {settings.persist_dir} (collection "
-        f"'{settings.collection_name}') is empty -- nothing was ever ingested "
-        "under that name. Run `rag ingest` first, and check COLLECTION_NAME "
-        "matches the one used to ingest."
+        f"No index in MongoDB Atlas at {settings.mongodb_db}."
+        f"{settings.collection_name} -- nothing was ever ingested under that "
+        "name. Run `rag ingest` first, and check MONGODB_DB and COLLECTION_NAME "
+        "match the ones used to ingest."
     )
 
 
 def open_store(
-    settings: Settings, embeddings: Embeddings | None = None, *, create: bool = True
-) -> Chroma:
-    """Open the Chroma collection this pipeline indexes into and searches.
+    settings: Settings, embeddings: Embeddings | None = None
+) -> MongoDBAtlasVectorSearch:
+    """Open the Atlas Vector Search store this pipeline indexes into and searches.
 
-    The store's identity -- (persist directory, collection name, embedding
-    function) -- must match between indexing and querying, so both stages open
-    it through this one factory. ``embeddings`` is injectable for tests;
-    production leaves it None and builds the embedding model.
+    The store's identity -- (``MONGODB_URI``, database, collection, vector
+    index, embedding function) -- must match between indexing and querying, so
+    both stages open it through this one factory. ``embeddings`` is injectable
+    for tests; production leaves it None and builds the embedding model.
 
-    ``create`` is for ingest. Construction is eager -- langchain-chroma gets or
-    creates the collection on the spot -- so the query path passes False, and a
-    ``COLLECTION_NAME`` that was never ingested into is a ``FileNotFoundError``
-    naming the fix rather than a freshly created empty collection. Cosine is set
-    explicitly because Chroma's default space is L2, and a collection keeps the
-    space it was created with. The error translation is here too, rather than
-    left to each caller, because a bad ``COLLECTION_NAME`` raises a
-    ``ChromaError`` *at construction* -- above whatever block a caller wraps its
-    own store ops in.
+    Construction is inert: with ``auto_create_index=False`` langchain-mongodb
+    creates no index and makes no call, so the query path never builds
+    anything. ``ingest`` owns the index (``_ensure_vector_index``).
     """
-    with store_errors_as_runtime():
-        try:
-            return Chroma(
-                client=_client(settings),
-                collection_name=settings.collection_name,
-                embedding_function=embeddings or build_embeddings(settings),
-                collection_configuration={"hnsw": {"space": "cosine"}},
-                create_collection_if_not_exists=create,
-            )
-        except chromadb.errors.NotFoundError as exc:
-            raise _no_collection(settings) from exc
+    return MongoDBAtlasVectorSearch(
+        collection=_collection(settings),
+        embedding=embeddings or build_embeddings(settings),
+        index_name=settings.vector_index_name,
+        text_key=_TEXT_KEY,
+        embedding_key=_EMBEDDING_KEY,
+        relevance_score_fn="cosine",
+        auto_create_index=False,
+    )
 
 
 @contextmanager
 def store_errors_as_runtime() -> Iterator[None]:
-    """Translate Chroma failures into the RuntimeError the frontends catch.
+    """Translate MongoDB failures into the RuntimeError the frontends catch.
 
-    Wraps every store op on both sides: opening the collection, the reads,
-    deletes and adds at ingest, and the search at query. chromadb's exception
-    types sit outside the ``FileNotFoundError | RuntimeError | ValueError`` union
-    both frontends handle, and none belongs in a frontend. Everything becomes a
+    Wraps every store op on both sides: connecting, ingest's reads, deletes,
+    adds and index management, and the search at query. pymongo's and bson's
+    exception types sit outside the ``FileNotFoundError | RuntimeError |
+    ValueError`` union both frontends handle. Everything becomes a
     RuntimeError, never a ValueError -- a store failure while the app loads its
-    pipeline must land in the branch ``streamlit_app.py`` catches *below* its sidebar,
-    keeping the uploader reachable, rather than the ``ValueError`` branch that
-    stops the script above it.
+    pipeline must land in the branch ``streamlit_app.py`` catches *below* its
+    sidebar, keeping the uploader reachable, rather than the ``ValueError``
+    branch that stops the script above it. A malformed ``MONGODB_URI`` is
+    pymongo's ``ConfigurationError``, so it lands there too.
 
-    ``ChromaError`` only, deliberately. chromadb also raises builtins
-    ``ValueError``/``TypeError`` from its own argument checks (an empty ``$in``,
-    a one-clause ``$and``, ``hnsw:space`` passed to ``modify``, a search for
-    fewer than one result), but catching
-    those here would also swallow the ``ValueError`` ingest raises on purpose
-    inside this block -- so the calls below avoid them by construction instead.
+    ``bson.errors.BSONError`` is not a ``PyMongoError``, so it has its own arm.
     Model failures need no arm: the adapters in ``mlx_models`` already raise
     inside the union.
     """
     try:
         yield
-    except chromadb.errors.ChromaError as exc:
-        # The hint keys off the message, not the type: chromadb raises the same
-        # InvalidArgumentError for unrelated validation (a bad COLLECTION_NAME)
-        # that the hint would misdiagnose. The remedy is a new collection, never
-        # a wiped persist directory: a collection keeps its width even after
-        # every row is deleted, and the directory may hold other collections.
+    except (pymongo.errors.PyMongoError, bson.errors.BSONError) as exc:
+        # Keyed off the message, not the type: a vector of the wrong width is an
+        # ordinary OperationFailure, raised at search time.
         hint = (
-            " The collection was built with a different EMBEDDING_MODEL/"
-            "EMBEDDING_DIMENSIONS; set a new COLLECTION_NAME (or delete that "
-            "collection) and run `rag ingest`."
+            " The index was built for a different EMBEDDING_MODEL/"
+            "EMBEDDING_DIMENSIONS; set a new COLLECTION_NAME (or drop that "
+            "collection's vector index) and run `rag ingest`."
             if "dimension" in str(exc).lower()
             else ""
         )
@@ -237,33 +217,22 @@ def store_errors_as_runtime() -> Iterator[None]:
 
 
 def reset_store_cache() -> None:
-    """Drop chromadb's per-process client cache.
+    """Close and drop every client this process opened.
 
-    chromadb shares one System per persist directory within a process, and that
-    System's vector search does not see writes another process made after it
-    was opened: after a terminal ``rag ingest`` it keeps returning chunks that
-    were deleted, or raises ``InternalError`` under a where-filter. Counts, gets
-    and metadata *are* current, so ``index_version`` sees the new corpus while a
-    search still serves the old one. A caller that reopens the store after an
-    out-of-process rebuild -- the app, before building a new pipeline -- must
-    clear this first.
-
-    Dropped, not closed: closing stops the System under every client still
-    holding it -- an outgoing pipeline answering in another session -- whose
-    next call then fails with an ``AttributeError`` outside the caught union. A
-    dropped System merely keeps its old view, and what that view raises is a
-    ``ChromaError``, which ``store_errors_as_runtime`` already turns into a
-    RuntimeError. Tests call this at every boundary to emulate a fresh process.
-
-    A writer must start from a fresh System too, which is why ``ingest`` calls
-    this under its lock. A stale System does not only read the old view, it
-    persists it: its vector index, written back over the other process's, keeps
-    the chunks that process deleted, which then take the places of live ones in
-    every search -- and past a few thousand chunks make every filtered search
-    fail -- for good, since later ingests inherit the damage.
+    For the tests, which call it at every boundary so each starts as a fresh
+    process would. Production never needs it: a client always reads the
+    server's current state, and closing one would break every pipeline still
+    holding it -- an outgoing one answering in another Streamlit session.
     """
-    with _system_cache_lock:
-        SharedSystemClient.clear_system_cache()
+    with _clients_lock:
+        clients = list(_clients.values())
+        _clients.clear()
+    for client in clients:
+        client.close()
+
+
+def _version_id(settings: Settings) -> str:
+    return f"version:{settings.collection_name}"
 
 
 def index_version(settings: Settings) -> str:
@@ -272,27 +241,18 @@ def index_version(settings: Settings) -> str:
     The Streamlit app keys its pipeline cache on this so a `rag ingest` is
     picked up automatically. Reads the digest ingest() stamps over the corpus
     fingerprints (see _write_index_version) -- stable across an unchanged
-    re-ingest, so it does not needlessly bust the cache. Collection metadata is
-    read fresh even through this process's cached client (it is not subject to
-    the stale vector view ``reset_store_cache`` exists for), which is what lets
-    this notice an ingest run from another process at all.
+    re-ingest, so it does not needlessly bust the cache.
 
-    ``""`` means nothing has been ingested yet. Creates nothing -- the database
-    is checked for before a client is opened (which would create one), since
-    the app calls this on every rerun of a fresh checkout. Can raise
-    RuntimeError; the app reads it inside the guard that already catches that.
+    ``""`` means nothing has been ingested yet. A read, so it creates nothing,
+    which matters because the app calls it on every rerun. Can raise
+    RuntimeError -- an unreachable cluster, a missing ``MONGODB_URI`` -- which
+    the app reads inside the guard that already catches it.
     """
-    if not _has_store(settings):
-        return ""
     with store_errors_as_runtime():
-        try:
-            metadata = _collection(settings).metadata or {}
-        except chromadb.errors.NotFoundError:
-            return ""
-    # `.get` plus a type check: metadata edited by hand, or by another tool
-    # sharing the collection, reads as "no version" rather than as a KeyError
-    # that would escape the caught union into a crash page.
-    version = metadata.get(_VERSION_KEY, "")
+        stamp = _meta(settings).find_one({"_id": _version_id(settings)})
+    # `.get` plus a type check: a stamp edited by hand reads as "no version"
+    # rather than as a KeyError escaping the caught union into a crash page.
+    version = (stamp or {}).get("digest", "")
     return version if isinstance(version, str) else ""
 
 
@@ -300,35 +260,40 @@ def require_index(settings: Settings) -> None:
     """Fail with the fix when there is nothing to query, before any model loads.
 
     The query path's guards, here rather than in the pipeline so they can use
-    the raw collection, which needs no embedding model: a fresh checkout should
-    be told to run ``rag ingest`` without first loading ~22 GB of local models
-    to find that out. Three cases, each a ``FileNotFoundError`` naming the fix:
+    the raw collection, which needs no embedding model: a fresh setup should be
+    told to run ``rag ingest`` without first loading ~22 GB of local models to
+    find that out. Three cases, each a ``FileNotFoundError`` naming the fix, and
+    none of them creates anything:
 
-    - no database in the persist directory -- checked first, because opening a
-      client would create one (see ``_has_store``);
     - no collection of that name -- a ``COLLECTION_NAME`` that differs from the
       one ingested into is a *different* collection, and one that silently
       searched empty would answer every question "I don't know";
     - a collection holding none of this pipeline's chunks (emptied, or only
       foreign records) -- scoped like every other read, so unrelated data does
-      not pass for an index.
+      not pass for an index;
+    - no vector index of that name, so no search could find anything.
+
+    An unreachable cluster is the RuntimeError ``_client`` raises.
     """
-    if not _has_store(settings):
-        raise FileNotFoundError(
-            f"No index found at {settings.persist_dir}. Run `rag ingest` first."
-        )
+    collection = _collection(settings)
     with store_errors_as_runtime():
-        try:
-            collection = _collection(settings)
-        except chromadb.errors.NotFoundError as exc:
-            raise _no_collection(settings) from exc
-        ids = collection.get(where=OWN_CHUNKS, limit=1, include=[])["ids"]
-    if not ids:
-        raise FileNotFoundError(
-            f"Index at {settings.persist_dir} (collection "
-            f"'{settings.collection_name}') is empty. Run `rag ingest` first, "
-            "and check COLLECTION_NAME matches the one used to ingest."
-        )
+        if settings.collection_name not in collection.database.list_collection_names(
+            filter={"name": settings.collection_name}
+        ):
+            raise _no_collection(settings)
+        if collection.find_one(OWN_CHUNKS, {"_id": 1}) is None:
+            raise FileNotFoundError(
+                f"The index at {settings.mongodb_db}.{settings.collection_name} "
+                "is empty. Run `rag ingest` first, and check COLLECTION_NAME "
+                "matches the one used to ingest."
+            )
+        if not list(collection.list_search_indexes(settings.vector_index_name)):
+            raise FileNotFoundError(
+                f"{settings.mongodb_db}.{settings.collection_name} has no vector "
+                f"index named '{settings.vector_index_name}'. Run `rag ingest` to "
+                "build it, and check VECTOR_INDEX_NAME matches the one used to "
+                "ingest."
+            )
 
 
 def indexed_sources(settings: Settings) -> set[str]:
@@ -338,20 +303,12 @@ def indexed_sources(settings: Settings) -> set[str]:
     was handed: ``load_documents`` skips a file it cannot read, and one with no
     text -- a scanned PDF has none -- without failing the run, so a file saved
     into ``data_dir`` is not thereby answerable. Read-only like the other read
-    paths: needs no model, creates nothing.
+    paths: needs no model, creates nothing (``distinct`` over a collection that
+    does not exist is simply empty).
     """
-    if not _has_store(settings):
-        return set()
     with store_errors_as_runtime():
-        try:
-            got = _collection(settings).get(where=OWN_CHUNKS, include=["metadatas"])
-        except chromadb.errors.NotFoundError:
-            return set()
-    return {
-        str(metadata["source"])
-        for metadata in got["metadatas"] or []
-        if metadata and "source" in metadata
-    }
+        sources = _collection(settings).distinct("source", OWN_CHUNKS)
+    return {str(source) for source in sources}
 
 
 def _read_pdf(path: Path) -> str:
@@ -517,9 +474,9 @@ def _fingerprint(text: str, settings: Settings) -> str:
     splitter's, because the same file under a new ``CHUNK_SIZE`` is cut into
     different chunks; ``EMBEDDING_MODEL``, because a vector means nothing except
     with respect to the model that produced it; and ``EMBEDDING_DIMENSIONS``,
-    because a truncated vector is a different vector, and a Chroma collection
-    fixes its width at the first insert, so a different-width run must reach the
-    width check in ``ingest`` rather than be skipped as current. Content alone
+    because a truncated vector is a different vector, and a vector index serves
+    one width only, so a different-width run must reach the width checks in
+    ``ingest`` rather than be skipped as current. Content alone
     would let a re-ingest keep vectors the current settings would never have
     produced -- and a changed model is the dangerous half: the chunks still
     *look* current, so the skip is silent and every later query compares
@@ -547,58 +504,276 @@ def _write_index_version(settings: Settings, fresh: dict[str, str]) -> None:
 
     Called on every run and compared before it writes, rather than called only
     when something changed. A run that died after its deletes and adds but
-    before this stamp (killed, or this very ``modify`` failing) leaves every
-    source looking current to the next one, so a stamp gated on "something
-    changed" would never be repaired -- and the app, keyed on it, would keep
-    serving its stale view until restarted. An unchanged corpus still writes
-    nothing.
-
-    ``modify`` replaces the collection's whole metadata dict, so the existing
-    keys are carried over (another tool sharing the collection may keep its own
-    there) -- minus any ``hnsw:*`` key. Those are index settings, which a
-    collection takes from its configuration at creation, and ``modify`` refuses
-    ``hnsw:space`` outright, with a builtins ValueError, even unchanged: a
-    collection created the common LangChain way carries it.
+    before this stamp leaves every source looking current to the next one, so a
+    stamp gated on "something changed" would never be repaired -- and the app,
+    keyed on it, would keep serving its stale pipeline until restarted. An
+    unchanged corpus still writes nothing.
     """
     digest = hashlib.sha256(
         "".join(f"{source}:{h};" for source, h in sorted(fresh.items())).encode("utf-8")
     ).hexdigest()
-    collection = _collection(settings)
-    metadata = collection.metadata or {}
-    if metadata.get(_VERSION_KEY) == digest:
+    meta = _meta(settings)
+    stamp = meta.find_one({"_id": _version_id(settings)})
+    if (stamp or {}).get("digest") == digest:
         return
-    kept = {
-        key: value for key, value in metadata.items() if not key.startswith("hnsw:")
+    meta.replace_one(
+        {"_id": _version_id(settings)},
+        {"_id": _version_id(settings), "digest": digest},
+        upsert=True,
+    )
+
+
+def _index_definition(settings: Settings) -> dict[str, Any]:
+    """The vector index: the embeddings, plus the two fields searches filter on.
+
+    ``ingested_by`` scopes every search to this pipeline's chunks (OWN_CHUNKS);
+    ``source`` lets ``_await_searchable`` probe one source's chunks. $vectorSearch
+    refuses a pre-filter on a field the index does not declare.
+    """
+    return {
+        "fields": [
+            {
+                "type": "vector",
+                "path": _EMBEDDING_KEY,
+                "numDimensions": settings.embedding_dimensions,
+                "similarity": "cosine",
+            },
+            {"type": "filter", "path": "ingested_by"},
+            {"type": "filter", "path": "source"},
+        ]
     }
-    collection.modify(metadata={**kept, _VERSION_KEY: digest})
+
+
+def _check_vector_index(
+    collection: Collection[dict[str, Any]], settings: Settings
+) -> None:
+    """Refuse, before any write, an existing index this pipeline cannot use.
+
+    An index serves vectors of one width, and a search pre-filtered on a field
+    the index does not declare fails. Neither is fixed by re-embedding into the
+    same index, so both are a ValueError naming the way out -- a new
+    COLLECTION_NAME, or that index dropped -- raised while nothing has been
+    deleted yet. Not repaired in place: the index may be another tool's.
+    """
+    found = list(collection.list_search_indexes(settings.vector_index_name))
+    if not found:
+        return
+    definition = found[0].get("latestDefinition") or {}
+    fields = definition.get("fields", [])
+    widths = [f.get("numDimensions") for f in fields if f.get("type") == "vector"]
+    filters = {f.get("path") for f in fields if f.get("type") == "filter"}
+    where = (
+        f"Vector index '{settings.vector_index_name}' on "
+        f"{settings.mongodb_db}.{settings.collection_name}"
+    )
+    fix = (
+        "Set a new COLLECTION_NAME (or drop that index in Atlas) and run `rag ingest`."
+    )
+    if widths != [settings.embedding_dimensions]:
+        raise ValueError(
+            f"{where} indexes {widths or 'no'}-wide vectors, but "
+            f"EMBEDDING_DIMENSIONS={settings.embedding_dimensions}. {fix}"
+        )
+    if not {"ingested_by", "source"} <= filters:
+        raise ValueError(
+            f"{where} does not declare `ingested_by` and `source` as filter "
+            f"fields, which every search filters on. {fix}"
+        )
+
+
+def _ensure_vector_index(
+    collection: Collection[dict[str, Any]], settings: Settings
+) -> None:
+    """Create the collection and its vector index if absent, then wait for it.
+
+    Atlas refuses to create a search index on a collection that does not exist
+    yet, so the collection is created first. Programmatic creation works on the
+    free tier, so ``rag ingest`` stays the whole setup. The build is
+    asynchronous, and a search against an index that is not yet queryable
+    returns no results and no error -- which is why this waits.
+    """
+    database = collection.database
+    if collection.name not in database.list_collection_names(
+        filter={"name": collection.name}
+    ):
+        # CollectionInvalid: created by another writer since the check.
+        with suppress(pymongo.errors.CollectionInvalid):
+            database.create_collection(collection.name)
+    if not list(collection.list_search_indexes(settings.vector_index_name)):
+        collection.create_search_index(
+            model=SearchIndexModel(
+                definition=_index_definition(settings),
+                name=settings.vector_index_name,
+                type="vectorSearch",
+            )
+        )
+    deadline = time.monotonic() + _INDEX_POLL_TIMEOUT_S
+    while time.monotonic() < deadline:
+        found = list(collection.list_search_indexes(settings.vector_index_name))
+        if found and found[0].get("queryable"):
+            return
+        time.sleep(_INDEX_POLL_INTERVAL_S)
+    raise RuntimeError(
+        f"Vector index '{settings.vector_index_name}' did not become queryable "
+        f"within {_INDEX_POLL_TIMEOUT_S:.0f}s."
+    )
+
+
+def _await_searchable(
+    collection: Collection[dict[str, Any]], settings: Settings, chunk_id: str
+) -> None:
+    """Wait until a chunk just written is returned by ``$vectorSearch``.
+
+    Atlas indexes a write asynchronously, so a chunk is in the collection (a
+    find sees it) before a search can find it. A caller that ingests and then
+    asks in the same process -- the app answering about a file just uploaded --
+    depends on this, so the wait lives here rather than on the query path.
+
+    Probes with the chunk's own vector, exactly (no approximation), within its
+    own source and this pipeline's chunks: it is its own nearest neighbour, and
+    asking for every chunk of that source keeps a chunk with an identical
+    vector (repeated text) from crowding it out of the results.
+    """
+    probe = collection.find_one({"_id": chunk_id}, {_EMBEDDING_KEY: 1, "source": 1})
+    if not probe or _EMBEDDING_KEY not in probe:
+        return
+    in_source = collection.count_documents({**OWN_CHUNKS, "source": probe["source"]})
+    stage = {
+        "index": settings.vector_index_name,
+        "path": _EMBEDDING_KEY,
+        "queryVector": probe[_EMBEDDING_KEY],
+        "exact": True,
+        "limit": max(1, min(in_source, 10000)),
+        "filter": {"$and": [OWN_CHUNKS, {"source": {"$eq": probe["source"]}}]},
+    }
+    deadline = time.monotonic() + _INDEX_POLL_TIMEOUT_S
+    while time.monotonic() < deadline:
+        hits = collection.aggregate(
+            [{"$vectorSearch": stage}, {"$project": {"_id": 1}}]
+        )
+        if any(hit["_id"] == chunk_id for hit in hits):
+            return
+        time.sleep(_INDEX_POLL_INTERVAL_S)
+    raise RuntimeError(
+        f"Newly ingested chunks did not become searchable within "
+        f"{_INDEX_POLL_TIMEOUT_S:.0f}s."
+    )
+
+
+class _WriterLock:
+    """A lease on one collection's ingest, held in Atlas, timed by its clock.
+
+    Two writers on one collection at once -- a terminal `rag ingest`
+    overlapping an upload in the app, or two machines -- would each apply its
+    own reading of the index: one deletes what the other just added, and the
+    stamp names a corpus neither wrote. A file lock covered one machine; the
+    store is shared, so the lock is too.
+
+    A lease rather than a flag, so a writer that dies -- killed, or its machine
+    gone -- frees the lock when the lease runs out instead of holding it
+    forever. Its expiry is computed by the server (``$$NOW``), so machines with
+    different clocks agree on it. The holder renews it after every slice of
+    adds, and a renewal that finds the lock taken over -- the lease ran out
+    under a stalled writer -- stops that writer before it writes again.
+    """
+
+    def __init__(self, settings: Settings) -> None:
+        self._meta = _meta(settings)
+        self._id = f"ingest-lock:{settings.collection_name}"
+        self._owner = uuid.uuid4().hex
+        self._where = f"{settings.mongodb_db}.{settings.collection_name}"
+        expiry = {"$add": ["$$NOW", _LOCK_LEASE_S * 1000]}
+        # Free: no lease yet (the upsert just created the document), or one that
+        # ran out. Evaluated against the document as it was before this update,
+        # since every expression in one $set stage reads the input document.
+        free = {"$lt": [{"$ifNull": ["$expires_at", None]}, "$$NOW"]}
+        self._take = [
+            {
+                "$set": {
+                    "owner": {"$cond": [free, self._owner, "$owner"]},
+                    "expires_at": {"$cond": [free, expiry, "$expires_at"]},
+                }
+            }
+        ]
+        self._extend = [{"$set": {"expires_at": expiry}}]
+
+    def try_acquire(self) -> bool:
+        """Take the lock if it is free, in one atomic write; report who holds it.
+
+        The write matches the lock by `_id` alone and decides inside the update
+        whether to take it -- MongoDB refuses `$expr` in an upsert's query, so
+        the "is it free" test cannot go in the filter. A single-document update
+        is atomic, so of two writers racing for a free lock exactly one finds
+        itself the owner afterwards.
+        """
+        held = self._meta.find_one_and_update(
+            {"_id": self._id},
+            self._take,
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+        return bool(held) and held.get("owner") == self._owner
+
+    def acquire(self) -> None:
+        announced = False
+        while not self.try_acquire():
+            if not announced:
+                print(
+                    f"Waiting for another ingest into {self._where} to finish...",
+                    file=sys.stderr,
+                )
+                announced = True
+            time.sleep(_LOCK_POLL_S)
+
+    def renew(self) -> None:
+        renewed = self._meta.update_one(
+            {"_id": self._id, "owner": self._owner}, self._extend
+        )
+        if renewed.matched_count != 1:
+            raise RuntimeError(
+                f"Lost the ingest lock on {self._where}: this ingest stalled for "
+                f"over {_LOCK_LEASE_S}s and another took over. Run `rag ingest` "
+                "again."
+            )
+
+    def release(self) -> None:
+        self._meta.delete_one({"_id": self._id, "owner": self._owner})
 
 
 @contextmanager
-def _writer_lock(settings: Settings) -> Iterator[None]:
-    """Hold the cross-process ingest lock, failing inside the caught union.
-
-    The directory is created first because the lock file lives in it. A
-    PERSIST_DIR that cannot be created or written -- an existing file, a
-    read-only parent or directory -- raises FileExistsError, NotADirectoryError
-    or PermissionError: builtins OSErrors outside the union ``rag ingest``
-    reports, so they would surface as a traceback. Translated here, around only
-    these two steps, so an OSError from inside the critical section keeps its
-    own type (the FileNotFoundError for a missing data_dir among them).
-    RuntimeError rather than ValueError, like every store failure.
-    """
-    lock = FileLock(str(settings.persist_dir / ".ingest.lock"))
-    try:
-        settings.persist_dir.mkdir(parents=True, exist_ok=True)
+def _writer_lock(settings: Settings) -> Iterator[_WriterLock]:
+    """Hold the collection's ingest lock for the body, failing inside the union."""
+    lock = _WriterLock(settings)
+    with store_errors_as_runtime():
         lock.acquire()
-    except OSError as exc:
-        raise RuntimeError(
-            f"Cannot write the index at {settings.persist_dir}: {exc}. Check that "
-            "PERSIST_DIR names a directory this user can write."
-        ) from exc
     try:
-        yield
+        yield lock
     finally:
-        lock.release()
+        with store_errors_as_runtime():
+            lock.release()
+
+
+def _stored_width(collection: Collection[dict[str, Any]]) -> int | None:
+    """The width of the vectors this pipeline's chunks already hold, if any."""
+    rows = collection.aggregate(
+        [
+            {"$match": OWN_CHUNKS},
+            {"$limit": 1},
+            {
+                "$project": {
+                    "_id": 0,
+                    "width": {
+                        "$cond": [
+                            {"$isArray": f"${_EMBEDDING_KEY}"},
+                            {"$size": f"${_EMBEDDING_KEY}"},
+                            None,
+                        ]
+                    },
+                }
+            },
+        ]
+    )
+    return next((row.get("width") for row in rows), None)
 
 
 def ingest(settings: Settings, embeddings: Embeddings | None = None) -> int:
@@ -622,29 +797,25 @@ def ingest(settings: Settings, embeddings: Embeddings | None = None) -> int:
     is filtered to ``OWN_CHUNKS`` -- so a collection shared with unrelated data
     is never read, counted, or deleted from (``ingest`` never wipes anything
     wholesale). Chunks are keyed by a deterministic id
-    (``source:index:content_hash``) and added through langchain-chroma's upsert,
-    so re-adding is an idempotent replace rather than a duplicating append.
+    (``source:index:content_hash``) and written by langchain-mongodb's
+    upsert-replace, so re-adding is idempotent rather than a duplicating append.
     Returns the number of chunks the index now holds, not the number
     re-embedded: it describes the index, which is what makes re-ingesting the
     same corpus report the same number. ``embeddings`` is injectable so tests can
     substitute a lightweight fake; production callers leave it as None.
     """
-    # Built before the lock, and before the persist directory exists: loading
-    # the model takes seconds, which no other writer should wait on, and a model
-    # that is missing or fails to load then fails before anything is written.
-    # Cheap when this process already holds it (the app, after its first load).
+    # Built before the lock: loading the model takes seconds, which no other
+    # writer should wait on, and a model that is missing or fails to load then
+    # fails before anything is written. Cheap when this process already holds
+    # it (the app, after its first load).
     embedder = embeddings or build_embeddings(settings)
 
-    # One writer at a time, across processes: two writers on one persist
-    # directory -- a terminal `rag ingest` overlapping an upload in the app --
-    # corrupt it permanently, and neither sees an error; only every later query
-    # does. Held across the whole read -> delete -> add -> stamp sequence *and*
-    # the read of data_dir that decides it: a run that read data_dir and then
-    # waited here would otherwise apply that older snapshot after the writer it
-    # waited on -- deleting what that writer had just indexed (another session's
-    # upload), and stamping a digest without it. Read under the lock, whichever
-    # run goes last applies the newest data_dir. Readers need no lock.
-    with _writer_lock(settings):
+    # One writer at a time per collection (see _WriterLock), held across the
+    # whole read -> delete -> add -> stamp sequence *and* the read of data_dir
+    # that decides it: a run that read data_dir and then waited here would
+    # otherwise apply that older snapshot after the writer it waited on --
+    # deleting what that writer had just indexed. Readers need no lock.
+    with _writer_lock(settings) as lock:
         documents = load_documents(settings.data_dir)
         if not documents:
             raise ValueError(
@@ -656,7 +827,7 @@ def ingest(settings: Settings, embeddings: Embeddings | None = None) -> int:
             document.metadata["content_hash"] = _fingerprint(
                 document.page_content, settings
             )
-            document.metadata.update(OWN_CHUNKS)
+            document.metadata["ingested_by"] = _OWNER
         # Chunks inherit their parent's metadata, so each carries the source's
         # fingerprint and the scope marker, and the comparison below needs no
         # second pass over the files.
@@ -668,26 +839,23 @@ def ingest(settings: Settings, embeddings: Embeddings | None = None) -> int:
         for chunk in chunks:
             chunks_by_source[chunk.metadata["source"]].append(chunk)
 
-        # A fresh System for the writer (see reset_store_cache): a cached one,
-        # opened before another process's ingest, would write its stale view of
-        # the index back over that ingest's. Here, under the lock, the view is
-        # taken after any other writer has finished.
-        reset_store_cache()
         store = open_store(settings, embedder)
+        collection = _collection(settings)
         with store_errors_as_runtime():
-            # Metadata, not ids alone: the fingerprints are what decide the work.
-            stored = store.get(where=OWN_CHUNKS, include=["metadatas"])
+            # The fingerprints are what decide the work, so they are what is read.
             indexed: dict[str, set[str]] = defaultdict(set)
             chunk_counts: Counter[str] = Counter()
-            for metadata in stored["metadatas"]:
-                source = str(metadata["source"])
-                indexed[source].add(str(metadata["content_hash"]))
+            for row in collection.find(
+                OWN_CHUNKS, {"_id": 0, "source": 1, "content_hash": 1}
+            ):
+                source = str(row.get("source"))
+                indexed[source].add(str(row.get("content_hash")))
                 chunk_counts[source] += 1
 
             # A source is current only if every chunk it should have is there
             # under its present fingerprint. The fingerprint alone would vouch
             # for a source whose add died part-way (a killed process, a failed
-            # batch): its surviving chunks carry the right hash, so it would be
+            # slice): its surviving chunks carry the right hash, so it would be
             # skipped as current -- missing chunks -- on every run after.
             current = {
                 source
@@ -710,15 +878,11 @@ def ingest(settings: Settings, embeddings: Embeddings | None = None) -> int:
                     new_chunks.append(chunk)
                     ids.append(f"{source}:{i}:{chunk.metadata['content_hash']}")
 
-            # Validate the width against the live model and the collection
-            # *before* any write. Chroma fixes a collection's width at its first
-            # insert -- and keeps it after every row is deleted -- so a
-            # different-width model would otherwise fail at the add, after the
-            # delete below had already removed the chunks it was replacing. Only
-            # when there is something to embed, so an unchanged re-ingest still
-            # makes no embedding call at all (this embed_query is the sole
-            # exception, and it runs only on a run about to embed documents
-            # anyway).
+            # Every width check before any write, so a refused run has deleted
+            # nothing. Only when there is something to embed, so an unchanged
+            # re-ingest still makes no embedding call at all (this embed_query
+            # is the sole exception, and it runs only on a run about to embed
+            # documents anyway).
             if new_chunks:
                 probe_dims = len(embedder.embed_query("dimension probe"))
                 if probe_dims != settings.embedding_dimensions:
@@ -727,45 +891,39 @@ def ingest(settings: Settings, embeddings: Embeddings | None = None) -> int:
                         f"{settings.embedding_model} produced {probe_dims}-wide "
                         f"vectors. Set EMBEDDING_DIMENSIONS={probe_dims}."
                     )
-                # len(), not truthiness: chromadb hands back a numpy array here,
-                # and the truth value of one is itself a ValueError.
-                held = store.get(where=OWN_CHUNKS, limit=1, include=["embeddings"])
-                vectors = held["embeddings"]
-                if (
-                    vectors is not None
-                    and len(vectors)
-                    and len(vectors[0]) != probe_dims
-                ):
+                held = _stored_width(collection)
+                if held is not None and held != probe_dims:
                     raise ValueError(
-                        f"Collection '{settings.collection_name}' holds "
-                        f"{len(vectors[0])}-wide vectors, but "
-                        f"{settings.embedding_model} now produces {probe_dims}-wide "
-                        "ones, and a collection cannot change width. Set a new "
-                        "COLLECTION_NAME (or delete that collection) and run "
-                        "`rag ingest`."
+                        f"{settings.mongodb_db}.{settings.collection_name} holds "
+                        f"{held}-wide vectors, but {settings.embedding_model} now "
+                        f"produces {probe_dims}-wide ones, which its vector index "
+                        "cannot serve. Set a new COLLECTION_NAME (or drop that "
+                        "collection) and run `rag ingest`."
                     )
+            _check_vector_index(collection, settings)
 
-            # Guarded, because chromadb rejects an empty `$in` outright rather
-            # than matching nothing.
             if superseded:
-                store.delete(
-                    where={"$and": [OWN_CHUNKS, {"source": {"$in": superseded}}]}
+                collection.delete_many(
+                    {"$and": [OWN_CHUNKS, {"source": {"$in": superseded}}]}
                 )
-            # Added in slices no larger than the backend's own cap. langchain's
-            # add embeds everything and then upserts it in one call, which
-            # chromadb refuses above get_max_batch_size() -- 5461 records, a
-            # few megabytes of text -- so unsliced, a first ingest of a larger
-            # corpus could never succeed, and a re-chunk would fail *after* the
-            # delete above, leaving the index empty. Each slice is written as
-            # soon as it is embedded, so an interrupted run keeps its progress,
-            # and the chunk-count check above re-embeds any source a failure cut
-            # in half.
-            if new_chunks:
-                step = _client(settings).get_max_batch_size()
-                for start in range(0, len(new_chunks), step):
-                    store.add_documents(
-                        new_chunks[start : start + step], ids=ids[start : start + step]
-                    )
+            # Before the adds, so the new chunks are indexed as they land, and
+            # on every run, so an index dropped by hand is rebuilt.
+            _ensure_vector_index(collection, settings)
+            lock.renew()
+
+            # In slices, each embedded and written before the next, renewing
+            # the lock between them: an interrupted run keeps its progress (the
+            # chunk-count check above re-embeds a source a failure cut in
+            # half), and no slice outlasts the lease.
+            for start in range(0, len(new_chunks), _ADD_SLICE):
+                store.add_documents(
+                    new_chunks[start : start + _ADD_SLICE],
+                    ids=ids[start : start + _ADD_SLICE],
+                    batch_size=_ADD_SLICE,
+                )
+                lock.renew()
+            if ids:
+                _await_searchable(collection, settings, ids[-1])
 
             # Last, and on every run; a no-op when the stored digest already
             # matches (see _write_index_version).

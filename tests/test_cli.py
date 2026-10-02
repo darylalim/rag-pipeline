@@ -63,8 +63,7 @@ def test_ingest_reports_where_it_wrote_and_how_much(wired_env, capsys):
     # The location is the actionable half: an ingest that silently wrote to a
     # different directory or collection is the failure a user cannot otherwise
     # see.
-    assert f"'{wired_env.collection_name}'" in out
-    assert str(wired_env.persist_dir) in out
+    assert f"{wired_env.mongodb_db}.{wired_env.collection_name}" in out
 
 
 def test_query_prints_the_answer_then_its_sources(indexed, capsys, canned_answer):
@@ -195,7 +194,8 @@ def test_a_variable_refused_at_import_is_an_error_not_a_traceback(fresh_interpre
     """ValueError again, raised by an import rather than by `from_env`.
 
     The OpenTelemetry SDK refuses a malformed OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT as
-    it is imported, which chromadb does whether or not tracing is on -- so the
+    it is imported, which langsmith (inside langchain-core) does whether or not
+    tracing is on -- so the
     command's own imports raise it, and they are inside main()'s try only
     because they are lazy. In a fresh interpreter, because this one has long
     since imported the SDK and would never read the variable again.
@@ -232,32 +232,40 @@ def test_a_failure_partway_through_the_stream_terminates_the_line(
     assert captured.err.startswith("Error: ")
 
 
-def test_an_unusable_persist_dir_is_an_error_not_a_traceback(
-    wired_env, capsys, monkeypatch, tmp_path
+@pytest.mark.parametrize(
+    ("uri", "message"),
+    [
+        pytest.param(None, "MONGODB_URI is not set", id="missing"),
+        pytest.param(
+            "mongodb://127.0.0.1:1/?directConnection=true",
+            "Vector store request failed",
+            id="unreachable",
+        ),
+    ],
+)
+def test_an_unusable_cluster_is_an_error_not_a_traceback(
+    wired_env, capsys, monkeypatch, uri, message
 ):
-    """The filesystem's own errors on PERSIST_DIR, as the one-line message.
-
-    A regular file where the directory should be: creating it is a
-    FileExistsError, an OSError outside the union main() catches, so it must be
-    translated before it gets here -- and name the setting, since the path
-    alone does not say which one to fix.
-    """
-    not_a_dir = tmp_path / "not-a-dir"
-    not_a_dir.write_text("a file", encoding="utf-8")
-    monkeypatch.setenv("PERSIST_DIR", str(not_a_dir))
+    """No MONGODB_URI, or a cluster that cannot be reached -- paused, or this
+    IP missing from its access list -- as the one-line message."""
+    if uri is None:
+        monkeypatch.delenv("MONGODB_URI")
+    else:
+        monkeypatch.setenv("MONGODB_URI", uri)
+        monkeypatch.setenv("MONGODB_TIMEOUT_MS", "200")
 
     assert cli.main(["ingest"]) == 1
 
     err = capsys.readouterr().err
     assert err.startswith("Error: ")
     assert "Traceback" not in err
-    assert "PERSIST_DIR" in err
+    assert message in err
 
 
 def test_a_fetch_k_below_one_is_an_error_not_a_traceback(indexed, capsys, monkeypatch):
-    """Chroma rejects a search for no results with a builtins TypeError, raised
-    only when the first question is asked; the pipeline refuses the setting
-    up front instead, inside the union."""
+    """$vectorSearch rejects a search for no results, and only when the first
+    question is asked; the pipeline refuses the setting up front instead,
+    inside the union."""
     monkeypatch.setenv("FETCH_K", "0")
 
     assert cli.main(["query", "anything"]) == 1
@@ -315,8 +323,6 @@ def test_settings_come_from_the_environment_not_a_literal(
     Asserted through `rag ingest`'s own output rather than by reading Settings,
     so it covers the wiring from environment to command and not just `from_env`.
     """
-    elsewhere = wired_env.persist_dir.parent / "moved"
-    monkeypatch.setenv("PERSIST_DIR", str(elsewhere))
     monkeypatch.setenv("COLLECTION_NAME", "a_distinctive_collection")
 
     assert cli.main(["ingest"]) == 0
@@ -325,16 +331,13 @@ def test_settings_come_from_the_environment_not_a_literal(
     # `from_env()` call -- that would derive both sides from one source and pass
     # even if the command ignored the environment entirely.
     out = capsys.readouterr().out
-    assert str(elsewhere) in out
-    assert "a_distinctive_collection" in out
-    # And the write landed there, not merely the message: that collection at
-    # that path now carries a version stamp, and the fixture's own location was
-    # never touched.
-    moved = dataclasses.replace(
-        wired_env, persist_dir=elsewhere, collection_name="a_distinctive_collection"
-    )
+    assert f"{wired_env.mongodb_db}.a_distinctive_collection" in out
+    # And the write landed there, not merely the message: that collection now
+    # carries a version stamp, and the fixture's own was never created.
+    moved = dataclasses.replace(wired_env, collection_name="a_distinctive_collection")
     assert ingest_mod.index_version(moved)
-    assert not wired_env.persist_dir.exists()
+    names = ingest_mod._collection(moved).database.list_collection_names()
+    assert wired_env.collection_name not in names
 
 
 def test_a_question_sets_up_tracing_and_an_ingest_does_not(indexed, monkeypatch):
@@ -366,7 +369,7 @@ def test_a_question_sets_up_tracing_and_an_ingest_does_not(indexed, monkeypatch)
 # --help` and a usage error load cli.py and then exit.
 # `anthropic` is the eval command's alone (its judge): `rag --help`, `rag ingest`
 # and `rag query` have no use for it.
-HEAVY = ("chromadb", "langchain_chroma", "mlx", "mlx_lm", "anthropic")
+HEAVY = ("pymongo", "langchain_mongodb", "mlx", "mlx_lm", "anthropic")
 
 # What tracing loads once it is on: the LangChain instrumentation and the span
 # exporter. Off, the pipeline carries the OpenTelemetry API alone.
@@ -400,7 +403,8 @@ def heavy_modules_loaded() -> dict:
     In a subprocess because this suite has already imported all of it; the
     question is what a fresh interpreter loads, which is the only place the
     difference is observable. Module-scoped because it is the same answer for
-    every test that asks, and a fresh interpreter importing chromadb is not free.
+    every test that asks, and a fresh interpreter importing the store stack is
+    not free.
     """
     result = subprocess.run(
         [
@@ -417,7 +421,7 @@ def heavy_modules_loaded() -> dict:
 
 
 def test_importing_cli_does_not_load_the_heavy_stack(heavy_modules_loaded):
-    """`import rag_pipeline.cli` must not drag in chromadb or MLX.
+    """`import rag_pipeline.cli` must not drag in the store stack or MLX.
 
     The behavioral form of what used to be a text rule matching import
     spellings in cli.py. Asserting on `sys.modules` is strictly stronger: it
@@ -433,7 +437,7 @@ def test_importing_cli_does_not_load_the_heavy_stack(heavy_modules_loaded):
     assert not heavy_modules_loaded["cli"], (
         f"importing cli.py loaded: {heavy_modules_loaded['cli']}"
     )
-    assert {"chromadb", "langchain_chroma"} <= set(heavy_modules_loaded["pipeline"])
+    assert {"pymongo", "langchain_mongodb"} <= set(heavy_modules_loaded["pipeline"])
 
 
 def test_importing_the_pipeline_does_not_load_mlx(heavy_modules_loaded):

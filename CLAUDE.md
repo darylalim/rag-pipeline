@@ -7,13 +7,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 uv sync                              # install deps (creates .venv; MLX only on macOS)
 uvx --from huggingface_hub hf download <model id>   # once per model (README Setup lists the three); loading never downloads
-uv run rag ingest                    # embed data/ into the Chroma collection under chroma_db/
+uv run rag ingest                    # embed data/ into the Atlas collection (needs MONGODB_URI)
 uv run rag query "your question"     # ask from the terminal (loads all three models first)
 uv run rag eval                      # score the pipeline on evals/questions.json (needs LANGSMITH_API_KEY + ANTHROPIC_API_KEY; indexes evals/corpus itself; ~20 min, ~$1-2)
 uv run rag eval --save-baseline      # ...and save the scores as evals/baseline.json
 uv run streamlit run streamlit_app.py # chat UI over the same pipeline
 uv run streamlit run streamlit_app.py --server.fileWatcherType auto   # while editing streamlit_app.py (config.toml turns the watcher off)
-uv run pytest                        # full suite (fakes + in-process Chroma; no models, network, Docker or secrets)
+uv run pytest                        # full suite (fakes + atlas-local in Docker; no models, network or secrets; ~4 min)
 uv run pytest -m models              # live tests against the real models (Apple Silicon + models downloaded; ~1 min)
 uv run pytest tests/test_config.py::test_defaults   # single test
 uv run pytest -k idempotent -v                      # by keyword
@@ -78,7 +78,7 @@ Two phases with a hard boundary between them, one shared config object, and the
 local models behind LangChain's interfaces:
 
 ```
-ingest  (rag_pipeline/ingest.py)      load → split → embed → store (Chroma, under PERSIST_DIR)
+ingest  (rag_pipeline/ingest.py)      load → split → embed → store (MongoDB Atlas + vector index)
 query   (rag_pipeline/pipeline.py)    embed question → search → rerank → stuff prompt → local LLM
 models  (rag_pipeline/mlx_models.py)  QwenVLEmbeddings · QwenVLReranker · MLXChatModel, over MLX
 tracing (rag_pipeline/tracing.py)     optional: each question as one trace, to a self-hosted Phoenix
@@ -87,8 +87,8 @@ eval    (rag_pipeline/evaluation.py)  rag eval: evals/questions.json as a LangSm
 
 `Settings` (`config.py`) is a frozen dataclass built via `Settings.from_env()`.
 Both frontends — `rag_pipeline/cli.py` and `streamlit_app.py` — construct it the same way,
-which is what keeps them agreeing on the persist directory and collection, the
-models, and chunking. Every setting is a field with a literal default.
+which is what keeps them agreeing on the database, collection and vector
+index, the models, and chunking. Every setting is a field with a literal default.
 
 Credentials are not settings. A key has no literal default to document, and a
 field is a value the sidebar displays and a traceback prints, so no key is ever
@@ -170,21 +170,18 @@ through the `Judge` callable; nothing in the suite calls either service.
 `build_embeddings()` and `open_store()` are defined in `ingest.py`; `pipeline.py`
 imports `open_store()`, never the reverse, and reaches `build_embeddings()` only
 through it. This is deliberate: vectors from different
-embedding models are not comparable, and the store's identity is (persist
-directory, collection name, embedding function). Indexing and querying must
-therefore go through one factory each. **Never construct `Chroma(...)`,
-`chromadb.PersistentClient(...)` or `QwenVLEmbeddings(...)` inline** — route
-through these factories. `open_store()` returns the langchain `Chroma`;
-bookkeeping that needs no model goes through `_collection()`, the raw collection
-with no embedding function (chromadb's default is an ONNX model it downloads on
-first use). `_client()` is the one `PersistentClient` construction, with a
-*fresh* `ChromaSettings(anonymized_telemetry=False)` each call: `PersistentClient`
-mutates the settings object it is handed, and two clients on one directory with
-unequal settings are a builtins `ValueError`. Every `*_impl` field in it is
-pinned to chromadb's default (`_PINNED_IMPLS`, read from its model): chromadb
-otherwise takes them from the environment, where a stray `CHROMA_API_IMPL`
-turns the store into an HTTP client for whatever server `CHROMA_SERVER_HOST`
-names (`test_the_environment_cannot_move_or_break_the_store`).
+embedding models are not comparable, and the store's identity is (`MONGODB_URI`,
+database, collection, vector index, embedding function). Indexing and querying
+must therefore go through one factory each. **Never construct
+`MongoDBAtlasVectorSearch(...)`, `MongoClient(...)` or `QwenVLEmbeddings(...)`
+inline** — route through these factories (`tests/conftest.py`'s administration
+of the test container is the one exemption). `open_store()` returns the langchain
+`MongoDBAtlasVectorSearch`, constructed with `auto_create_index=False` so the
+query path creates nothing; bookkeeping that needs no model goes through
+`_collection()` and `_meta()`, the raw pymongo handles. Both translate pymongo's
+`InvalidName` — raised for a refused database or collection name when the
+*handle* is made, before any operation — so they wrap their own construction in
+`store_errors_as_runtime`.
 
 The reranker is the deliberate exception: `build_reranker()` lives in
 `pipeline.py`, not here. Reranking is query-only — it has no ingest-side
@@ -314,57 +311,44 @@ fills it only from a `model`/`model_name` field; without it the LLM span names n
 model. `tests/test_tracing.py` asserts the trace in-process and the wire format
 in a subprocess, against a stand-in collector that runs inside the subprocess.
 
-### Chroma's per-process System (the stale-view hazard)
+### One MongoDB client per process
 
-chromadb shares one System per persist directory per process, and that System's
-*vector search* does not see writes another process made after it was opened:
-after a terminal `rag ingest` it keeps returning chunks that were deleted, or
-raises `InternalError: Error finding id` under a where-filter. Counts, gets and
-collection metadata *are* current, so every check but an actual search looks
-fine. `reset_store_cache()` is `SharedSystemClient.clear_system_cache()` — it
-*drops* the cached System, never closes it: closing stops the System under every
-client still holding it (an outgoing pipeline answering in another session),
-whose next call is then a builtins `AttributeError` outside the caught union. A
-dropped System merely keeps its old view, and what that raises is a
-`ChromaError`, which `store_errors_as_runtime` turns into a RuntimeError.
-Callers (`grep reset_store_cache`):
+`_client()` is the one `MongoClient` construction, kept in `_clients` keyed by
+(`MONGODB_URI`, `MONGODB_TIMEOUT_MS`) under `_clients_lock`, so concurrent first
+opens from several Streamlit sessions build one client
+(`test_concurrent_first_opens_share_one_client`). It reads `MONGODB_URI`
+through `require_env_key` (a credential, not a setting) and pings on creation,
+because pymongo connects lazily: a paused cluster or an IP missing from the
+access list would otherwise surface deep inside an ingest or a question. A
+client whose ping failed is closed and not kept, so every later attempt reports
+the same failure (`test_an_unusable_cluster_is_a_runtime_error_each_time`).
 
-- `streamlit_app.py`'s `load_pipeline` calls it before every build, or the fresh pipeline
-  would answer from the old index while its cache key already names the new one.
-  `max_entries=1` for the same reason: a second slot would keep a pipeline opened
-  before the last reset, and a corpus that changes and changes back mints its
-  old key again.
-- `ingest()` calls it under its lock, before opening the store. A stale System
-  does not only *read* the old view: written through, it saves its vector index
-  back over the other process's, keeping the chunks that process deleted for
-  good — short searches, and past a few thousand chunks "Error finding id" on
-  every filtered one. (The app's upload ingest runs in the sidebar, above the
-  reset in `load_pipeline`, so this is the one that covers it.)
-- `tests/conftest.py` calls it autouse at every test boundary.
-- `test_ingest.py`, `test_pipeline.py`, `test_cli.py` and `test_models_live.py`
-  call it directly between ingests to emulate a fresh CLI process (`test_streamlit_app.py`
-  only wraps it, to count the app's resets).
-
-Every construction (`_client()`) and every clear (`reset_store_cache()`) holds
-one module lock, `_system_cache_lock`, because chromadb's System cache has none
-of its own; and `_client()` empties that cache when an open fails, so a
-half-built System is never handed to the next open. The comment on the lock and
-`_client`'s docstring give the builtins errors each prevents — keep both.
+A client is a connection pool that always reads the server's current state, so
+**nothing in production resets it**. That inverts the Chroma era's rule, whose
+cached on-disk view had to be dropped before every pipeline build:
+`reset_store_cache()` now *closes* the clients, and closing one breaks every
+pipeline still holding it — an outgoing pipeline answering in another session.
+So `load_pipeline` and `ingest()` never call it
+(`test_no_pipeline_build_closes_the_shared_store_client`,
+`test_an_ingest_leaves_a_held_store_searching`), and a held store sees another
+process's ingest with no reset at all
+(`test_a_store_held_by_this_process_sees_another_processs_ingest`). Only the
+tests call it, at every boundary (conftest's `_reset_store_client`), so each
+starts as a fresh process would.
 
 The Streamlit cache key is `index_version()` (a `str`) — a SHA-256 digest over
-the corpus fingerprints that `ingest()` stamps into the *collection metadata*
-(`rag_index_version`), because Chroma cannot store a record without an
-embedding, and one with a made-up vector could be retrieved. Metadata reads are
-fresh across processes even through a cached System, which is what lets the app
-notice a `rag ingest` at all. It changes on exactly the events an edit, add, or
-removal changes and no others, so the running app picks up a `rag ingest`
+the corpus fingerprints that `ingest()` stamps into a document of the
+`rag_pipeline_meta` collection (`_META_COLLECTION`, keyed `version:<collection>`),
+beside the chunks rather than among them, so nothing that reads, counts, deletes
+or searches chunks can meet it. It changes on exactly the events an edit, add,
+or removal changes and no others, so the running app picks up a `rag ingest`
 without a restart and an unchanged re-ingest does not needlessly bust the cache.
 `ingest()` reconciles it on *every* run — compared, and written only when it
 differs — because a run that died after its writes but before the stamp leaves
 every source looking current, and a stamp written only "when something changed"
 would then never be repaired. It returns `""` when nothing has been ingested,
-and creates nothing (every read path checks `_has_store()` first; see Gotchas),
-which matters because the app calls it on every rerun of a fresh checkout.
+and creates nothing (finds and `distinct` over a missing collection are simply
+empty), which matters because the app calls it on every rerun.
 
 ### Ingest is incremental, and scoped — never a wholesale wipe
 
@@ -372,10 +356,11 @@ which matters because the app calls it on every rerun of a fresh checkout.
 `data_dir` right now. It gets there by re-embedding only what changed: each
 chunk carries its source's `content_hash` in its metadata, and a source whose
 hash still matches keeps the vectors it has. Chunks are keyed by a deterministic
-id (`source:index:content_hash`) and added through langchain-chroma's
-`add_documents(ids=)`, which upserts — a raw `collection.add` would silently keep
-the *old* document under an existing id — so re-adding is an idempotent replace,
-not a duplicating append.
+id (`source:index:content_hash`) and added through langchain-mongodb's
+`add_documents(ids=)`, which writes `ReplaceOne(..., upsert=True)` — a raw
+`insert_many` would refuse an existing id — so re-adding is an idempotent
+replace, not a duplicating append. Its metadata is written as top-level fields
+(`source`, `content_hash`, `ingested_by`) beside `text` and `embedding`.
 
 **The state after the run is the contract, not the work skipped.** Every caller
 depends on it — the app rebuilds after an upload and expects the rest of the
@@ -389,43 +374,60 @@ up without being announced. Consequences that are easy to get wrong:
   and `CHUNK_OVERLAP` as well as the text, because all four change what the stored
   vectors *are*. Dropping the model or dimensions is the dangerous case: the
   chunks still look current, so the skip is silent.
-- A Chroma collection fixes its width at the first insert and keeps it after
-  every row is deleted, so a width change would fail at the add — *after* the
-  delete had removed the chunks it was replacing. Hence two checks before any
-  write, only when there is something to embed, each a `ValueError` naming its
-  own fix. First, the live model's probe width against `EMBEDDING_DIMENSIONS`:
-  set it to the model's width. Then that width against the width this
-  pipeline's chunks already hold: a new `COLLECTION_NAME`, never a wiped persist
-  directory (it may hold other collections). The second reads only `OWN_CHUNKS`,
-  so a collection whose width was set by foreign records, or whose own chunks
-  are all gone, gives it nothing to compare: there the add itself fails, as
-  `store_errors_as_runtime`'s `RuntimeError` with the same `COLLECTION_NAME`
-  hint — harmlessly, since with none of our chunks indexed nothing was deleted
-  first.
+- A vector index serves one width (`numDimensions`), and MongoDB itself stores
+  a vector of any width, so a mismatch would surface only at search time —
+  after a re-ingest had deleted the chunks it was replacing. Hence three checks
+  before any write, each a `ValueError` naming its own fix. When there is
+  something to embed: the live model's probe width against
+  `EMBEDDING_DIMENSIONS` (set it to the model's width), then that width against
+  what this pipeline's chunks already hold (`_stored_width`, scoped to
+  `OWN_CHUNKS`: a new `COLLECTION_NAME`). On every run: the existing index's own
+  definition (`_check_vector_index`) — its width, and that it declares
+  `ingested_by` and `source` as filter fields, since `$vectorSearch` refuses a
+  pre-filter on an undeclared field. An index this pipeline did not make is
+  refused, never rebuilt in place: it may be another tool's. A search at the
+  wrong width is Atlas's own `OperationFailure`, which `store_errors_as_runtime`
+  turns into a `RuntimeError` with the `COLLECTION_NAME` hint.
+- `_ensure_vector_index` runs on every run, after the deletes and before the
+  adds: it creates the collection (Atlas refuses a search index on a collection
+  that does not exist) and the index if either is missing — so an index dropped
+  by hand is rebuilt — then waits until it is queryable. After the adds,
+  `_await_searchable` waits until a written chunk is returned by an exact
+  `$vectorSearch` within its own source: Atlas indexes writes asynchronously,
+  and the app answers about an upload on the same run that ingested it. Both
+  waits poll every `_INDEX_POLL_INTERVAL_S` (0.25 s); it sets the suite's run
+  time, since every store test builds an index.
 - Every read, delete **and search** is scoped to `OWN_CHUNKS`
   (`{"ingested_by": "rag-pipeline"}`, a marker every chunk carries), so a
   collection shared with unrelated records is never read, counted, deleted from
   or cited — the document-level form of "never a wipe". A dedicated key matched
-  by equality, because Chroma has no `$exists`, and the obvious stand-in,
+  by equality rather than a guess at what only our chunks have: the obvious one,
   `{"content_hash": {"$ne": ""}}`, also matches records that *lack* the key: a
-  delete built on it removed a foreign document. Deletes are
+  delete built on it removed a foreign document. `OWN_CHUNKS` is spelled
+  `{"ingested_by": {"$eq": "rag-pipeline"}}` because that form serves both a
+  find and `$vectorSearch`'s `pre_filter`. Deletes are
   `{"$and": [OWN_CHUNKS, {"source": {"$in": superseded}}]}`, issued only when
   `superseded` is non-empty.
-- The whole read → delete → add → stamp sequence runs under a `FileLock` on
-  `persist_dir/.ingest.lock` — and so does the read of `data_dir` that decides
-  it. Two writers on one persist directory at once — a terminal `rag ingest`
-  overlapping an upload in the app — corrupt it permanently, and neither writer
-  sees an error; only every later query does. And a run that read `data_dir`
-  before waiting would apply that older snapshot after the writer it waited on,
-  deleting what that writer had just indexed. The embedder is built *before* the
-  lock (a multi-second load no other writer should wait on). `_writer_lock()`
-  turns the filesystem's own errors creating the directory and the lock file
-  (`FileExistsError`, `PermissionError`, …) into `RuntimeError` — around those
-  two steps only, so an `OSError` from inside keeps its type. Readers need no
-  lock.
-- New chunks are added in slices of `get_max_batch_size()` (5461 locally).
-  langchain's `add_documents` upserts everything in one call, which chromadb
-  refuses above that — a few MB of text — *after* the delete had run. Sliced,
+- The whole read → delete → add → stamp sequence runs under `_WriterLock` — and
+  so does the read of `data_dir` that decides it. Two writers on one collection
+  at once — a terminal `rag ingest` overlapping an upload in the app, or two
+  machines — would each apply its own reading of the index, one deleting what
+  the other just added. And a run that read `data_dir` before waiting would
+  apply that older snapshot after the writer it waited on. The lock is a lease
+  document in `rag_pipeline_meta` (`ingest-lock:<collection>`), so it binds
+  every process and machine; its expiry is computed by the server (`$$NOW`),
+  so machines whose clocks differ agree on it. Acquiring is one
+  `find_one_and_update(upsert=True)` matched by `_id` alone, whose update
+  pipeline takes the lock only if it is missing or expired — MongoDB refuses
+  `$expr` in an upsert's query, so the "is it free" test cannot go in the
+  filter — and the owner it returns says who won. The holder renews the lease
+  (`_LOCK_LEASE_S`, 300 s) after every slice of adds; a renewal that finds the
+  lock taken over (it stalled past the lease) raises before writing again, and
+  a writer that dies frees the lock when its lease runs out. The embedder is
+  built *before* the lock (a multi-second load no other writer should wait on).
+  Readers need no lock.
+- New chunks are added in slices of `_ADD_SLICE` (256), each embedded and written
+  before the next, renewing the lock between them: no slice outlasts the lease,
   an interrupted run keeps its progress, and the chunk-count check re-embeds a
   source a failure cut in half. `changed` is sorted, so the same corpus goes
   through the embedder in the same batches — and to the same bits — every run.
@@ -455,7 +457,9 @@ LLM should thread these through rather than constructing them unconditionally.
 Injection is a convention, so `conftest.py` backs it with autouse guards, each
 pinned by `tests/test_offline_guard.py` so one that loosens reads as a failure: `_no_real_models` makes MLX unimportable (**the one that catches a
 forgotten injection** — with the models cached, a network block alone would let
-it load them), `_offline` blocks every socket, `_no_tracing` keeps Phoenix and
+it load them), `_no_real_store` removes the developer's real `MONGODB_URI`,
+`_offline` blocks every socket to a host other than this machine (the atlas-local
+container is on loopback), `_no_tracing` keeps Phoenix and
 LangSmith off whatever `.env` says, and `_no_tracer_left_on` fails a test that
 left tracing on (which `_offline` cannot see: the tracing stack swallows the
 socket error). How each works, and which fixture a new test takes, is in
@@ -506,8 +510,8 @@ because they are only observable at the frontend:
   starts from a built index would never enter.
 - A browser-supplied name cannot escape `data_dir` through the widget that
   delivers it.
-- Every pipeline build starts from a fresh store client, so the app never
-  answers from a stale view of an index another process rebuilt.
+- No pipeline build, upload or rerun closes the shared store client, which
+  another session's pipeline may still be searching through.
 - A later rerun does not silently re-index. This one is **counted, not
   displayed**: `st.file_uploader` re-reports its files on every rerun, so
   re-indexing on sight would rebuild the whole corpus once per chat message —
@@ -524,18 +528,16 @@ because they are only observable at the frontend:
   defaults too: a stale model id left in `.env` fails as "not in the Hugging
   Face cache".
 - `cli.py` imports `ingest`/`pipeline` lazily inside the command functions. This
-  is load-bearing: importing them pulls in chromadb (a multi-second cold import)
-  and the langchain stack, so `rag --help` and a usage error stay cheap. Keep
+  is load-bearing: importing them pulls in pymongo, langchain-mongodb and the
+  langchain stack, so `rag --help` and a usage error stay cheap. Keep
   those imports local — which also keeps them inside `main()`'s `try`, the one
   place a library's import-time `ValueError` (next) is reported.
 - Some libraries read settings from the environment once, as they are first
-  imported, and refuse a malformed one with a `ValueError` (for chromadb,
-  pydantic's subclass of it) — tracing on or off. chromadb imports the
-  OpenTelemetry SDK, whose `opentelemetry.sdk.trace` validates
-  `OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT`, and builds its own pydantic `Settings()` in
-  its `__init__` (from the environment, and from a `.env` in the working
-  directory); numpy, langsmith and huggingface_hub (through transformers, on a
-  Mac) each `int()` a variable or two of theirs. So `streamlit_app.py` imports the
+  imported, and refuse a malformed one with a `ValueError` — tracing on or off.
+  langsmith, inside langchain-core, imports the OpenTelemetry SDK, whose
+  `opentelemetry.sdk.trace` validates `OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT`; numpy,
+  langsmith and huggingface_hub (through transformers, on a Mac) each `int()` a
+  variable or two of theirs (`HF_HUB_ETAG_TIMEOUT`, say). So `streamlit_app.py` imports the
   pipeline inside its `Settings` guard, not at the top of the file, where any of
   these was a traceback in place of the whole page. It does so once per process,
   through the cached `_import_failure()`, which keeps a failure as surely as a
@@ -562,25 +564,26 @@ because they are only observable at the frontend:
   no `<think>` tag to strip. `MLXChatModel` passes `enable_thinking=False`;
   filtering afterwards cannot work. mlx-lm's `stream_generate` also defaults to
   `max_tokens=256`, so it is passed explicitly.
-- Chroma creates `persist_dir`, and `chroma.sqlite3` in it, when a client opens,
-  so every read path checks `_has_store()` — for `chroma.sqlite3`, not merely
-  the directory — first; `get_collection` (never `get_or_create`) on reads, so a
-  query cannot conjure an empty collection.
-  chromadb raises *builtins* `ValueError`/`TypeError` from its own argument
-  checks — an empty `$in`, a one-clause `$and`, `hnsw:space` passed to
-  `modify`, a `None` in a `where` filter, a search for fewer than one result
-  (hence `RAGPipeline`'s `FETCH_K` check) — which the code avoids by
-  construction rather than catching (catching `ValueError` would swallow
-  ingest's own width errors). A `None` metadata *value* is the silent case: a
-  raw `add` refuses it, but `upsert` — which `add_documents` uses — drops the
-  key, so a chunk whose `ingested_by` came out `None` would fall outside
-  `OWN_CHUNKS` for good. `get(include=["embeddings"])` returns a numpy array: use `len()`,
-  never truthiness. `modify(metadata=)` *replaces* the dict, so
-  `_write_index_version` merges the existing keys, minus `hnsw:*`.
-- The stale-view and concurrent-writer hazards above are Chroma's two sharp
-  edges; both are silent until a later query, so don't remove
-  `reset_store_cache()` from `load_pipeline` or from `ingest()`, or the ingest
-  `FileLock`.
+- Atlas Vector Search is **asynchronous** twice over, and each is silent: an index
+  is queryable some time after it is created, and a write is searchable some
+  time after it lands — until then a search returns nothing, with no error.
+  `ingest()` waits out both (see the ingest section). A test that writes a
+  document directly and then asserts a search does *not* return it must first
+  see an unscoped search return it, or it passes only because the index has not
+  caught up (`test_retrieve_never_returns_a_foreign_document` does).
+- MongoDB refuses `$expr` in an upsert's query (code 224): a conditional upsert
+  decides inside its update pipeline instead, as `_WriterLock.try_acquire` does.
+  And atlas-local's `update_search_index` treats a definition as a full-text one
+  ("mappings is required"), so a test that needs a different vector index drops
+  the old one (asynchronously — wait for it to go) and creates the new one.
+- Reads create nothing: a find, `distinct` or `list_collection_names` on a
+  missing collection is simply empty, and MongoDB creates a collection only on
+  its first write — which only `ingest()` makes. `require_index()` and
+  `index_version()` rely on that, and the tests check it
+  (`test_index_version_is_empty_before_any_ingest_and_creates_nothing`).
+- Don't call `reset_store_cache()` outside the tests (see "One MongoDB client per
+  process"), and don't remove the ingest's `_WriterLock`: two writers at once are
+  silent until a later query finds the index missing what one of them added.
 - `rag_pipeline/__init__.py` sets `TRANSFORMERS_NO_ADVISORY_WARNINGS` before
   anything imports LangChain, which on a Mac imports transformers (with mlx-lm,
   without torch) and prints a false "PyTorch was not found". It must stay in the
@@ -626,7 +629,7 @@ behavior is:
 | Invariant | Enforced by |
 | --------- | ----------- |
 | the exception union, the empty-collection guards, `source` metadata on loaders | `test_pipeline.py`, `test_ingest.py`, `test_mlx_models.py` |
-| `cli.py`'s imports stay cheap | `test_importing_cli_does_not_load_the_heavy_stack` — subprocess-imports the module, asserts chromadb/langchain_chroma/mlx/mlx_lm are absent from `sys.modules`, with the same probe required to see the store stack once the pipeline is imported, so it cannot pass vacuously |
+| `cli.py`'s imports stay cheap | `test_importing_cli_does_not_load_the_heavy_stack` — subprocess-imports the module, asserts pymongo/langchain_mongodb/mlx/mlx_lm/anthropic are absent from `sys.modules`, with the same probe required to see the store stack once the pipeline is imported, so it cannot pass vacuously |
 | the chat model decodes greedily, with thinking off | `test_generation_is_greedy_with_thinking_off_and_explicit_max_tokens` — asserts the exact arguments generation is called with, so no sampler reaches mlx-lm by any route |
 | `ingest()` never deletes documents it did not write | `test_ingest_preserves_foreign_documents_in_a_shared_collection` — a foreign doc survives a rebuild that deletes |
 | a stopped answer releases the generation lock, and its turn is still stored | `test_a_real_stop_releases_the_model_and_keeps_the_turn` — Stop as Streamlit delivers it, garbage collector off, real `MLXChatModel` over a fake MLX |
@@ -692,25 +695,27 @@ text rule and are strictly stronger than it: don't reintroduce one.
   whole prompt (several seconds; ~15 s on the first answer after loading)
   before it writes anything. The stream is a `Generator` because a caller that
   stops early must `close()` it (see the concurrency paragraph).
-- `RAGPipeline.__init__` checks `FETCH_K >= 1` (a `RuntimeError`), then calls
-  `require_index()` before building any model, so a fresh checkout is told to
-  run `rag ingest` without first loading ~22 GB. Three cases, each a
-  `FileNotFoundError` naming the fix, checked in order: no database in the
-  persist directory (first, because opening a client would create one); no
+- `RAGPipeline.__init__` checks `1 <= FETCH_K <= 1000` (a `RuntimeError`;
+  `$vectorSearch` caps candidates at 10,000 and langchain-mongodb asks for ten
+  per result), then calls `require_index()` before building any model, so a
+  fresh setup is told to run `rag ingest` without first loading ~22 GB. Three
+  cases, each a `FileNotFoundError` naming the fix, checked in order: no
   collection of that name (a wrong `COLLECTION_NAME` is a *different*
   collection, and one that silently searched empty would answer every question
-  "I don't know"); and a collection holding none of this pipeline's chunks
-  (scoped by `OWN_CHUNKS`, so foreign records do not pass for an index). Only
-  then `open_store(create=False)`, the reranker, and the LLM. Keep that order.
+  "I don't know"); a collection holding none of this pipeline's chunks (scoped
+  by `OWN_CHUNKS`, so foreign records do not pass for an index); and no vector
+  index named `VECTOR_INDEX_NAME`. An unreachable cluster or a missing
+  `MONGODB_URI` is `_client()`'s `RuntimeError`. Only then `open_store()`, the
+  reranker, and the LLM. Keep that order.
 - Store failures are translated in `store_errors_as_runtime` (`ingest.py`): it
-  wraps every store op — opening the collection, ingest's reads, deletes and
-  adds, and the query-time search — mapping `chromadb.errors.ChromaError` to
-  **RuntimeError, never ValueError**, so a store failure while the app loads
-  its pipeline lands below the sidebar. A message mentioning a dimension gets a
-  hint: new `COLLECTION_NAME` (or delete that collection), then `rag ingest` —
-  never delete the persist directory. `ChromaError` only; see Gotchas for
-  chromadb's builtins errors. `open_store()` also maps `NotFoundError` to
-  `FileNotFoundError`.
+  wraps every store op — connecting, getting a handle, ingest's reads, deletes,
+  adds and index management, the writer lock, and the query-time search —
+  mapping `pymongo.errors.PyMongoError` and `bson.errors.BSONError` (not a
+  `PyMongoError`) to **RuntimeError, never ValueError**, so a store failure
+  while the app loads its pipeline lands below the sidebar; a malformed
+  `MONGODB_URI` (pymongo's `ConfigurationError`) lands there too. A message
+  mentioning a dimension gets a hint: a new `COLLECTION_NAME` (or drop that
+  collection's vector index), then `rag ingest`.
 - `MLXChatModel` has no `temperature`/`top_p`/`top_k` fields and passes no
   sampler: decoding is greedy, so the same question over the same retrieved
   context gets the same answer — grounding comes from the context, and an answer
@@ -735,6 +740,7 @@ text rule and are strictly stronger than it: don't reintroduce one.
 - Document `source` metadata (path relative to `data_dir`, POSIX-style) is what
   citations key off. Any new loader must set it. Chunk metadata is exactly
   `source`, `content_hash` and `ingested_by`, with `str`/`int`/`float`/`bool`
-  values only. That limit is ours to keep, not Chroma's: it also stores lists,
-  and silently drops a key whose value is `None` (see Gotchas).
+  values only. That limit is ours to keep, not MongoDB's: it stores lists and
+  `null` too, and a chunk whose `ingested_by` came out `null` would fall outside
+  `OWN_CHUNKS` for good.
 - Module and function docstrings explain *why*, not what. Match that register.

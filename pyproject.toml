@@ -1,7 +1,7 @@
 [project]
 name = "rag-pipeline"
 version = "0.1.0"
-description = "A local RAG pipeline built with LangChain, Chroma, and MLX models"
+description = "A RAG pipeline built with LangChain, MongoDB Atlas, and MLX models"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -30,23 +30,12 @@ dependencies = [
     # it, the reranker's `model_id` field is a UserWarning on every `rag
     # ingest`, `rag query` and app start.
     "pydantic>=2.10",
-    # Chroma, the vector store: an in-process PersistentClient under
-    # PERSIST_DIR. chromadb is declared directly because ingest.py imports it
-    # (the client, its Settings, and chromadb.errors for the RuntimeError
-    # translation), not only through langchain-chroma.
-    "chromadb>=1.5.9",
-    "langchain-chroma>=1.1.0",
     # Resolves model ids to their local snapshot with local_files_only=True, so
     # loading a model never reaches the network. Below 2 because transformers
-    # (via mlx-lm) refuses 2.x, even at import, and so does tokenizers (via
-    # chromadb). On Linux, where transformers is absent, only tokenizers' bound
-    # holds it: anything that wanted hub 2.x would backtrack tokenizers to
-    # 0.13.3, the last release with no hub bound -- which has no wheels past
-    # Python 3.11, so needs a source build.
+    # (via mlx-lm, so on macOS) refuses 2.x, even at import, along with its
+    # tokenizers; stated here so the Linux legs, which install neither, resolve
+    # the same hub as a Mac.
     "huggingface-hub>=1.24,<2",
-    # Serializes ingests across processes: two writers on one persist dir at
-    # once silently corrupt it (a CLI `rag ingest` during an app upload).
-    "filelock>=4.0.3",
     # Optional tracing to a self-hosted Phoenix (off unless
     # PHOENIX_COLLECTOR_ENDPOINT is set). pipeline.py opens its spans through
     # the OpenTelemetry API alone -- a no-op until a provider exists -- and
@@ -70,6 +59,12 @@ dependencies = [
     # inside the eval command, so `rag --help` and the app never load them.
     "langsmith>=0.14.1",
     "anthropic>=1.11.0",
+    # The vector store: MongoDB Atlas, with Atlas Vector Search. pymongo is
+    # declared directly because ingest.py imports it -- the client, search
+    # index management, the writer lock, and pymongo.errors for the
+    # RuntimeError translation -- not only through langchain-mongodb.
+    "langchain-mongodb>=0.12.1",
+    "pymongo>=4.18.2",
 ]
 
 [project.scripts]
@@ -94,6 +89,9 @@ dev = [
     "pytest>=9.1.1",
     "pytest-cov>=7.0",
     "ruff>=0.16.9",
+    # The store tests run against MongoDB's atlas-local image in Docker, one
+    # container per session (conftest's `atlas_uri`).
+    "testcontainers>=4.15.0",
     "ty>=0.0.84",
 ]
 
