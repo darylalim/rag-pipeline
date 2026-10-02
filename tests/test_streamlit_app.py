@@ -96,7 +96,10 @@ def test_the_stored_sources_carry_the_passage_text_and_survive_replay(app):
 
     at.run()  # replay from session_state, the path a rerun takes
     assert at.session_state["messages"][1]["sources"] == assistant["sources"]
-    assert excerpt["text"] in [t.value for t in at.text]
+    # Word for word rather than character for character: the panel reflows a
+    # hand-wrapped passage, which changes its whitespace and nothing else.
+    shown = [t.value.split() for t in at.text]
+    assert excerpt["text"].split() in shown
 
 
 def test_a_retrieved_passage_is_shown_unparsed(app):
@@ -113,6 +116,50 @@ def test_a_retrieved_passage_is_shown_unparsed(app):
     passages = [t.value for t in at.text if "Alpha" in t.value]
     assert passages, "the retrieved passage was not rendered as text"
     assert "# Alpha" in passages[0], "the heading was parsed instead of shown"
+
+
+def test_a_hand_wrapped_passage_is_reflowed_for_display_only(
+    app, wired_env, fake_embeddings
+):
+    """A passage card is narrower than the width documents are wrapped at.
+
+    Shown with its stored breaks, every line would wrap again and stop short.
+    So a break inside a paragraph is shown as a space -- and every break that
+    is structure is kept: a heading's, a blank line, a list item, a fence and
+    the lines inside it. The stored passage keeps its own breaks.
+    """
+    wrapped = (
+        "## Beta\n"
+        "Beta topic about\n"
+        "bicycles and boats.\n"
+        "\n"
+        "- a list item\n"
+        "- another\n"
+        "```\n"
+        "keep\n"
+        "these\n"
+        "```\n"
+    )
+    (wired_env.data_dir / "sub" / "b.txt").write_text(wrapped, encoding="utf-8")
+    ingest_mod.ingest(wired_env, embeddings=fake_embeddings)
+
+    at = app.run()
+    at.chat_input[0].set_value("Tell me about bicycles.").run()
+
+    _, assistant = at.session_state["messages"]
+    stored = next(s["text"] for s in assistant["sources"] if "Beta" in s["text"])
+    assert "about\nbicycles" in stored, "the stored passage was reflowed"
+    assert (
+        "## Beta\n"
+        "Beta topic about bicycles and boats.\n"
+        "\n"
+        "- a list item\n"
+        "- another\n"
+        "```\n"
+        "keep\n"
+        "these\n"
+        "```"
+    ) in [t.value for t in at.text]
 
 
 def test_the_passages_are_labelled_as_retrieved_not_as_sources(app, monkeypatch):

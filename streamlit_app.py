@@ -12,6 +12,7 @@ from __future__ import annotations
 import importlib
 import itertools
 import logging
+import re
 from contextlib import ExitStack, closing
 
 import streamlit as st
@@ -301,6 +302,43 @@ def _show_failure(phase: str, exc: Exception) -> dict:
     return _error_reply(error_msg)
 
 
+# A line Markdown would start a block with: a heading, a list item, a quote, a
+# table row, a fence, or an indented line. Its break is structure, not wrapping.
+_BLOCK_START = re.compile(r"\s|#|[-*+>]\s|\||\d+[.)]\s|```|~~~")
+_FENCE = re.compile(r"\s*(```|~~~)")
+
+
+def _reflow(text: str) -> str:
+    """Join the lines a source file wrapped by hand, for display only.
+
+    Documents are often wrapped at a fixed width, and a passage keeps those
+    breaks. In a card narrower than that width every stored line wraps again
+    and stops short, leaving a fragment on each line. So a break between two
+    lines of one paragraph becomes a space; every other break -- a blank line,
+    a heading, a list item, a table row, inside a fence -- is kept. Only the
+    whitespace changes: every word is still shown, in order, unparsed. The
+    stored passage, and what the model read, are untouched.
+    """
+    lines = text.split("\n")
+    shown = lines[:1]
+    in_fence = bool(lines) and bool(_FENCE.match(lines[0]))
+    for previous, line in itertools.pairwise(lines):
+        if _FENCE.match(line):
+            in_fence = not in_fence
+            shown.append(line)
+        elif (
+            not in_fence
+            and previous.strip()
+            and line.strip()
+            and not _BLOCK_START.match(line)
+            and not previous.lstrip().startswith(("#", "|"))
+        ):
+            shown[-1] += " " + line
+        else:
+            shown.append(line)
+    return "\n".join(shown)
+
+
 def _render_sources(excerpts: list[Excerpt]) -> None:
     """Show the passages, not only the names of the files they came from.
 
@@ -340,7 +378,7 @@ def _render_sources(excerpts: list[Excerpt]) -> None:
                 ):
                     with column.container(border=True, height="stretch"):
                         st.caption(f"{rank}. `{excerpt['source']}`")
-                        st.text(excerpt["text"])
+                        st.text(_reflow(excerpt["text"]))
 
 
 # Replay the conversation so far.
