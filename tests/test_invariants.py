@@ -258,7 +258,7 @@ def test_gitignore_keeps_secrets_and_your_documents_out_of_git(
     """Secrets and the user's own documents stay untracked; the templates don't.
 
     The repository is public, and nothing else would notice a gap: a
-    `.env.phoenix`, a Streamlit `secrets.toml` or a document uploaded through
+    `.env.local`, a Streamlit `secrets.toml` or a document uploaded through
     the app goes out with the next `git add -A`, every check green. The samples
     and `.env.example` must stay addable, or one deleted and re-created could
     not be added back without `-f`.
@@ -735,12 +735,10 @@ def test_an_empty_default_is_documented_as_a_blank_cell(
         "from dataclasses import dataclass\n\n\n"
         "@dataclass(frozen=True)\n"
         "class Settings:\n"
-        '    phoenix_collector_endpoint: str = ""\n'
+        '    example_endpoint: str = ""\n'
     )
-    (tmp_path / ".env.example").write_text("# PHOENIX_COLLECTOR_ENDPOINT=\n")
-    (tmp_path / "README.md").write_text(
-        f"| `PHOENIX_COLLECTOR_ENDPOINT` |{cell}| Tracing |\n"
-    )
+    (tmp_path / ".env.example").write_text("# EXAMPLE_ENDPOINT=\n")
+    (tmp_path / "README.md").write_text(f"| `EXAMPLE_ENDPOINT` |{cell}| An example |\n")
 
     assert (settings_problems(tmp_path) == []) is documented
 
@@ -748,9 +746,9 @@ def test_an_empty_default_is_documented_as_a_blank_cell(
 @pytest.mark.parametrize(
     ("line", "documented"),
     [
-        pytest.param("# PHOENIX_COLLECTOR_ENDPOINT=\n", True, id="bare"),
+        pytest.param("# EXAMPLE_ENDPOINT=\n", True, id="bare"),
         pytest.param(
-            "# PHOENIX_COLLECTOR_ENDPOINT=   # e.g. http://localhost:6006\n",
+            "# EXAMPLE_ENDPOINT=   # e.g. http://localhost:6006\n",
             False,
             id="trailing-comment",
         ),
@@ -760,19 +758,18 @@ def test_an_empty_default_is_a_bare_line_in_the_env_example(
     tmp_path: Path, line: str, documented: bool
 ) -> None:
     """Uncommented, the line must mean the default -- and for an empty one a
-    trailing comment breaks that: python-dotenv takes `# e.g. ...` as the value,
-    which the URL check then refuses, stopping both frontends."""
+    trailing comment breaks that: python-dotenv takes `# e.g. ...` as the value.
+    No setting has an empty default today; the checker keeps the rule for the
+    next one, which is why its sample is made up."""
     (tmp_path / "rag_pipeline").mkdir()
     (tmp_path / "rag_pipeline" / "config.py").write_text(
         "from dataclasses import dataclass\n\n\n"
         "@dataclass(frozen=True)\n"
         "class Settings:\n"
-        '    phoenix_collector_endpoint: str = ""\n'
+        '    example_endpoint: str = ""\n'
     )
     (tmp_path / ".env.example").write_text(line)
-    (tmp_path / "README.md").write_text(
-        "| `PHOENIX_COLLECTOR_ENDPOINT` | | Tracing |\n"
-    )
+    (tmp_path / "README.md").write_text("| `EXAMPLE_ENDPOINT` | | An example |\n")
 
     assert (settings_problems(tmp_path) == []) is documented
 
@@ -810,13 +807,11 @@ def test_every_env_var_actually_overrides_its_field(
     if isinstance(default, Path):
         override = str(tmp_path)
     elif isinstance(default, bool):
-        override = "1"
+        override = str(not default).lower()
     elif isinstance(default, int):
         override = "7"
     else:
-        # A URL, because one str setting must be one; every other str reader
-        # passes any string through.
-        override = "http://sentinel.invalid"
+        override = "sentinel"
 
     monkeypatch.setenv(var, override)
     changed = getattr(Settings.from_env(), field.name)

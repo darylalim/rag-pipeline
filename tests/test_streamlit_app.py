@@ -35,7 +35,6 @@ from streamlit.testing.v1 import AppTest
 
 from rag_pipeline import ingest as ingest_mod
 from rag_pipeline import pipeline as pipeline_mod
-from rag_pipeline import tracing as tracing_mod
 
 APP = Path(__file__).resolve().parent.parent / "streamlit_app.py"
 
@@ -261,19 +260,21 @@ class _StopDuringRerank(BaseDocumentCompressor):
         return documents[:2]
 
 
-def test_a_stop_during_retrieval_still_sends_the_questions_trace(
-    app, spans, monkeypatch
+def test_a_stop_during_retrieval_still_ends_the_questions_trace(
+    app, traces, monkeypatch
 ):
     """The one Stop that lands with the answer stream returned but unread.
 
     The retrieval spinner's exit is itself a Streamlit call, so a Stop pressed
     while retrieval runs is raised there -- after stream_answer has handed the
-    stream back, before anything reads it. No lock is held yet, but the stream
-    holds the question's root span, which ends when the stream is closed:
-    dropped, the question never reaches Phoenix, and its search and rerank
-    arrive with a parent that never does. The garbage collector is off, as it
-    is free to be, so nothing but an explicit close can end it.
+    stream back, before anything reads it. No request to the model is open
+    yet, but the stream holds the question's root run, which ends when the
+    stream is closed: dropped, the question's trace stays open in LangSmith
+    for good, its search and rerank under a run that never finishes. The
+    garbage collector is off, as it is free to be, so nothing but an explicit
+    close can end it.
     """
+    monkeypatch.setenv("LANGSMITH_TRACING", "true")
     monkeypatch.setattr(pipeline_mod, "build_reranker", lambda _s: _StopDuringRerank())
     at = app.run()
 
@@ -285,26 +286,34 @@ def test_a_stop_during_retrieval_still_sends_the_questions_trace(
 
     assert _roles(at) == ["user", "assistant"], "the stopped turn was not stored"
     assert "Interrupted" in at.session_state["messages"][1]["content"]
-    roots = [span for span in spans.get_finished_spans() if span.name == "RAGPipeline"]
-    assert len(roots) == 1, "the stopped question's trace was never ended"
-    assert [event.name for event in roots[0].events] == ["stopped"]
+    root = traces.named("RAGPipeline")
+    assert root.get("end_time"), "the stopped question's trace was never ended"
+    assert "stopped" in root["tags"]
 
 
-def test_the_app_sets_up_tracing_from_its_own_settings(app, monkeypatch):
+def test_the_app_traces_from_its_own_settings_and_says_so(app, traces, monkeypatch):
     """The app is one of the two places a process decides to trace, and it
-    must decide from the Settings it built, like everything else it does."""
-    seen: list[str] = []
-    monkeypatch.setattr(
-        tracing_mod,
-        "setup_tracing",
-        lambda settings: seen.append(settings.phoenix_collector_endpoint),
-    )
-    monkeypatch.setenv("PHOENIX_COLLECTOR_ENDPOINT", "http://phoenix.test:6006")
-
+    must decide from the Settings it built, like everything else it does. Its
+    sidebar says so: on, every question leaves the machine a second time."""
+    monkeypatch.setenv("LANGSMITH_TRACING", "true")
     at = app.run()
 
+    at.chat_input[0].set_value("Why do chunks overlap?").run()
+
     assert not at.exception, [e.value for e in at.exception]
-    assert seen == ["http://phoenix.test:6006"]
+    root = traces.named("RAGPipeline")
+    assert root["inputs"] == {"question": "Why do chunks overlap?"}
+    assert any("LangSmith" in c.value for c in at.sidebar.caption)
+
+
+def test_with_tracing_off_the_app_sends_nothing_and_says_nothing(app, traces):
+    at = app.run()
+
+    at.chat_input[0].set_value("Why do chunks overlap?").run()
+
+    assert not at.exception, [e.value for e in at.exception]
+    assert traces.runs == []
+    assert not any("LangSmith" in c.value for c in at.sidebar.caption)
 
 
 def test_every_turn_stays_paired_across_mixed_outcomes(app, fail_mid_stream):
@@ -778,14 +787,6 @@ print(json.dumps(loads))
 @pytest.mark.parametrize(
     ("var", "value", "message"),
     [
-        # Refused by opentelemetry.sdk.trace as it is imported, which langsmith
-        # (inside langchain-core) does -- so with tracing off too.
-        pytest.param(
-            "OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT",
-            "abc",
-            "OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT",
-            id="opentelemetry",
-        ),
         # numpy's message is int()'s own, naming only the value -- and a failed
         # numpy import cannot be repeated, which is what the reload checks.
         pytest.param("NUMPY_MADVISE_HUGEPAGE", "abc", "'abc'", id="numpy"),
@@ -854,23 +855,18 @@ def test_missing_index_is_reported_not_raised(
     assert not at.chat_input, "the app must stop before offering an input"
 
 
-def test_a_tracing_setup_failure_is_reported_below_the_sidebar(
-    app, monkeypatch, undo_tracing
-):
-    """Tracing is set up on the pipeline-load path, whose handler catches
-    FileNotFoundError and RuntimeError only. The tracing SDK refuses some
-    malformed OTEL_* variables with a builtins ValueError -- which must arrive
-    translated, as the message the handler shows, with the sidebar above it."""
-    monkeypatch.setenv("PHOENIX_COLLECTOR_ENDPOINT", "http://127.0.0.1:9")
-    # A batch larger than its queue, refused as setup_tracing builds the
-    # processor. (An unknown compression, the trigger before OpenTelemetry
-    # 1.45, has since only been logged.)
-    monkeypatch.setenv("OTEL_BSP_MAX_EXPORT_BATCH_SIZE", "4096")
+def test_tracing_without_its_key_is_reported_below_the_sidebar(app, monkeypatch):
+    """The tracing client is built on the pipeline-load path, whose handler
+    catches FileNotFoundError and RuntimeError only: tracing switched on with no
+    LANGSMITH_API_KEY must arrive as the message the handler shows, naming the
+    key, with the sidebar above it -- not as every trace silently lost. The
+    real factory: conftest has removed the developer's key."""
+    monkeypatch.setenv("LANGSMITH_TRACING", "true")
 
     at = app.run()
 
     assert not at.exception, [e.value for e in at.exception]
-    assert any("OTEL_" in e.value for e in at.error)
+    assert any("LANGSMITH_API_KEY" in e.value for e in at.error)
     assert at.sidebar.button, "the sidebar must render above the error"
     assert not at.chat_input
 

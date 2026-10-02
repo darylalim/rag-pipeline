@@ -19,24 +19,9 @@ dependencies = [
     # itself, so pydantic is declared directly rather than left to
     # langchain-core.
     "pydantic>=2.10",
-    # Optional tracing to a self-hosted Phoenix (off unless
-    # PHOENIX_COLLECTOR_ENDPOINT is set). pipeline.py opens its spans through
-    # the OpenTelemetry API alone -- a no-op until a provider exists -- and
-    # names their attributes with OpenInference's conventions, which is what
-    # Phoenix reads. tracing.py builds the provider (the OpenInference one:
-    # the SDK's own caps a span at 128 attributes, which a reranker span
-    # passes from a FETCH_K of about 37), exports over OTLP/HTTP, and
-    # instruments LangChain. All six are imported directly, so all six are
-    # declared. Not arize-phoenix-otel: its register() cannot bound the
-    # exporter's timeout, and reads PHOENIX_* settings from outside Settings.
-    "opentelemetry-api>=1.44.0",
-    "opentelemetry-sdk>=1.44.0",
-    "opentelemetry-exporter-otlp-proto-http>=1.44.0",
-    "openinference-semantic-conventions>=0.1.39",
-    "openinference-instrumentation>=0.1.66",
-    "openinference-instrumentation-langchain>=0.1.76",
-    # `rag eval` (rag_pipeline/evaluation.py): the question set is a LangSmith
-    # dataset and each run a LangSmith experiment. Imported directly, so
+    # LangSmith: optional tracing, one trace per question (tracing.py builds
+    # the client, pipeline.py the runs), and `rag eval`, whose question set is
+    # a LangSmith dataset and each run an experiment. Imported directly, so
     # declared, though it also arrives through langchain-core.
     "langsmith>=0.14.1",
     # Claude, through its own SDK: the chat model (claude_model.py, an adapter
@@ -54,6 +39,11 @@ dependencies = [
     # imported for its clients and errors, so it is declared too.
     "langchain-voyageai>=0.4.1",
     "voyageai>=0.5.0",
+    # Retry: tracing.py turns off the LangSmith client's transport retries,
+    # which held a finished `rag query`'s exit for over a minute with
+    # LangSmith unreachable. Imported directly, so declared, though it also
+    # arrives through requests.
+    "urllib3>=2.8.0",
 ]
 
 [project.scripts]
@@ -68,13 +58,6 @@ packages = ["rag_pipeline"]
 
 [dependency-groups]
 dev = [
-    # ExportTraceServiceRequest: test_tracing.py's stand-in collector decodes
-    # what the exporter posts with OTLP's own protobuf types. The exporter's
-    # floor, since each exporter release pins opentelemetry-proto to its own.
-    "opentelemetry-proto>=1.44.0",
-    # reset_trace_globals(): OpenTelemetry lets a process set its tracer
-    # provider once, so the tests that record spans reset it between them.
-    "opentelemetry-test-utils>=0.65b0",
     "pytest>=9.1.1",
     "pytest-cov>=7.0",
     "ruff>=0.16.9",

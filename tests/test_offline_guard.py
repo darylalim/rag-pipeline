@@ -7,15 +7,14 @@ the API keys, so each factory stops before it builds a client, and ``_offline``
 blocks the socket besides. Either silently loosening reads as green everywhere
 else, so each route to a real model is tripped here on purpose
 -- every factory, and both entry points that build one when a fake is left out
--- and the socket block is checked on its own. So is the tracing guard: an
-exporter is the one route out the socket block cannot stop, since the tracing
-stack catches its error. And a leak it catches must fail only the test that left
-it, not every test after.
+-- and the socket block is checked on its own. So is the tracing guard: a
+client sending from a background thread is the one route out the socket block
+cannot stop, since that thread logs the error and carries on. And a tracing
+context a test leaves behind must fail only that test, not every test after.
 """
 
 from __future__ import annotations
 
-import dataclasses
 import os
 import socket
 from pathlib import Path
@@ -24,12 +23,13 @@ from typing import Any
 
 import pytest
 from langchain_core.language_models import FakeListChatModel
+from langsmith import tracing_context
+from langsmith.run_trees import RunTree
 
 from rag_pipeline import ingest as ingest_mod
 from rag_pipeline import pipeline as pipeline_mod
 from rag_pipeline.config import Settings
 from rag_pipeline.pipeline import RAGPipeline
-from rag_pipeline.tracing import setup_tracing
 from tests.conftest import _LIVE_CREDENTIALS, is_live
 
 # The key each factory needs, and so the one its refusal must name.
@@ -197,82 +197,77 @@ def test_the_developers_cluster_is_out_of_reach():
 
 
 def test_tracing_is_off_whatever_the_env_file_says():
-    """`_no_tracing`, seen from inside a test.
+    """`_no_tracing` and `_no_real_store`, seen from inside a test.
 
-    The endpoint both frontends read is gone, so neither installs an exporter,
-    and LangSmith -- which langchain-core still carries, and which still acts
-    on its own switch -- is off.
+    The switch both frontends read is off, so neither builds a client; every
+    other spelling LangSmith acts on by itself is off too; and the key that
+    would let anything through is gone.
     """
-    assert "PHOENIX_COLLECTOR_ENDPOINT" not in os.environ
-    assert Settings.from_env().phoenix_collector_endpoint == ""
+    assert Settings.from_env().langsmith_tracing is False
     assert os.environ["LANGSMITH_TRACING"] == "false"
+    assert os.environ["LANGCHAIN_TRACING_V2"] == "false"
+    assert "LANGSMITH_API_KEY" not in os.environ
 
 
 def test_every_test_is_checked_for_tracing_left_on(request):
     """The tripwire must run after every test, not only where requested: a
-    test that forgets to undo tracing does not know it."""
+    test that leaves a tracing context behind does not know it."""
     assert "_no_tracer_left_on" in request.fixturenames
 
 
-def test_the_tripwire_sees_what_a_real_setup_leaves(
-    settings, undo_tracing, tracing_left_on
-):
-    """Tripped for real: tracing set up with an endpoint leaves a provider and
-    LangChain's hook installed process-wide, and the check reports both. (No
-    span is emitted, so the exporter never reaches for its socket.)"""
-    setup_tracing(
-        dataclasses.replace(settings, phoenix_collector_endpoint="http://127.0.0.1:9")
-    )
+def test_the_tripwire_sees_a_context_left_open(tracing_left_on):
+    """Tripped for real: a tracing context entered and not yet left -- what a
+    context held across a yield amounts to -- is a current run and tracing
+    switched on, and the check reports both. Left properly afterwards, so this
+    test does not trip the guard itself. (Nothing is posted: the run is
+    never sent.)"""
+    leaked = tracing_context(enabled=True, parent=RunTree(name="leaked"))
+    leaked.__enter__()
+    try:
+        assert tracing_left_on() == [
+            "run 'leaked' is current",
+            "tracing is set to True",
+        ]
+    finally:
+        leaked.__exit__(None, None, None)
+    assert tracing_left_on() == []
 
-    assert tracing_left_on() == [
-        "a tracer provider is installed",
-        "LangChain is instrumented",
-    ]
 
-
-# A session whose first test leaks tracing. Left on, the leak would fail both
-# tests after it: the one that ignores tracing, by tripping the same teardown
-# check, and the one that sets tracing up under its own project, because setup,
-# finding it done, returns without building a provider.
+# A session whose first test leaks a tracing context. Left in place, the leak
+# would fail both tests after it: the one that ignores tracing, by tripping the
+# same teardown check, and the one that looks, by finding a run still current.
 _LEAK_THEN_CARRY_ON = """
-import dataclasses
-
-from opentelemetry import trace
-
-from rag_pipeline.tracing import setup_tracing
+from langsmith import tracing_context
+from langsmith.run_helpers import get_current_run_tree
+from langsmith.run_trees import RunTree
 
 
-def traced(settings, project):
-    return dataclasses.replace(
-        settings,
-        phoenix_collector_endpoint="http://127.0.0.1:9",
-        phoenix_project=project,
-    )
+# Held: a context manager nothing refers to is collected, and collecting it
+# runs its exit -- which would undo the leak before the guard could see it.
+_held = []
 
 
-def test_leaks(settings):
-    setup_tracing(traced(settings, "leaked"))
+def test_leaks():
+    leaked = tracing_context(enabled=True, parent=RunTree(name="leaked"))
+    leaked.__enter__()
+    _held.append(leaked)
 
 
 def test_ignores_tracing():
     pass
 
 
-def test_sets_up(settings, undo_tracing):
-    setup_tracing(traced(settings, "own"))
-
-    resource = trace.get_tracer_provider().resource
-    assert resource.attributes["openinference.project.name"] == "own"
+def test_finds_no_run_current():
+    assert get_current_run_tree() is None
 """
 
 
 def test_a_leak_fails_only_the_test_that_left_tracing_on(pytester, monkeypatch):
-    """The tripwire switches a leak off before failing the test that left it,
-    so the tests after it run as if it had never happened.
+    """The tripwire clears a leak before failing the test that left it, so the
+    tests after it run as if it had never happened.
 
-    A pytest process of its own, with this conftest as its plugin: a provider
-    is process-wide, so a session run in this process would leak into this
-    run's tests instead. This checkout goes on the path ahead of the one the
+    A pytest process of its own, with this conftest as its plugin: a context
+    left set in this process would leak into this run's tests instead. This checkout goes on the path ahead of the one the
     environment has installed, so the session loads the conftest under test.
     """
     monkeypatch.setenv(

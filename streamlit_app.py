@@ -142,7 +142,7 @@ def _import_failure() -> str:
     name its variable (numpy's is int()'s own).
     """
     try:
-        for module in ("ingest", "pipeline", "tracing"):
+        for module in ("ingest", "pipeline"):
             importlib.import_module(f"rag_pipeline.{module}")
     except ValueError as exc:
         logger.exception("Importing the pipeline failed")
@@ -156,10 +156,9 @@ def _import_failure() -> str:
 # that fixes it. A malformed setting is the one setup failure nothing can
 # proceed past, so it alone stops the script here: one of ours (CHUNK_SIZE=abc),
 # or one a library reads for itself as the pipeline's imports first load it —
-# the OpenTelemetry SDK, which langsmith imports inside langchain-core, refuses
-# OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT=abc, tracing on or off, and huggingface_hub
-# (under voyageai's tokenizers) refuses HF_HUB_ETAG_TIMEOUT=abc. Hence those
-# imports here, inside the guard,
+# numpy refuses NUMPY_MADVISE_HUGEPAGE=abc, and huggingface_hub (under
+# voyageai's tokenizers) HF_HUB_ETAG_TIMEOUT=abc. Hence those imports here,
+# inside the guard,
 # rather than at the top of the file, where either was a traceback in place of
 # the whole page;
 # nothing below works without them, the uploader included. The advice is to
@@ -178,7 +177,6 @@ try:
         save_upload,
     )
     from rag_pipeline.pipeline import Excerpt, RAGPipeline, source_excerpts
-    from rag_pipeline.tracing import setup_tracing
 except ValueError as exc:
     st.error(f"{exc}\n\nFix it, then restart the app.", icon=":material/error:")
     st.stop()
@@ -194,6 +192,10 @@ with st.sidebar:
 - **Data dir:** `{cfg.data_dir.name}/`
 """
     )
+    if cfg.langsmith_tracing:
+        # Shown because it is the one setting that sends every question, its
+        # passages and its answer somewhere else as well.
+        st.caption(f"Tracing to LangSmith, project `{cfg.langsmith_project}`.")
 
     # `st.file_uploader` re-reports its files on every rerun, so re-indexing on
     # sight would rebuild the whole corpus once per chat message. What confines
@@ -245,16 +247,12 @@ with st.sidebar:
     if st.button("Clear conversation", icon=":material/delete:", key="clear-chat"):
         st.session_state.messages = []
 
-# Build the pipeline, turning setup errors (no index yet, a model not
-# downloaded) into a clear on-screen message instead of a stack trace. Below the
+# Build the pipeline, turning setup errors (no index yet, a missing key) into
+# a clear on-screen message instead of a stack trace. Below the
 # sidebar so that an upload made on this run is already indexed: index_version()
 # is read here, after the rebuild bumped it, so the cached pipeline misses and
 # reloads.
 try:
-    # Once per process however often it is called -- a no-op after the first,
-    # and always unless PHOENIX_COLLECTOR_ENDPOINT is set. Here, below the
-    # sidebar, with the pipeline load, since the questions are what it traces.
-    setup_tracing(cfg)
     pipeline = load_pipeline(cfg, index_version(cfg))
 except (FileNotFoundError, RuntimeError) as exc:
     # FileNotFoundError: no/empty index. RuntimeError: a missing key, an
@@ -262,8 +260,8 @@ except (FileNotFoundError, RuntimeError) as exc:
     # One callout, not an error stacked on an info: the advice is a continuation
     # of the error, meaningless on its own. Left generic because it covers every
     # case and each exception already names its own remedy: a reload picks up a
-    # fix made on disk (an index built, a model downloaded), but a fix to a
-    # setting (FETCH_K, MAX_TOKENS, an OTEL_* variable) needs a restart, since --
+    # fix made on disk (an index built), but a fix to a setting or a key
+    # (FETCH_K, MAX_TOKENS, LANGSMITH_API_KEY) needs a restart, since --
     # as above the sidebar -- the server read its environment and .env when it
     # started. The sidebar has rendered above this guard, so the uploader that
     # resolves the missing-index case is on screen to speak for itself.
@@ -389,13 +387,13 @@ if question := st.chat_input(
                     # Registered inside the spinner, not after it: the spinner's
                     # exit is itself a Streamlit call, so a Stop pressed during
                     # retrieval is raised there, with the stream returned but
-                    # not yet read. It holds no lock then, but it does hold the
-                    # question's trace, which is sent only once it is closed.
+                    # not yet read. No request to the model is open then, but the
+                    # stream holds the question's trace, ended only when it is
+                    # closed.
                     open_stream.enter_context(closing(chunks))
                 phase = "Generation"
-                # The local model reads the whole prompt before its first token
-                # — several seconds, and longest on the first answer after the
-                # models load — and write_stream shows nothing until a token
+                # Claude reads the whole prompt before its first token -- about
+                # a second -- and write_stream shows nothing until a token
                 # arrives, so the wait for the first piece gets a spinner of its
                 # own. `phase` is already "Generation", so a failure in that wait
                 # is labelled for the step that raised it.

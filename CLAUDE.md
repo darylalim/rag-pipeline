@@ -78,7 +78,7 @@ hosted models behind LangChain's interfaces:
 ingest  (rag_pipeline/ingest.py)      load → split → embed → store (MongoDB Atlas + vector index)
 query   (rag_pipeline/pipeline.py)    embed question → search → rerank → stuff prompt → Claude
 models  embeddings + rerank: Voyage AI's API (factories in ingest.py / pipeline.py) · chat: ClaudeChatModel, over Anthropic's SDK (claude_model.py)
-tracing (rag_pipeline/tracing.py)     optional: each question as one trace, to a self-hosted Phoenix
+tracing (rag_pipeline/tracing.py)     optional: each question as one trace, to LangSmith
 eval    (rag_pipeline/evaluation.py)  rag eval: evals/questions.json as a LangSmith dataset, judged by Claude
 ```
 
@@ -206,7 +206,7 @@ manager: ingest's adds and width probe, the question's embedding in the search,
 and the rerank in `retrieve()`. The reranker is `pipeline._VoyageRerank`, a subclass
 whose `compress_documents` returns the candidates themselves with only
 `relevance_score` added: langchain-voyageai's rebuilds each document without its
-id (`source:index:content_hash`, which the reranker trace span records) and adds
+id (`source:index:content_hash`, which the reranker's trace run records) and adds
 a `total_tokens` key to its metadata. It calls the library's private `_rerank`,
 so `test_the_reranker_returns_the_candidates_themselves_in_voyages_order` pins
 it offline and the live suite checks it against the real API.
@@ -276,68 +276,68 @@ those move. It calls the real APIs, so conftest exempts the `live` mark from
 `_offline` and lets it keep `ANTHROPIC_API_KEY` and `VOYAGE_API_KEY` — never
 `MONGODB_URI`. Skipped is not passed.
 
-### Tracing is the API in the pipeline, the SDK in the frontends
+### Tracing: one LangSmith trace per question, built by hand
 
-Off unless `PHOENIX_COLLECTOR_ENDPOINT` is set (empty default; `_env_url` refuses
-a malformed one as `ValueError`). OpenTelemetry's own split: `pipeline.py`
-imports only `opentelemetry-api` and OpenInference's attribute names, which are
-a no-op until a provider exists, and `tracing.setup_tracing()` installs one.
-`cli.py` calls it in `cmd_query` only (ingest emits no spans, so it would only
-load the tracing stack and start an idle exporter thread), and `streamlit_app.py` on every
-rerun, inside the pipeline-load `try`; it is once per process, guarded by the
-instrumentor's own state under a lock (`test_concurrent_first_setups_install_once`).
-Like the adapters, it raises only `RuntimeError`, because the app calls it on
-the pipeline-load path: the builtins `ValueError` a malformed `OTEL_*` variable
-can cause, and the exporter's `RuntimeError` for a credential provider that is
-not installed, become one `RuntimeError` pointing at the `OTEL_*` variables. It
-installs nothing until everything is built, and shuts down a provider already
-built when the failure comes, or each failed rerun would leave one more exit
-hook (`test_a_malformed_otel_variable_is_a_runtime_error_that_installs_nothing`
-watches `atexit`). Its imports are lazy, so tracing off loads none of the stack
-(`test_tracing_off_loads_none_of_the_tracing_stack`, which takes the frontends'
-path: import, then `setup_tracing(Settings())`).
+Off unless `LANGSMITH_TRACING` is true (`_env_bool`: only true or false, any
+case — anything else is a `ValueError`, never a quiet off). `tracing.py` holds
+only `tracing_client()`: None while off; on, one LangSmith `Client` per API key
+per process (each owns a sending thread, and the app rebuilds its pipeline
+after every ingest), with `LANGSMITH_API_KEY` read through `require_env_key`.
+`RAGPipeline.__init__` calls it on the load path, so a missing key is the
+`RuntimeError` the app shows below its sidebar. The client is capped —
+`Retry(total=0)`, `_TIMEOUT_MS` — because its queue is drained before the
+process exits: uncapped, an unreachable LangSmith held a finished `rag query`
+12 s (refused) to 88 s (black-holed); capped, 0.3 s and 10 s, the 10 s being
+the SDK's own floor (three attempts at a fixed 3 s connect, no setting).
+`test_with_langsmith_down_questions_do_not_wait_and_exit_waits_briefly`
+measures the refused case. `LANGSMITH_ENDPOINT` is left to the client, as for
+the eval's: it is the region, LangSmith's to name.
 
-`setup_tracing` assembles the provider from OpenTelemetry's parts, **not
-`phoenix.otel.register()`**, whose shortcuts are traps here — `tracing.py`'s
-module docstring lists them (a base URL posted to as-is, whose 405
-`force_flush()` reports as success; gRPC, whose sockets `_offline` cannot see;
-no exporter timeout; `PHOENIX_*`/`.env.phoenix` that `Settings` does not know).
-So `traces_url()` always builds the collector URL: it appends `/v1/traces` to a
-base URL, keeping a path prefix for a reverse proxy, and leaves an endpoint that
-already ends in it as is. The `BatchSpanProcessor`, `_EXPORT_TIMEOUT_S = 2` and
-OpenInference's `TracerProvider` (the SDK's caps a span at 128 attributes, which
-a reranker span passes from a `FETCH_K` of about 37) are each justified in the
-comments beside them, and
-`test_with_phoenix_down_questions_do_not_wait_and_exit_waits_briefly` measures
-what batching and the timeout buy. The exporter timeout is the only bound on the exit flush:
-`force_flush(timeout)` and `OTEL_BSP_EXPORT_TIMEOUT` are ignored.
+**The switch is passed, not inherited.** LangSmith turns itself on from its own
+variables (`LANGSMITH_TRACING`, `LANGCHAIN_TRACING_V2`, …, cached once per
+process) and inside any run already current. So every question runs inside
+`_tracing(root)`: `tracing_context(enabled=False, parent=False)` when off,
+`enabled=True, parent=root` when on. Off then means off whatever the
+environment or an enclosing trace says
+(`test_off_sends_nothing_even_inside_a_trace_that_is_on`), and the old advice to
+delete a stale `LANGCHAIN_TRACING_V2` from `.env` is moot.
 
-A question is one trace, and every path out of it ends the root span:
+A question is one trace, and every path out of it ends the root run:
 
-- **The root span.** `stream_answer` opens it (`start_span`, never
-  `start_as_current_span`) and makes it current only around retrieval, a
-  synchronous stretch. The LangChain retriever run and the manual reranker span
-  nest under it there. A compressor is not a Runnable, so without the manual
-  span the rerank would not be traced at all.
-- **Generation is lazy**, so it outlives that call. `_traced` re-attaches the
-  root's context around each `next()` of `_generate` and never across a
-  `yield`. One held across a yield leaks into the consumer between pieces, and
-  logs "Failed to detach context" when the stream is closed from another context
-  or thread.
+- **The root run.** `_open_root` builds a `RunTree` by hand, rather than with
+  `trace`/`@traceable`, which set context on entry and reset it on exit and so
+  cannot span a lazy stream. Inside a run already current — `rag eval`'s
+  `evaluate()` traces each question as a row of its experiment — it is
+  `create_child` of that run, in that project
+  (`test_inside_a_run_already_current_the_question_nests_under_it`); otherwise a
+  root in `LANGSMITH_PROJECT`. It is current around retrieval only, a
+  synchronous stretch, where LangChain's retriever run and the reranker's run
+  nest under it. The reranker is not a Runnable, so `retrieve()` traces it with
+  `langsmith.trace` (`run_type="retriever"`: the candidates in, the kept ones
+  out, scored) — only when tracing is on, so nothing is serialized while off.
+- **Generation is lazy**, so it outlives that call. `_traced` enters
+  `_tracing(root)` around each `next()` of `_generate` and never across a
+  `yield`: LangSmith keeps the current run in context variables, and one held
+  across a yield leaks into the consumer between pieces and cannot be reset
+  when the stream is closed from another thread. Off, each step is still
+  wrapped — in the disabling context.
 - **Primed.** `_traced` yields `""` once, and `stream_answer` consumes it before
   returning. A generator's `finally` exists only once its body has started, so a
   stream closed before its first piece would otherwise end nothing.
-- **Status (`_finish`).** An `Exception` is ERROR with the exception recorded. A
+- **Outcome (`_finish`).** An `Exception` ends the root with `error`. A
   `BaseException` (GeneratorExit, KeyboardInterrupt, Streamlit's StopException)
-  leaves the status unset, adds a `stopped` event, and keeps the partial answer
-  as the output.
+  ends it with no error, tagged `stopped`, `stopped_by` in its metadata. Either
+  way the partial answer is the output, then `patch()` sends it.
 
-The model's own span still shows ERROR on a Stop: LangChain reports a closed
-stream to its tracer as an error. `_tracer()` is looked up per question, not
-held at import, because a tracer keeps the provider it first resolved and tests
-reset it. `ClaudeChatModel._get_ls_params` sets `ls_provider` and
-`ls_model_name`; LangChain would otherwise name the provider after the class. `tests/test_tracing.py` asserts the trace in-process and the wire format
-in a subprocess, against a stand-in collector that runs inside the subprocess.
+Production's client batches, so `post()`/`patch()` only queue a run and no
+tracing failure can reach a question. The model's own run still ends in error
+on a Stop: LangChain reports a closed stream to its tracer as one.
+`ClaudeChatModel._get_ls_params` sets `ls_provider` and `ls_model_name`;
+LangChain would otherwise name the provider after the class.
+`tests/test_tracing.py` asserts the trace in-process, through conftest's
+`traces` — the real `Client`, unbatched, with its HTTP adapter replaced by a
+recorder (`tests/fake_langsmith.py`) — and batching and the exit cost in a
+subprocess against a stand-in LangSmith.
 
 ### One MongoDB client per process
 
@@ -487,10 +487,9 @@ pinned by `tests/test_offline_guard.py` so one that loosens reads as a failure:
 one that catches a forgotten injection**: each factory stops at its missing key
 before it builds a client),
 `_offline` blocks every socket to a host other than this machine (the atlas-local
-container is on loopback), `_no_tracing` keeps Phoenix and
-LangSmith off whatever `.env` says, and `_no_tracer_left_on` fails a test that
-left tracing on (which `_offline` cannot see: the tracing stack swallows the
-socket error). How each works, and which fixture a new test takes, is in
+container is on loopback), `_no_tracing` keeps LangSmith's every switch off
+whatever `.env` says, and `_no_tracer_left_on` fails a test that leaves a
+LangSmith tracing context set (which `_offline` cannot see). How each works, and which fixture a new test takes, is in
 `tests/CLAUDE.md`.
 
 Tests marked `@pytest.mark.live` are the deliberate exception: they call the
@@ -529,7 +528,7 @@ because they are only observable at the frontend:
   retrieval spinner's exit (a Streamlit call), after `stream_answer` returned
   and before generation starts, so `streamlit_app.py` registers `closing(chunks)` inside
   the spinner through an `ExitStack`. No request is open then, but the stream holds
-  the question's root span, and a dropped stream means a trace never sent.
+  the question's root run, and a dropped stream means a trace never finished.
 - An upload is reported as added only if it reached the index
   (`indexed_sources()`): ingest skips a textless file — a scanned PDF — without
   failing.
@@ -563,9 +562,7 @@ because they are only observable at the frontend:
   place a library's import-time `ValueError` (next) is reported.
 - Some libraries read settings from the environment once, as they are first
   imported, and refuse a malformed one with a `ValueError` — tracing on or off.
-  langsmith, inside langchain-core, imports the OpenTelemetry SDK, whose
-  `opentelemetry.sdk.trace` validates `OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT`; numpy,
-  langsmith and huggingface_hub (through voyageai's tokenizers) each `int()` a
+  numpy, langsmith and huggingface_hub (through voyageai's tokenizers) each `int()` a
   variable or two of theirs (`HF_HUB_ETAG_TIMEOUT`, say). So `streamlit_app.py` imports the
   pipeline inside its `Settings` guard, not at the top of the file, where any of
   these was a traceback in place of the whole page. It does so once per process,
@@ -596,18 +593,15 @@ because they are only observable at the frontend:
 - Don't call `reset_store_cache()` outside the tests (see "One MongoDB client per
   process"), and don't remove the ingest's `_WriterLock`: two writers at once are
   silent until a later query finds the index missing what one of them added.
-- Phoenix's own clients read `PHOENIX_COLLECTOR_ENDPOINT` too, with different
-  semantics: unset means `localhost:6006` to them and *off* here, and given no
-  protocol they infer gRPC. The name is shared so Phoenix's docs on it apply;
-  the behavior is this repo's, from `Settings`, over HTTP. Phoenix's other
-  client variables (`PHOENIX_API_KEY`, its headers variable, `PHOENIX_GRPC_PORT`)
-  are not read, so the pipeline sends no credentials and needs a Phoenix with
-  authentication off — its default; the README keeps it private with
-  `PHOENIX_HOST=127.0.0.1` instead.
-- langsmith still ships inside langchain-core and acts on `LANGSMITH_TRACING`
-  by itself, uploading every run to LangSmith's cloud. The pipeline does not
-  use it, and `_no_tracing` switches it off for tests only; the README and
-  `.env.example` tell users with an old `.env` to delete it.
+- `LANGSMITH_TRACING` and `LANGSMITH_PROJECT` are both a `Settings` field and
+  variables LangSmith reads for itself. The names are shared so LangSmith's
+  docs apply; what decides is `Settings`, passed explicitly per question (see
+  the tracing section). LangSmith caches its own reading for the life of the
+  process, which is why `_no_tracing` is session-scoped.
+- `langsmith.trace(...)` as an *outer* context does nothing unless tracing is
+  enabled around it (conftest turns the environment switches off), so a test
+  that opens one to stand in for `rag eval` wraps it in
+  `tracing_context(enabled=True)`, as `evaluate()` does.
 - `.streamlit/config.toml` keeps Streamlit local and quiet: usage statistics,
   the first-run email prompt and the file watcher off, and `server.address =
   127.0.0.1` (unset, the uploader — which writes into `data/` — is on the local
@@ -641,8 +635,8 @@ behavior is:
 | `ingest()` never deletes documents it did not write | `test_ingest_preserves_foreign_documents_in_a_shared_collection` — a foreign doc survives a rebuild that deletes |
 | a stopped answer ends the model's request, and its turn is still stored | `test_a_real_stop_ends_the_models_request_and_keeps_the_turn` — Stop as Streamlit delivers it, garbage collector off, real `ClaudeChatModel` and SDK client over a stand-in server |
 | no test calls a real model | conftest's `_no_real_store` (the API keys) and `_offline`, pinned by `tests/test_offline_guard.py` |
-| a question is one trace, ended however the question ends (answered, failed, stopped, closed unread) | `tests/test_tracing.py`, plus `test_a_stop_during_retrieval_still_sends_the_questions_trace` in `test_streamlit_app.py` |
-| no test leaves tracing on | conftest's `_no_tracer_left_on`, after every test |
+| a question is one trace, ended however the question ends (answered, failed, stopped, closed unread), and nothing when off | `tests/test_tracing.py`, plus `test_a_stop_during_retrieval_still_ends_the_questions_trace` in `test_streamlit_app.py` |
+| no test leaves a tracing context set | conftest's `_no_tracer_left_on`, after every test |
 | secrets (`.env`, `.env.*`, `.streamlit/secrets.toml`), the user's documents in `data/`, coverage's parallel data files and Claude Code worktrees stay out of git; `.env.example` and the three samples stay addable | `test_gitignore_keeps_secrets_and_your_documents_out_of_git` — the repo's `.gitignore` in a scratch repository made with no template, global excludes off |
 | Anthropic's and Voyage's real APIs behave as the fakes assume | `tests/test_live.py` (`-m live`, by hand, with both keys) |
 

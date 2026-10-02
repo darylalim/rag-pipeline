@@ -27,12 +27,9 @@ def cmd_ingest(settings: Settings) -> int:
 
 def cmd_query(settings: Settings, question: str) -> int:
     from rag_pipeline.pipeline import RAGPipeline, unique_sources
-    from rag_pipeline.tracing import setup_tracing
 
-    # Here and not in main(): a question is the one thing that is traced, so
-    # `rag ingest` has no exporter to flush at exit. A no-op unless
-    # PHOENIX_COLLECTOR_ENDPOINT is set.
-    setup_tracing(settings)
+    # Traced if LANGSMITH_TRACING is true. Nothing to flush here: runs not yet
+    # sent when the answer ends are sent before the process exits.
     pipeline = RAGPipeline(settings)
     docs, chunks = pipeline.stream_answer(question)
 

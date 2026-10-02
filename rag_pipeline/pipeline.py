@@ -1,15 +1,14 @@
 """Query phase: embed question -> search -> rerank -> generate a grounded answer.
 
-``RAGPipeline`` opens the Atlas Vector Search index and the local models
-once, then answers questions against them. Both the CLI and the Streamlit app
+``RAGPipeline`` opens the Atlas Vector Search index and the models once, then
+answers questions against them. Both the CLI and the Streamlit app
 build a single pipeline and reuse it across queries.
 """
 
 from __future__ import annotations
 
-import json
-from collections.abc import Generator, Sequence
-from contextlib import closing
+from collections.abc import Generator, Iterator, Sequence
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from typing import Any, TypedDict, cast
 
@@ -21,17 +20,10 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import Runnable
 from langchain_voyageai import VoyageAIRerank
-from openinference.semconv.trace import (
-    DocumentAttributes,
-    OpenInferenceMimeTypeValues,
-    OpenInferenceSpanKindValues,
-    RerankerAttributes,
-    SpanAttributes,
-)
-from opentelemetry import context as otel_context
-from opentelemetry import trace
-from opentelemetry.trace import Span, Status, StatusCode
-from opentelemetry.util.types import AttributeValue
+from langsmith import Client, trace, tracing_context
+from langsmith.run_helpers import get_current_run_tree
+from langsmith.run_trees import RunTree
+from langsmith.utils import tracing_is_enabled
 from pydantic import SecretStr
 
 from rag_pipeline.claude_model import ClaudeChatModel
@@ -43,6 +35,7 @@ from rag_pipeline.ingest import (
     require_index,
     voyage_clients,
 )
+from rag_pipeline.tracing import tracing_client
 
 # Grounding prompt: the model must answer from the retrieved context only, and
 # admit when the context does not contain the answer. This is what turns a
@@ -123,102 +116,84 @@ def source_excerpts(docs: list[Document]) -> list[Excerpt]:
 
 # --- tracing -----------------------------------------------------------------
 #
-# Through the OpenTelemetry API only, so all of this is a no-op until a frontend
-# installs a provider (rag_pipeline.tracing); the attribute names are
-# OpenInference's, which is what Phoenix renders a trace from.
+# One LangSmith trace per question, built here by hand. Its root run is opened
+# by stream_answer and ended by the answer stream, however that ends; the
+# search and the model are LangChain runs, which nest under whatever run is
+# current when they start; the rerank is a run of its own (see retrieve()).
 
 # The metadata key a LangChain reranker scores its documents under, Voyage's
 # included.
 _SCORE_KEY = "relevance_score"
 
-_TEXT = OpenInferenceMimeTypeValues.TEXT.value
 
+@contextmanager
+def _tracing(root: RunTree | None) -> Iterator[None]:
+    """Trace what runs inside under ``root`` -- or, with no root, nothing.
 
-def _tracer() -> trace.Tracer:
-    """This module's tracer, looked up per question rather than held.
-
-    A tracer resolves against the provider installed when it is first used,
-    and keeps that answer: held at import, it would keep the first one for good,
-    and the tests install a fresh provider for each test that records spans.
+    Explicit both ways. On, ``root`` is the parent every run inside nests
+    under. Off, tracing is disabled outright rather than left to the
+    environment: LangSmith also switches itself on from variables of its own
+    (an old ``LANGCHAIN_TRACING_V2=true``, say) and from any run already
+    current, and either would upload a question this pipeline was told not to.
     """
-    return trace.get_tracer(__name__)
+    if root is None:
+        with tracing_context(enabled=False, parent=False):
+            yield
+    else:
+        with tracing_context(enabled=True, parent=root):
+            yield
 
 
-def _span_kind(kind: OpenInferenceSpanKindValues) -> dict[str, AttributeValue]:
-    # Upper case, as the enum's values are: Phoenix's span filters are written
-    # that way.
-    return {SpanAttributes.OPENINFERENCE_SPAN_KIND: kind.value}
+def _finish(root: RunTree, answer: str, error: BaseException | None) -> None:
+    """End a question's root run with what its outcome earned, and send it.
 
-
-def _documents(key: str, docs: list[Document]) -> dict[str, AttributeValue]:
-    """``docs`` as OpenInference's flattened document list under ``key``."""
-    attributes: dict[str, AttributeValue] = {}
-    for index, doc in enumerate(docs):
-        prefix = f"{key}.{index}."
-        attributes[prefix + DocumentAttributes.DOCUMENT_CONTENT] = doc.page_content
-        attributes[prefix + DocumentAttributes.DOCUMENT_METADATA] = json.dumps(
-            doc.metadata, default=str
-        )
-        if doc.id is not None:
-            attributes[prefix + DocumentAttributes.DOCUMENT_ID] = doc.id
-        score = doc.metadata.get(_SCORE_KEY)
-        if isinstance(score, float):
-            attributes[prefix + DocumentAttributes.DOCUMENT_SCORE] = score
-    return attributes
-
-
-def _finish(span: Span, error: BaseException | None) -> None:
-    """End a question's root span with the status its outcome earned.
-
-    A failure is an error, with the exception recorded. A question stopped
-    part-way -- the app's Stop, Ctrl-C at the terminal, a caller that closes the
-    stream early -- is not, so its status is left unset and the stop is an event
-    instead; otherwise Phoenix would count every Stop as a failed question. (The
-    model's own span still ends in error on a Stop: LangChain reports a closed
-    stream to its tracer as one, and nothing here sees it first.)
+    A failure is an error, with its message. A question stopped part-way --
+    the app's Stop, Ctrl-C at the terminal, a caller that closes the stream
+    early -- is not, or LangSmith would count every Stop as a failed question:
+    it is tagged ``stopped`` instead. Either way the partial answer is kept as
+    the output, the useful part of such a trace. (The model's own run still
+    ends in error on a Stop: LangChain reports a closed stream to its tracer as
+    one, and nothing here sees it first.)
     """
     if isinstance(error, Exception):
-        span.record_exception(error)
-        span.set_status(Status(StatusCode.ERROR, f"{type(error).__name__}: {error}"))
-    elif error is not None:
-        span.add_event("stopped", {"reason": type(error).__name__})
+        root.end(outputs={"answer": answer}, error=f"{type(error).__name__}: {error}")
     else:
-        span.set_status(Status(StatusCode.OK))
-    span.end()
+        if error is not None:
+            root.add_tags(["stopped"])
+            root.add_metadata({"stopped_by": type(error).__name__})
+        root.end(outputs={"answer": answer})
+    root.patch()
 
 
 def _traced(
-    span: Span, pieces: Generator[str, None, None]
+    root: RunTree | None, pieces: Generator[str, None, None]
 ) -> Generator[str, None, None]:
-    """``pieces``, generated inside ``span``, which ends when the stream does.
+    """``pieces``, generated inside ``root``, which ends when the stream does.
 
-    The span is made current around each step rather than across a yield.
-    OpenTelemetry keeps the current span in a context variable, and one held
-    across a yield leaks into whatever the consumer does between pieces -- and
-    fails to detach ("Failed to detach context") when the stream is closed from
-    another context, as a Stop in the app can close it. One step is one
-    synchronous frame, so attach and detach always pair. The first step is the
-    one that counts: LangChain parents its run to whichever span is current
-    when the chain starts, and the chain starts on the first pull.
+    The tracing context is entered around each step rather than across a
+    yield. LangSmith keeps it in context variables, and one held across a
+    yield leaks into whatever the consumer does between pieces -- and cannot be
+    reset when the stream is closed from another context, as a Stop in the
+    app can close it. One step is one synchronous frame, so entry and exit
+    always pair. The first step is the one that counts: LangChain parents its
+    run to whichever run is current when the chain starts, and the chain
+    starts on the first pull. With tracing off, each step is still wrapped, in
+    a context that disables it.
 
     Primed: the first ``yield`` gives nothing, comes before any generation, and
     is consumed by ``stream_answer``. A generator's ``finally`` exists only once
     its body has started, so unprimed, a stream closed before its first piece --
     a Stop that lands between retrieval and generation -- would end nothing,
-    and that question's trace would never be exported. The model still does not
+    and that question's trace would never be sent. The model still does not
     start until the caller asks for a piece.
     """
-    context = trace.set_span_in_context(span)
     answer: list[str] = []
     error: BaseException | None = None
     try:
         yield ""
         while True:
-            token = otel_context.attach(context)
-            try:
+            with _tracing(root):
                 piece = next(pieces, None)
-            finally:
-                otel_context.detach(token)
             if piece is None:
                 break
             answer.append(piece)
@@ -232,15 +207,8 @@ def _traced(
             # stops the model when the caller closes the stream early.
             pieces.close()
         finally:
-            # What was generated, however it ended: the partial answer is the
-            # useful part of a stopped or failed question's trace.
-            span.set_attributes(
-                {
-                    SpanAttributes.OUTPUT_VALUE: "".join(answer),
-                    SpanAttributes.OUTPUT_MIME_TYPE: _TEXT,
-                }
-            )
-            _finish(span, error)
+            if root is not None:
+                _finish(root, "".join(answer), error)
 
 
 def build_chat_model(settings: Settings) -> BaseChatModel:
@@ -338,7 +306,7 @@ class RAGPipeline:
                 f"FETCH_K must be between 1 and {_MAX_FETCH_K}, not {settings.fetch_k}."
             )
         # Before any model is built: a missing, misnamed or empty index is
-        # reported without first loading ~15 GB of weights to find out.
+        # reported before any model client is made.
         require_index(settings)
 
         self.settings = settings
@@ -346,7 +314,7 @@ class RAGPipeline:
         # Reopen the existing store via the shared factory, so the same
         # embedding model that indexed the documents also embeds queries.
         # `embeddings` and `llm` are injectable for tests; production leaves
-        # both as None and gets the local models. Opening it creates nothing.
+        # both as None and gets the real models. Opening it creates nothing.
         vectorstore = open_store(settings, embeddings)
         # Retrieve a wide candidate set (fetch_k); the reranker below narrows it
         # to retrieval_k. Filtered to this pipeline's own chunks, like every
@@ -361,10 +329,13 @@ class RAGPipeline:
         # The model's own message chunks, not a StrOutputParser's strings:
         # closing a parser's stream does not stop the model -- langchain-core
         # catches the GeneratorExit and drains the parser's input to the end --
-        # so a Stop in the app would keep generating, under the process-wide
-        # generation lock, until MAX_TOKENS. _generate() extracts the text
+        # so a Stop in the app would keep Claude generating, and billing, until
+        # MAX_TOKENS. _generate() extracts the text
         # itself instead.
         self._chain = _PROMPT | (llm or build_chat_model(settings))
+        # None while tracing is off. Built with the models, on the load path,
+        # so a missing LANGSMITH_API_KEY is reported before the first question.
+        self._tracing_client: Client | None = tracing_client(settings)
 
     def retrieve(self, question: str) -> list[Document]:
         """Return the reranked top chunks for the question.
@@ -377,41 +348,26 @@ class RAGPipeline:
         The models need no wrapping: their adapters already raise inside the
         union.
 
-        The search is traced by LangChain's instrumentation, as a retriever run;
-        the rerank is not -- a compressor is not a Runnable -- so it gets a span
-        of its own here. That span is where a trace shows what the reranker was
-        given and what it kept, with their scores: the step whose choices
-        decide what the model is shown.
+        Traced, the search is LangChain's own retriever run; the rerank is not
+        a Runnable, so it gets a run of its own here -- the step whose choices
+        decide what the model is shown, with what it was given and what it kept,
+        scored.
         """
         with provider_errors_as_runtime():
             candidates = self._retriever.invoke(question)
-            with _tracer().start_as_current_span(
+            if not tracing_is_enabled():
+                return list(self._reranker.compress_documents(candidates, question))
+            with trace(
                 type(self._reranker).__name__,
-                attributes=_span_kind(OpenInferenceSpanKindValues.RERANKER),
-            ) as span:
-                # Guarded: with tracing off, nothing is serialized for a span
-                # that records nothing.
-                if span.is_recording():
-                    span.set_attributes(
-                        {
-                            RerankerAttributes.RERANKER_QUERY: question,
-                            RerankerAttributes.RERANKER_MODEL_NAME: (
-                                self.settings.rerank_model
-                            ),
-                            RerankerAttributes.RERANKER_TOP_K: self.settings.retrieval_k,
-                            **_documents(
-                                RerankerAttributes.RERANKER_INPUT_DOCUMENTS, candidates
-                            ),
-                        }
-                    )
+                run_type="retriever",
+                inputs={"query": question, "documents": candidates},
+                metadata={
+                    "model": self.settings.rerank_model,
+                    "top_k": self.settings.retrieval_k,
+                },
+            ) as run:
                 ranked = list(self._reranker.compress_documents(candidates, question))
-                if span.is_recording():
-                    span.set_attributes(
-                        _documents(RerankerAttributes.RERANKER_OUTPUT_DOCUMENTS, ranked)
-                    )
-                # OK, as LangChain's own spans end: left unset, it is the one
-                # step in a successful trace that does not read as a success.
-                span.set_status(Status(StatusCode.OK))
+                run.end(outputs={"documents": ranked})
             return ranked
 
     def _generate(
@@ -488,38 +444,55 @@ class RAGPipeline:
         is consumed.
 
         A caller that stops reading early must `close()` the stream rather than
-        drop it. The local model holds a process-wide lock for as long as its
-        stream is open, and a dropped one is freed only when the garbage
-        collector gets to it -- which, for a stream a Streamlit script holds in
-        a global, can be never: every later answer would wait on that lock.
+        drop it. The model's request stays open for as long as its stream does,
+        and a dropped one is closed only when the garbage collector gets to it
+        -- which, for a stream a Streamlit script holds in a global, can be
+        never: Claude would generate, and bill, on to MAX_TOKENS.
 
-        With tracing on, the question is one trace: a root span opened here,
+        With tracing on, the question is one trace: a root run opened here,
         current while retrieval runs so the search and rerank nest under it,
         and ended by the stream -- however the stream ends (see `_traced`).
         Its end is why a stream that is never read should still be closed:
-        until it is, the trace is not sent.
+        until it is, the root run is not finished.
         """
-        span = _tracer().start_span(
-            "RAGPipeline",
-            attributes={
-                **_span_kind(OpenInferenceSpanKindValues.CHAIN),
-                SpanAttributes.INPUT_VALUE: question,
-                SpanAttributes.INPUT_MIME_TYPE: _TEXT,
-            },
-        )
+        root = self._open_root(question)
         try:
-            # Made current only for this synchronous stretch. Statuses are left
-            # to _finish, which tells a failure from a stop.
-            with trace.use_span(
-                span, record_exception=False, set_status_on_exception=False
-            ):
+            with _tracing(root):
                 docs = self.retrieve(question)
         except BaseException as exc:
-            _finish(span, exc)
+            if root is not None:
+                _finish(root, "", exc)
             raise
-        answer = _traced(span, self._generate(question, docs))
+        answer = _traced(root, self._generate(question, docs))
         next(answer)  # primes it; see _traced
         return docs, answer
+
+    def _open_root(self, question: str) -> RunTree | None:
+        """Start this question's root run and send it, or None if not traced.
+
+        Inside a run that is already current -- `rag eval`'s, which traces each
+        question it asks -- the root nests under that run, in its project, so
+        an experiment shows each answer's whole trace. Otherwise it starts a
+        trace of its own in LANGSMITH_PROJECT.
+        """
+        if self._tracing_client is None:
+            return None
+        inputs = {"question": question}
+        parent = get_current_run_tree()
+        if parent is not None:
+            root = parent.create_child(
+                name="RAGPipeline", run_type="chain", inputs=inputs
+            )
+        else:
+            root = RunTree(
+                name="RAGPipeline",
+                run_type="chain",
+                inputs=inputs,
+                ls_client=self._tracing_client,
+                project_name=self.settings.langsmith_project,
+            )
+        root.post()
+        return root
 
     def answer(self, question: str) -> Answer:
         """Retrieve context, then generate a grounded answer with sources.

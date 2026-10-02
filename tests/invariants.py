@@ -302,6 +302,11 @@ def _render_default(node: ast.expr | None) -> str | None:
     way, and lands in the same branch: its documentation is still required, only
     its value is not checkable.
     """
+    # bool before int, which it subclasses: documented as it is typed into an
+    # environment variable -- `false`, as LangSmith's own docs spell it -- not
+    # as Python prints it.
+    if isinstance(node, ast.Constant) and isinstance(node.value, bool):
+        return str(node.value).lower()
     if isinstance(node, ast.Constant) and isinstance(node.value, str | int):
         return str(node.value)
     # `_ROOT / "data"` is an absolute path at runtime but documented as `./data`,

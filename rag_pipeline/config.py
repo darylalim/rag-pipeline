@@ -12,7 +12,6 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, fields
 from pathlib import Path
-from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 
@@ -53,27 +52,17 @@ def _env_str(name: str, default: str) -> str:
     return value if value else default
 
 
-def _env_url(name: str, default: str) -> str:
-    # Checked here because nothing downstream checks it: the span exporter
-    # accepts any string, and one it cannot send to fails only when a trace is
-    # sent -- a line in a log, every trace lost -- rather than as a setting the
-    # app stops on and names.
+def _env_bool(name: str, default: bool) -> bool:
+    # Only "true" or "false", in any case: a value this cannot read is a
+    # malformed setting, not a quiet False. LangSmith's own reading of the same
+    # variable accepts nothing but "true", so a looser one here -- "1", "yes"
+    # -- would be a switch the two read differently.
     value = os.getenv(name)
     if not value:
         return default
-    try:
-        url = urlsplit(value)
-        # `.port` raises ValueError for a port that is not a number in range.
-        usable = (
-            url.scheme in ("http", "https") and bool(url.hostname) and url.port != 0
-        )
-    except ValueError as exc:
-        raise ValueError(f"{name}={value!r} is not a usable URL: {exc}") from exc
-    if not usable:
-        raise ValueError(
-            f"{name}={value!r} must be an http(s) URL, such as http://localhost:6006"
-        )
-    return value
+    if value.lower() in ("true", "false"):
+        return value.lower() == "true"
+    raise ValueError(f"{name}={value!r} must be true or false")
 
 
 def require_env_key(name: str, used_for: str) -> str:
@@ -164,15 +153,15 @@ class Settings:
     # which embedding similarity only approximates.
     rerank_model: str = "rerank-3"
 
-    # Tracing, off while the endpoint is empty. Set, it is the base URL of a
-    # self-hosted Phoenix (http://localhost:6006 for `phoenix serve`), and each
-    # question is sent there as one trace, over OTLP/HTTP to its /v1/traces,
-    # filed under this project. The names are the ones Phoenix's own clients
-    # read, so its docs on these two apply -- except that unset means off here,
-    # where Phoenix's clients would assume localhost. Its other client
-    # settings (an API key among them) are not read: no credentials are sent.
-    phoenix_collector_endpoint: str = ""
-    phoenix_project: str = "rag-pipeline"
+    # Tracing to LangSmith, off unless set to true: on, each question is sent
+    # to LangSmith's cloud as one trace -- the question, every passage
+    # retrieved, the prompt and the answer -- filed under this project, with
+    # LANGSMITH_API_KEY. The names are the ones LangSmith's own SDK reads, so
+    # its docs on them apply; the pipeline passes both to it explicitly for
+    # every question, so this switch, and not anything else in the
+    # environment, decides whether a question is traced.
+    langsmith_tracing: bool = False
+    langsmith_project: str = "rag-pipeline"
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -194,10 +183,8 @@ class Settings:
             retrieval_k=_env_int("RETRIEVAL_K", cls.retrieval_k),
             fetch_k=_env_int("FETCH_K", cls.fetch_k),
             rerank_model=_env_str("RERANK_MODEL", cls.rerank_model),
-            phoenix_collector_endpoint=_env_url(
-                "PHOENIX_COLLECTOR_ENDPOINT", cls.phoenix_collector_endpoint
-            ),
-            phoenix_project=_env_str("PHOENIX_PROJECT", cls.phoenix_project),
+            langsmith_tracing=_env_bool("LANGSMITH_TRACING", cls.langsmith_tracing),
+            langsmith_project=_env_str("LANGSMITH_PROJECT", cls.langsmith_project),
         )
 
 

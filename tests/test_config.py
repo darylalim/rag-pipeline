@@ -39,8 +39,9 @@ def test_defaults(fresh_interpreter):
 
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout.splitlines()[-1]) == str(_ROOT / "data")
-    # Empty: tracing is off unless asked for, so a fresh checkout sends nothing.
-    assert Settings().phoenix_collector_endpoint == ""
+    # Off: tracing sends every question to LangSmith, so a fresh checkout
+    # sends nothing until asked.
+    assert Settings().langsmith_tracing is False
 
 
 def test_from_env_overrides(monkeypatch, tmp_path):
@@ -54,8 +55,8 @@ def test_from_env_overrides(monkeypatch, tmp_path):
     monkeypatch.setenv("MONGODB_DB", "docs")
     monkeypatch.setenv("VECTOR_INDEX_NAME", "docs_index")
     monkeypatch.setenv("MONGODB_TIMEOUT_MS", "2500")
-    monkeypatch.setenv("PHOENIX_COLLECTOR_ENDPOINT", "http://phoenix.internal:6006")
-    monkeypatch.setenv("PHOENIX_PROJECT", "docs-qa")
+    monkeypatch.setenv("LANGSMITH_TRACING", "true")
+    monkeypatch.setenv("LANGSMITH_PROJECT", "docs-qa")
     # Relative, so the resolution is observable: a path setting is fixed to an
     # absolute path when read, not reinterpreted against whatever directory a
     # later call happens to run in.
@@ -78,10 +79,8 @@ def test_from_env_overrides(monkeypatch, tmp_path):
     assert s.vector_index_name == "docs_index"
     assert s.mongodb_timeout_ms == 2500
     assert s.data_dir == (tmp_path / "corpus").resolve()
-    # Kept as given: the collector path is appended where spans are sent, so a
-    # base URL and one naming a proxy prefix both mean what they say.
-    assert s.phoenix_collector_endpoint == "http://phoenix.internal:6006"
-    assert s.phoenix_project == "docs-qa"
+    assert s.langsmith_tracing is True
+    assert s.langsmith_project == "docs-qa"
 
 
 @pytest.mark.parametrize("var", ["DATA_DIR"])
@@ -99,43 +98,34 @@ def test_an_unusable_path_setting_is_a_value_error_naming_it(monkeypatch, var):
         Settings.from_env()
 
 
-@pytest.mark.parametrize(
-    "endpoint",
-    [
-        "localhost:6006",  # no scheme: urlsplit reads "localhost" as one
-        "grpc://localhost:4317",
-        "http://",
-        "http://localhost:not-a-port",
-        "http://localhost:0",
-    ],
-)
-def test_an_unusable_phoenix_endpoint_is_a_value_error_naming_it(monkeypatch, endpoint):
-    """Refused where it is read, not where spans are sent.
+@pytest.mark.parametrize("value", ["1", "yes", "on", "ture"])
+def test_a_tracing_switch_that_is_not_true_or_false_is_a_value_error(
+    monkeypatch, value
+):
+    """Refused, not read as off -- nor as on.
 
-    The exporter takes any string, and one it cannot post to fails only on
-    export, as a log line on a background thread -- every trace lost, and
-    nothing on screen to say why. A ValueError here is what streamlit_app.py stops on
-    above its sidebar and what the CLI prints as its one-line error.
+    LangSmith reads the same variable and accepts only "true". A looser reading
+    here would be a switch the two disagree on, and a quiet False would leave
+    someone who typed "1" wondering where their traces are. A ValueError is
+    what streamlit_app.py stops on above its sidebar and the CLI prints as its
+    one-line error.
     """
-    monkeypatch.setenv("PHOENIX_COLLECTOR_ENDPOINT", endpoint)
+    monkeypatch.setenv("LANGSMITH_TRACING", value)
 
-    with pytest.raises(ValueError, match="PHOENIX_COLLECTOR_ENDPOINT"):
+    with pytest.raises(ValueError, match="LANGSMITH_TRACING"):
         Settings.from_env()
 
 
 @pytest.mark.parametrize(
-    "endpoint",
-    [
-        "http://localhost:6006",
-        "https://phoenix.example.com",
-        "http://127.0.0.1:6006/phoenix/",  # behind a reverse proxy
-        "http://[::1]:6006",
-    ],
+    ("value", "on"),
+    [("true", True), ("TRUE", True), ("False", False), ("false", False)],
 )
-def test_a_usable_phoenix_endpoint_is_accepted(monkeypatch, endpoint):
-    monkeypatch.setenv("PHOENIX_COLLECTOR_ENDPOINT", endpoint)
+def test_the_tracing_switch_reads_true_or_false_in_any_case(monkeypatch, value, on):
+    """Any case, since `wired_env` exports a setting as Python writes it
+    ("False"), and a person may too."""
+    monkeypatch.setenv("LANGSMITH_TRACING", value)
 
-    assert Settings.from_env().phoenix_collector_endpoint == endpoint
+    assert Settings.from_env().langsmith_tracing is on
 
 
 def test_from_env_uses_defaults_when_unset(monkeypatch):

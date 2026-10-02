@@ -571,12 +571,20 @@ def read_baseline(path: Path = BASELINE_PATH) -> dict[str, Any] | None:
 
 
 def eval_settings(settings: Settings) -> Settings:
-    """`settings` pointed at the eval corpus and its own collection.
+    """`settings` pointed at the eval corpus and its own collection, traced.
 
     Everything else -- the models, chunking, k -- is kept, because that is what
-    is being evaluated.
+    is being evaluated. Tracing is switched on whatever the caller's setting:
+    each question then nests its whole trace -- the search, the rerank, the
+    prompt -- under its row of the experiment, which already holds the
+    question, the passages and the answer, so nothing new leaves the machine.
     """
-    return replace(settings, data_dir=EVAL_CORPUS, collection_name=EVAL_COLLECTION)
+    return replace(
+        settings,
+        data_dir=EVAL_CORPUS,
+        collection_name=EVAL_COLLECTION,
+        langsmith_tracing=True,
+    )
 
 
 def fit_eval_index(settings: Settings, timeout_s: float = 180.0) -> bool:
@@ -653,8 +661,8 @@ def run(settings: Settings, *, save_baseline: bool = False) -> list[str]:
             evaluators=[retrieval_hit, retrieval_rank, *make_judge_evaluators(judge)],
             experiment_prefix=_EXPERIMENT_PREFIX,
             metadata={"judge": JUDGE_MODEL, **_comparable_settings(settings)},
-            # One question at a time: the local models serialize on their locks
-            # anyway, and the answers' order then matches the dataset's.
+            # One question at a time, so the answers' order matches the
+            # dataset's.
             max_concurrency=0,
             client=client,
         )

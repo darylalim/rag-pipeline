@@ -77,7 +77,12 @@ def test_the_eval_corpus_outnumbers_what_vector_search_fetches():
 
 
 def test_eval_settings_swap_the_corpus_and_collection_but_keep_the_models(settings):
+    """The models are what is evaluated, so they are kept; tracing is on, so an
+    experiment's rows carry each question's whole trace."""
     evaluated = ev.eval_settings(settings)
+
+    assert evaluated.langsmith_tracing is True
+    assert not settings.langsmith_tracing
 
     assert evaluated.data_dir == ev.EVAL_CORPUS
     assert evaluated.collection_name == ev.EVAL_COLLECTION != settings.collection_name

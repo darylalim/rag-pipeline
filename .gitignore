@@ -4,8 +4,9 @@ __pycache__/
 .venv*/
 *.egg-info/
 
-# Environment / secrets. `.env.*` includes the `.env.phoenix` Phoenix's own
-# clients read; `.env.example` is the template, so it stays tracked.
+# Environment / secrets. `.env.*` covers every variant -- `.env.local`, or a
+# `.env.phoenix` left from the Phoenix tracing of earlier versions;
+# `.env.example` is the template, so it stays tracked.
 .env
 .env.*
 !.env.example

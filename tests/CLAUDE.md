@@ -11,8 +11,7 @@ the root `CLAUDE.md`: production passes no models and tests inject fakes, what
 | the store | `settings` — which takes `atlas`: the session's atlas-local container as `MONGODB_URI`, and a database of the test's own, dropped after it. A test that needs a second collection uses another `COLLECTION_NAME` in that database, never another database |
 | a frontend (`streamlit_app.py` or `cli.py`) over fakes | `wired_env` — every `ENV_VARS` name from `settings`, and fakes behind the three model factories. Derived from `ENV_VARS` because a hand-kept list would let the developer's `.env` answer a missed name |
 | the real chat model, down to whether its HTTP response was closed | `fake_claude` — a real Anthropic SDK client over `httpx2.MockTransport` (`fake_claude.py`): set `pieces`, `stop_reason`, `on_piece` or `respond`, take `.chat()`, read `requests`/`bodies` afterwards |
-| asserting on spans | `spans` — production's provider, a synchronous processor into memory, LangChain instrumented; all undone after |
-| running `setup_tracing` for real | `undo_tracing` |
+| asserting on a question's trace | `traces` — the real LangSmith `Client`, unbatched, its HTTP adapter replaced by a recorder (`fake_langsmith.py`), patched in as `pipeline.tracing_client`; turn tracing on in the test's settings (`langsmith_tracing=True`) or, for a frontend, with `LANGSMITH_TRACING=true`, then read `runs`, `named()` or `parents()` |
 | what only a fresh process shows (a library reading a variable as it is first imported) | `fresh_interpreter` |
 | a generation that fails partway, as a real one would | `fail_mid_stream` |
 
@@ -33,21 +32,22 @@ the root `CLAUDE.md`: production passes no models and tests inject fakes, what
   connection means something is calling a model API, phoning home, or reaching
   a real cluster. Unix sockets — Docker's API — stay open. `live` tests are
   exempt.
-- `_no_tracing` (session-scoped) deletes `PHOENIX_COLLECTOR_ENDPOINT` and forces
-  LangSmith's switches to `false` (the pipeline no longer uses LangSmith, but
-  langsmith ships inside langchain-core and still acts on them). `.env` is loaded
-  at import time, and either would otherwise send test traces from a background
-  flush that can land after `_offline` is undone. **`_offline` cannot catch an
-  exporter**: the socket block's `RuntimeError` is caught inside the tracing
-  stack and only logged — by the exporter's own HTTP transport from
-  OpenTelemetry 1.45, by the batch processor before — so the test passes.
-- `_no_tracer_left_on` is what makes that failure loud: after every test it
-  fails one that left a global tracer provider installed or LangChain
-  instrumented. It switches tracing off first, through the same
-  `_switch_tracing_off()` as `undo_tracing`, so only the test that leaked fails
+- `_no_tracing` (session-scoped) forces every spelling of LangSmith's switch to
+  `false` — `LANGSMITH_TRACING`, which `Settings` reads, and the others
+  LangSmith acts on by itself. `.env` is loaded at import time, and a `true`
+  there would otherwise send test questions from a background thread whose
+  queue is drained at exit, after `_offline` is undone. **`_offline` cannot
+  catch that thread**: it logs the socket block's error and carries on, so the
+  test passes. `_no_real_store` removes `LANGSMITH_API_KEY` as well.
+- `_no_tracer_left_on` fails, after every test, one that left a LangSmith
+  tracing context set — a current run, or tracing switched on — which every
+  later test on the thread would inherit. The pipeline enters its context only
+  around synchronous steps, never across a yield, so this is what notices if
+  that changes. It clears the context first (`_set_tracing_context(None)`), so
+  only the test that leaked fails
   (`test_a_leak_fails_only_the_test_that_left_tracing_on`, in a pytest
-  subprocess). OpenTelemetry allows one global provider per process, and
-  `opentelemetry-test-utils`' `reset_trace_globals()` is what undoes it.
+  subprocess). A generator-based context manager left open must be *held* to
+  stay open: collected, it runs its own exit.
 - `_reset_store_client` closes the process's MongoDB clients at every test
   boundary, so each test starts as a fresh process would — something production
   must never do (root `CLAUDE.md`, "One MongoDB client per process").

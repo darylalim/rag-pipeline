@@ -21,7 +21,6 @@ tests inside the suite's no-real-model guarantee.
 from __future__ import annotations
 
 import dataclasses
-import importlib.util
 import json
 import subprocess
 import sys
@@ -31,7 +30,6 @@ import pytest
 from rag_pipeline import cli
 from rag_pipeline import ingest as ingest_mod
 from rag_pipeline import pipeline as pipeline_mod
-from rag_pipeline import tracing as tracing_mod
 
 # The real factories, bound before `wired_env` swaps fakes in on the modules:
 # the tests below that are about the production path put these back.
@@ -168,23 +166,23 @@ def test_a_malformed_numeric_setting_is_an_error_not_a_traceback(
 def test_a_variable_refused_at_import_is_an_error_not_a_traceback(fresh_interpreter):
     """ValueError again, raised by an import rather than by `from_env`.
 
-    The OpenTelemetry SDK refuses a malformed OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT as
-    it is imported, which langsmith (inside langchain-core) does whether or not
-    tracing is on -- so the
-    command's own imports raise it, and they are inside main()'s try only
-    because they are lazy. In a fresh interpreter, because this one has long
-    since imported the SDK and would never read the variable again.
+    huggingface_hub, which voyageai's tokenizers import, refuses a malformed
+    HF_HUB_ETAG_TIMEOUT as it is imported -- so the command's own imports raise
+    it, and they are inside main()'s try only because they are lazy. Its
+    message is int()'s own, naming the value rather than the variable. In a
+    fresh interpreter, because this one has long since imported the library
+    and would never read the variable again.
     """
     result = fresh_interpreter(
         "from rag_pipeline.cli import main\nraise SystemExit(main())",
         "query",
         "anything",
-        OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT="abc",
+        HF_HUB_ETAG_TIMEOUT="abc",
     )
 
     assert result.returncode == 1, result.stderr
     assert result.stderr.startswith("Error: ")
-    assert "OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT" in result.stderr
+    assert "'abc'" in result.stderr
     assert "Traceback" not in result.stderr
 
 
@@ -315,25 +313,22 @@ def test_settings_come_from_the_environment_not_a_literal(
     assert wired_env.collection_name not in names
 
 
-def test_a_question_sets_up_tracing_and_an_ingest_does_not(indexed, monkeypatch):
-    """From the command's own Settings, and only for `rag query`.
-
-    A question is the one thing traced. An ingest emits no spans, so setting
-    tracing up there would only load the instrumentation and the exporter and
-    start an exporter thread with nothing to send.
-    """
-    seen: list[str] = []
-    monkeypatch.setattr(
-        tracing_mod,
-        "setup_tracing",
-        lambda settings: seen.append(settings.phoenix_collector_endpoint),
-    )
-    monkeypatch.setenv("PHOENIX_COLLECTOR_ENDPOINT", "http://phoenix.test:6006")
+def test_a_question_is_traced_from_the_commands_own_settings(
+    indexed, traces, monkeypatch
+):
+    """`rag query` traces as LANGSMITH_TRACING says, read by the command itself,
+    and the question arrives as one trace. An ingest sends nothing: it runs
+    nothing a trace would describe."""
+    monkeypatch.setenv("LANGSMITH_TRACING", "true")
 
     assert cli.main(["ingest"]) == 0
-    assert seen == []
+    assert traces.runs == []
     assert cli.main(["query", "Why do chunks overlap?"]) == 0
-    assert seen == ["http://phoenix.test:6006"]
+
+    root = traces.named("RAGPipeline")
+    assert root["inputs"] == {"question": "Why do chunks overlap?"}
+    assert root["outputs"]["answer"]
+    assert {run["trace_id"] for run in traces.runs} == {root["id"]}
 
 
 # --- the cost of `rag --help` ------------------------------------------------
@@ -342,14 +337,7 @@ def test_a_question_sets_up_tracing_and_an_ingest_does_not(indexed, monkeypatch)
 # cli.py reaches all of it, but only from inside a command function: importing
 # the module must not pay for a stack the user may never reach, since `rag
 # --help` and a usage error load cli.py and then exit.
-HEAVY = ("pymongo", "langchain_mongodb", "voyageai", "anthropic")
-
-# What tracing loads once it is on: the LangChain instrumentation and the span
-# exporter. Off, the pipeline carries the OpenTelemetry API alone.
-TRACING_STACK = (
-    "openinference.instrumentation",
-    "opentelemetry.exporter.otlp.proto.http",
-)
+HEAVY = ("pymongo", "langchain_mongodb", "voyageai", "anthropic", "langsmith")
 
 # Records which HEAVY modules are loaded after importing cli.py, then again after
 # importing the store and query modules -- one interpreter, so the second
@@ -361,10 +349,6 @@ import rag_pipeline.cli
 loaded["cli"] = [m for m in {heavy!r} if m in sys.modules]
 import rag_pipeline.ingest, rag_pipeline.pipeline
 loaded["pipeline"] = [m for m in {heavy!r} if m in sys.modules]
-from rag_pipeline.config import Settings
-from rag_pipeline.tracing import setup_tracing
-setup_tracing(Settings())  # what both frontends do with tracing off
-loaded["tracing"] = [m for m in {tracing!r} if m in sys.modules]
 print(json.dumps(loaded))
 """
 
@@ -383,7 +367,7 @@ def heavy_modules_loaded() -> dict:
         [
             sys.executable,
             "-c",
-            _IMPORT_PROBE.format(heavy=HEAVY, tracing=TRACING_STACK),
+            _IMPORT_PROBE.format(heavy=HEAVY),
         ],
         capture_output=True,
         text=True,
@@ -411,19 +395,3 @@ def test_importing_cli_does_not_load_the_heavy_stack(heavy_modules_loaded):
         f"importing cli.py loaded: {heavy_modules_loaded['cli']}"
     )
     assert set(HEAVY) <= set(heavy_modules_loaded["pipeline"])
-
-
-def test_tracing_off_loads_none_of_the_tracing_stack(heavy_modules_loaded):
-    """Off is the default, and costs nothing: setup_tracing imports the
-    instrumentation and the exporter itself, and only once it has an endpoint.
-
-    The probe takes the frontends' own path -- import everything, then call
-    setup_tracing with the default Settings -- so an import hoisted to the top
-    of tracing.py, or above its endpoint check, shows up here. The control is
-    that every name is a real, installed module: a misspelled one is never
-    loaded, and would pass forever.
-    """
-    assert all(importlib.util.find_spec(name) for name in TRACING_STACK)
-    assert not heavy_modules_loaded["tracing"], (
-        f"tracing off loaded: {heavy_modules_loaded['tracing']}"
-    )

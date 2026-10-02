@@ -41,15 +41,7 @@ import pytest
 from langchain_core.documents.compressor import BaseDocumentCompressor
 from langchain_core.embeddings import DeterministicFakeEmbedding
 from langchain_core.language_models import FakeListChatModel
-from openinference.instrumentation import TracerProvider
-from openinference.instrumentation.langchain import LangChainInstrumentor
-from opentelemetry import trace
-from opentelemetry.sdk.trace import TracerProvider as SDKTracerProvider
-from opentelemetry.sdk.trace.export import SimpleSpanProcessor
-from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
-    InMemorySpanExporter,
-)
-from opentelemetry.test.globals_test import reset_trace_globals
+from langsmith.run_helpers import _set_tracing_context, get_tracing_context
 from pymongo import MongoClient
 from pymongo.operations import SearchIndexModel
 
@@ -58,6 +50,7 @@ from rag_pipeline import pipeline as pipeline_mod
 from rag_pipeline.config import ENV_VARS, Settings
 from rag_pipeline.ingest import reset_store_cache
 from tests.fake_claude import FakeClaude
+from tests.fake_langsmith import TraceRecorder
 
 # pytest's own harness for running a pytest session inside a test: how
 # test_offline_guard shows what the tracing guard leaves for the test after it.
@@ -150,8 +143,14 @@ _START_ATTEMPTS = 3
 _START_RETRY_S = 5.0
 # Credentials and other variables a developer's environment (or .env) holds
 # that no test may inherit.
-_CREDENTIALS = ("MONGODB_URI", "ANTHROPIC_API_KEY", "VOYAGE_API_KEY")
-# What a test marked `models` keeps: the live tests call Voyage's API.
+_CREDENTIALS = (
+    "MONGODB_URI",
+    "ANTHROPIC_API_KEY",
+    "VOYAGE_API_KEY",
+    "LANGSMITH_API_KEY",
+)
+# What a test marked `live` keeps: the live tests call Anthropic's and Voyage's
+# APIs. Never LangSmith's: nothing live is traced.
 _LIVE_CREDENTIALS = ("VOYAGE_API_KEY", "ANTHROPIC_API_KEY")
 
 
@@ -324,54 +323,24 @@ def fake_claude() -> FakeClaude:
 
 
 @pytest.fixture
-def spans() -> Iterator[InMemorySpanExporter]:
-    """Every span the test produces, recorded in memory as tracing-on would.
+def traces(monkeypatch) -> Iterator[TraceRecorder]:
+    """Every run a test with tracing on would send to LangSmith, recorded.
 
-    The provider production installs -- OpenInference's, whose attribute cap a
-    reranker span over a large FETCH_K needs -- with LangChain instrumented
-    against it, but a synchronous processor into memory in place of the batched
-    exporter, so a span can be asserted on the moment it ends. All of it is
-    undone afterwards: OpenTelemetry allows one provider per process, and
-    LangChain's hook is process-wide, so either left in place would trace every
-    later test.
+    Production's own path, with only the client swapped: the pipeline asks
+    `tracing_client` for one exactly as it does for real, and gets a client
+    that records instead of sending (``fake_langsmith.py``). A test turns
+    tracing on in its settings, as a user would -- ``langsmith_tracing=True``.
     """
-    exporter = InMemorySpanExporter()
-    provider = TracerProvider()
-    provider.add_span_processor(SimpleSpanProcessor(exporter))
-    trace.set_tracer_provider(provider)
-    LangChainInstrumentor().instrument(tracer_provider=provider)
+    recorder = TraceRecorder()
+    monkeypatch.setattr(
+        pipeline_mod,
+        "tracing_client",
+        lambda s: recorder.client if s.langsmith_tracing else None,
+    )
     try:
-        yield exporter
+        yield recorder
     finally:
-        LangChainInstrumentor().uninstrument()
-        provider.shutdown()
-        reset_trace_globals()
-
-
-def _switch_tracing_off() -> None:
-    """Undo whatever of tracing is on: LangChain's hook, then the provider.
-
-    One undo for both callers -- `undo_tracing` after a test that set tracing
-    up on purpose, `_no_tracer_left_on` after one that left it on by mistake --
-    so the two cannot drift apart as setup comes to install more.
-    """
-    if LangChainInstrumentor().is_instrumented_by_opentelemetry:
-        LangChainInstrumentor().uninstrument()
-    provider = trace.get_tracer_provider()
-    if isinstance(provider, SDKTracerProvider):
-        provider.shutdown()
-    reset_trace_globals()
-
-
-@pytest.fixture
-def undo_tracing() -> Iterator[None]:
-    """For a test that runs `setup_tracing` for real: switch tracing back off.
-
-    Everything setup installs is process-wide, and `_no_tracer_left_on` fails
-    the test that leaves any of it behind.
-    """
-    yield
-    _switch_tracing_off()
+        recorder.client.close()
 
 
 @pytest.fixture
@@ -405,12 +374,10 @@ def fresh_interpreter(tmp_path) -> Callable[..., subprocess.CompletedProcess[str
     from the environment once, as they are first imported, and this process
     imported all of them before the first test ran. Left out of the child are
     the developer's own settings -- this repo's (config.py's load_dotenv() has
-    put .env's in os.environ, credentials included) and OpenTelemetry's -- and
-    .env is switched off, or config.py would read it straight back in. So is
-    what this package sets for itself as it is imported
-    (TRANSFORMERS_NO_ADVISORY_WARNINGS): this process's import already put it
-    in os.environ, and inherited, it would answer for the child's own. No
-    credential is set, so the child can reach no model and open no store, which is also what keeps it offline: ``_offline`` cannot
+    put .env's in os.environ, credentials included) and LangSmith's -- and
+    .env is switched off, or config.py would read it straight back in. No
+    credential is set, so the child can reach no model, open no store and
+    trace nothing, which is also what keeps it offline: ``_offline`` cannot
     reach into another process.
 
     Here rather than in one frontend's test file because both frontends have to
@@ -423,8 +390,7 @@ def fresh_interpreter(tmp_path) -> Callable[..., subprocess.CompletedProcess[str
             for name, value in os.environ.items()
             if name not in ENV_VARS
             and name not in _CREDENTIALS
-            and name != "TRANSFORMERS_NO_ADVISORY_WARNINGS"
-            and not name.startswith(("OTEL_", "LANGSMITH_", "LANGCHAIN_"))
+            and not name.startswith(("LANGSMITH_", "LANGCHAIN_"))
         }
         child |= {
             "PYTHON_DOTENV_DISABLED": "1",
@@ -489,23 +455,22 @@ def is_live(node) -> bool:
 def _no_tracing():
     """Keep tracing off, whatever the developer's .env says.
 
-    config.py loads .env at import time, so a ``PHOENIX_COLLECTOR_ENDPOINT``
-    there would reach every test that builds its settings from the
-    environment -- both frontends -- and each would install a real exporter.
-    ``_offline`` does not stop one: the tracing stack catches the socket block's
-    error and logs it, and a batch still queued at exit is sent after the block
-    is undone, into the developer's own Phoenix.
+    config.py loads .env at import time, so a ``LANGSMITH_TRACING=true`` there
+    would reach every test that builds its settings from the environment --
+    both frontends -- and each would build a real client and send its
+    questions. ``_offline`` does not stop one: the client sends from a
+    background thread, which logs the socket block's error and carries on, and
+    a batch still queued at exit is sent after the block is undone, into the
+    developer's own LangSmith project.
 
-    LangSmith is switched off as well. The pipeline no longer uses it, but
-    langsmith still ships inside langchain-core and still acts on
-    ``LANGSMITH_TRACING=true``, uploading every chain from a background thread.
-    Every spelling is set, because the first one found wins and "false" also
-    keeps langchain-core's legacy ``LANGCHAIN_TRACING`` check quiet.
-    Session-scoped because langsmith reads these once per process and caches
-    the answer, so they must be in place before the first chain runs.
+    Every spelling is set, not only the one ``Settings`` reads: LangSmith also
+    switches itself on from the others for any chain run outside the
+    pipeline's explicit context, the first one found wins, and "false" keeps
+    langchain-core's legacy ``LANGCHAIN_TRACING`` check quiet. Session-scoped
+    because langsmith reads these once per process and caches the answer, so
+    they must be in place before the first chain runs.
     """
     with pytest.MonkeyPatch.context() as mp:
-        mp.delenv("PHOENIX_COLLECTOR_ENDPOINT", raising=False)
         for var in (
             "LANGSMITH_TRACING_V2",
             "LANGCHAIN_TRACING_V2",
@@ -517,41 +482,40 @@ def _no_tracing():
 
 
 def _tracing_left_on() -> list[str]:
-    """What of tracing is switched on process-wide right now, if anything."""
+    """What of a LangSmith tracing context is still in place, if anything."""
+    context = get_tracing_context()
     left = []
-    if not isinstance(trace.get_tracer_provider(), trace.ProxyTracerProvider):
-        left.append("a tracer provider is installed")
-    if LangChainInstrumentor().is_instrumented_by_opentelemetry:
-        left.append("LangChain is instrumented")
+    if context["parent"] is not None:
+        left.append(f"run {context['parent'].name!r} is current")
+    if context["enabled"] is not None:
+        left.append(f"tracing is set to {context['enabled']!r}")
     return left
 
 
 @pytest.fixture
 def tracing_left_on() -> Callable[[], list[str]]:
     """`_no_tracer_left_on`'s check, callable: test_offline_guard trips it, and
-    test_tracing shows it staying quiet."""
+    test_tracing checks it between the pieces of an answer."""
     return _tracing_left_on
 
 
 @pytest.fixture(autouse=True)
 def _no_tracer_left_on():
-    """Fail a test that leaves tracing switched on behind it.
+    """Fail a test that leaves a tracing context behind it.
 
-    `setup_tracing` installs a provider for the life of the process -- that is
-    its job -- so a test that reaches it with an endpoint would trace every test
-    after it, and export them. Checked after the test, and after `spans` has
-    undone its own provider: an autouse fixture is torn down last.
+    LangSmith keeps the current run, and whether tracing is on, in context
+    variables, which every later test on this thread would inherit: one left
+    set would trace those tests, under a run that has ended. The pipeline
+    enters its context only around synchronous steps, never across a yield, so
+    nothing should ever be left -- this is what notices if that changes.
 
-    Switched off before failing, so the failure is that test's alone. Left on,
-    the tests after it would fail for it too, far from the cause: each trips
-    this check again until one happens to undo tracing, and one that sets
-    tracing up finds it already done -- setup returns early, installing and
-    raising nothing.
+    Cleared before failing, so the failure is that test's alone. Left set, the
+    tests after it would fail for it too, far from the cause.
     """
     yield
     left = _tracing_left_on()
     if left:
-        _switch_tracing_off()
+        _set_tracing_context(None)
     assert not left, f"the test left tracing on: {', '.join(left)}"
 
 

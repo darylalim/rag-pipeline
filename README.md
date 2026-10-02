@@ -26,15 +26,12 @@ switches off Streamlit's usage statistics, which its browser front end would
 otherwise send to Streamlit, and its first-run prompt for an email address, and
 keeps the app to this machine — though
 Streamlit can still look up the machine's external IP address (see
-[below](#3-or-use-the-chat-app)). Tracing keeps to it as well: it is off unless
-you turn it on, and then goes to a [Phoenix](#tracing-with-phoenix) server you
-run yourself. (LangSmith is not used for tracing — `rag eval` keeps its
-questions and results there — but see [below](#tracing-with-phoenix) if an old
-`.env` still switches LangSmith tracing on.)
+[below](#3-or-use-the-chat-app)). [Tracing](#tracing-with-langsmith) is off
+unless you turn it on; on, every question is also sent to LangSmith.
 
 **Contents** — [Prerequisites](#prerequisites) · [Setup](#setup) ·
 [Usage](#usage) · [Add your own documents](#add-your-own-documents) ·
-[Evaluation](#evaluation) · [Tracing with Phoenix](#tracing-with-phoenix) ·
+[Evaluation](#evaluation) · [Tracing with LangSmith](#tracing-with-langsmith) ·
 [Configuration](#configuration) · [Development](#development) ·
 [Project structure](#project-structure) · [How it works](#how-it-works) ·
 [Invariants](#invariants)
@@ -236,7 +233,7 @@ give yours names of their own. And a `DATA_DIR` pointed elsewhere inside the
 checkout is not covered: list it in `.git/info/exclude`. Their text is also
 stored in your Atlas cluster, which is as private as its access list and
 database users. Secrets beside the code
-are ignored too — `.env` and its variants such as `.env.phoenix`, and
+are ignored too — `.env` and its variants such as `.env.local`, and
 Streamlit's `.streamlit/secrets.toml`; only the `.env.example` template is
 tracked.
 
@@ -308,86 +305,68 @@ Some things to know:
   unscored.
 - **A baseline needs every question scored.** `--save-baseline` refuses a run in
   which a question failed or a grade was declined.
-- **Only the eval talks to LangSmith.** It does not switch LangSmith tracing on
-  for anything else.
+- **Every row of an experiment carries its question's whole trace** — the
+  search, the rerank and the prompt, nested under it — whatever
+  `LANGSMITH_TRACING` says, since the eval sends LangSmith those passages
+  anyway. It does not switch tracing on for anything else.
 
-## Tracing with Phoenix
+## Tracing with LangSmith
 
-Optional, and off unless you set it up. With it on, every question — from the
+Optional, and off unless you turn it on. With it on, every question — from the
 terminal or the app — is recorded as one trace in
-[Arize Phoenix](https://github.com/Arize-ai/phoenix), an open-source LLM
-observability server that you run on your own machine:
+[LangSmith](https://smith.langchain.com), LangChain's hosted observability
+service:
 
 ```
-RAGPipeline                 CHAIN      the question, and the answer
-├─ VectorStoreRetriever     RETRIEVER  the FETCH_K candidates the vector search returned
-├─ VoyageAIRerank           RERANKER   those candidates in; the RETRIEVAL_K kept, with scores, out
-└─ generate                 CHAIN
-   ├─ ChatPromptTemplate    PROMPT     the prompt, with the passages filled in
-   └─ ClaudeChatModel       LLM        the messages, the answer, token counts, finish reason
+RAGPipeline                 chain      the question, and the answer
+├─ VectorStoreRetriever     retriever  the FETCH_K candidates the vector search returned
+├─ _VoyageRerank            retriever  those candidates in; the RETRIEVAL_K kept, with scores, out
+└─ generate                 chain
+   ├─ ChatPromptTemplate    prompt     the prompt, with the passages filled in
+   └─ ClaudeChatModel       llm        the messages, the answer, token counts, why it stopped
 ```
 
-Start the server (no Docker: `uvx` fetches it into uv's cache on the first run,
-about 670 MB and a minute or so), leaving it running in its own terminal:
+Turn it on in `.env`, with an API key from LangSmith's settings page (the one
+`rag eval` uses, if you have set that up):
 
 ```bash
-PHOENIX_HOST=127.0.0.1 PHOENIX_ALLOW_EXTERNAL_RESOURCES=false \
-  uvx --from arize-phoenix phoenix serve
+LANGSMITH_TRACING=true
+LANGSMITH_API_KEY=lsv2_...
 ```
 
-Then point the pipeline at it in `.env`:
-
-```bash
-PHOENIX_COLLECTOR_ENDPOINT=http://localhost:6006
-```
-
-and open <http://localhost:6006>. Traces are filed under the `rag-pipeline`
-project (`PHOENIX_PROJECT`), which the first one creates, and Phoenix keeps
-them in SQLite under `~/.phoenix` (`PHOENIX_WORKING_DIR` moves it).
+Traces are filed under the `rag-pipeline` project (`LANGSMITH_PROJECT`), which
+the first one creates. The app's sidebar says when tracing is on. Set
+`LANGSMITH_ENDPOINT` too if your LangSmith account is in another region
+(`https://eu.api.smith.langchain.com` for the EU); it is LangSmith's own
+variable, read by its client. LangSmith's free plan includes 5,000 traces a
+month, about three months at 50 questions a day.
 
 - **A trace holds everything:** the question, every retrieved passage in full,
-  the prompt and the answer. Phoenix has no login by default, and it listens
-  on every network interface, which would open all of that to your local
-  network. `PHOENIX_HOST=127.0.0.1` keeps it to this machine. Keep it private
-  that way rather than with Phoenix's own authentication: the pipeline sends no
-  credentials, so an authenticated Phoenix refuses every trace (a `401` on
-  stderr). Its gRPC collector (port 4317) listens on every interface regardless.
-  The pipeline sends over HTTP and never uses it, but it will accept spans from
-  the network.
-- **What still leaves the machine:** `PHOENIX_ALLOW_EXTERNAL_RESOURCES=false`
-  turns off the server's usage telemetry and its docs-assistant connection. It
-  cannot stop two things. On its first start in a working directory, the server
-  downloads a 26 MB WebAssembly runtime from GitHub. And while the UI is open,
-  the browser asks PyPI for the latest release and GitHub for the star count.
-  Neither carries trace data.
+  the prompt and the answer — all sent to LangSmith's cloud.
+- **Off means off.** `LANGSMITH_TRACING` is the one switch: the pipeline tells
+  LangSmith on every question whether to trace it, so a leftover
+  `LANGCHAIN_TRACING_V2=true` from an older `.env` — which LangSmith would
+  otherwise act on by itself — no longer sends anything. A value other than
+  `true` or `false` is refused rather than read as off.
 - **Stopping an answer is not a failure:** a Stop in the app, or Ctrl-C at the
-  terminal, gives the root span a `stopped` event and the partial answer, and
-  leaves its status unset. LangChain's own spans for the generation do show an
-  error — the model's always, and on Ctrl-C the `generate` chain's too —
-  because LangChain reports a closed or interrupted stream to its tracer as
-  one.
-- **If Phoenix is down, answers are unaffected.** Spans are sent from a
-  background thread. Each batch that fails is logged on stderr as it fails (a
-  `Transient error ... Connection refused` warning, then `Failed to export spans
-  batch ...` — `span batch` before OpenTelemetry 1.45), so at a terminal these
-  lines can land in the middle of a streaming answer. Whatever is still queued
-  is tried once more at exit, where a `rag query` waits about a second longer
-  — about two for a remote host that never answers (four before OpenTelemetry
-  1.45).
+  terminal, ends the question's trace tagged `stopped`, with the partial answer
+  and no error. LangChain's own runs for the generation do show an error — the
+  model's always, and on Ctrl-C the `generate` chain's too — because LangChain
+  reports a closed or interrupted stream to its tracer as one.
+- **If LangSmith is unreachable, answers are unaffected.** Runs are sent from a
+  background thread, and failures are logged on stderr — so at a terminal a
+  warning can land in the middle of a streaming answer. What is still queued
+  when a `rag query` finishes is sent before it exits: with LangSmith refusing
+  connections that costs a fraction of a second, and with a network that drops
+  them silently about 10 seconds, which is as low as LangSmith's client goes.
 - **Only questions are traced.** Nothing in ingest is a LangChain run.
-- **LangSmith is not used for tracing — but an old `.env` may still switch it on.**
-  langchain-core still acts on `LANGSMITH_TRACING=true` (or
-  `LANGCHAIN_TRACING_V2=true`) by itself, and while either is set it uploads
-  every question — the prompt, every retrieved passage and the answer — to
-  LangSmith's cloud, whether or not Phoenix is on. Earlier versions of
-  `.env.example` suggested them, so delete them from your `.env`.
 
 ## Configuration
 
 `MONGODB_URI`, `VOYAGE_API_KEY` and `ANTHROPIC_API_KEY` are required (see
-[Setup](#setup)); they are credentials, not settings, so it has no default and the app never displays it. Every setting has
-a default and can be overridden in `.env` (see `.env.example`) or the
-environment:
+[Setup](#setup)); they are credentials, not settings, so they have no default
+and the app never displays them. Every setting has a default and can be
+overridden in `.env` (see `.env.example`) or the environment:
 
 | Variable            | Default            | Purpose |
 | ------------------- | ------------------ | ------- |
@@ -405,8 +384,8 @@ environment:
 | `COLLECTION_NAME`   | `rag_docs`         | Atlas collection holding the chunks and their vectors — must match between ingest and query |
 | `VECTOR_INDEX_NAME` | `vector_index`     | Atlas Vector Search index over them; `rag ingest` creates it — must match between ingest and query |
 | `MONGODB_TIMEOUT_MS` | `10000`           | How long to wait to reach the cluster before failing; generous because a paused free cluster resumes slowly |
-| `PHOENIX_COLLECTOR_ENDPOINT` |           | Base URL of the Phoenix server to trace questions to — `http://localhost:6006` for a local `phoenix serve`. Unset, tracing is off (see [Tracing with Phoenix](#tracing-with-phoenix)) |
-| `PHOENIX_PROJECT`   | `rag-pipeline`     | Phoenix project the traces are filed under; the first trace creates it |
+| `LANGSMITH_TRACING` | `false`            | `true` sends each question to LangSmith as one trace, with `LANGSMITH_API_KEY` (see [Tracing with LangSmith](#tracing-with-langsmith)); only `true` or `false` |
+| `LANGSMITH_PROJECT` | `rag-pipeline`     | LangSmith project the traces are filed under; the first trace creates it |
 
 API keys are not settings: they have no default, and are never shown in the
 app's sidebar or in an error. The three the pipeline reads are in
@@ -458,15 +437,15 @@ keep the rest honest:
   instead of calling a paid API; only the container's URI is ever set.
 - Every socket to a host other than this machine is blocked, so nothing reaches
   a real cluster, a model API or anywhere else.
-- Tracing is forced off, whatever `.env` says. That covers Phoenix, and also
-  LangSmith, which still ships inside langchain-core. A test that leaves a
-  tracer switched on fails, because the tracing stack catches the socket block's
-  error and only logs it, so the block alone would not notice.
+- Tracing is forced off, whatever `.env` says, and your `LANGSMITH_API_KEY` is
+  removed with the other keys. A test that leaves a tracing context behind
+  fails, since every later test would otherwise inherit it.
 
-Most of the tests that check traces record spans in memory. The two that check
-what reaches a collector run the real exporter in a subprocess, against a
-stand-in collector inside that subprocess, so the test process itself still
-opens no socket. The suite runs the same on a Mac as on Linux.
+The tests that check traces use LangSmith's real client with its HTTP replaced,
+recording every run it would send. The two that check what an actual process
+sends — that runs go out in batches, and what an unreachable LangSmith costs at
+exit — run in a subprocess against a stand-in LangSmith inside it, so the test
+process itself still opens no socket. The suite runs the same on a Mac as on Linux.
 
 It covers the configuration, the loader and splitter, ingest idempotency and
 scoping, upload handling, an ingest→retrieve→generate round trip, the CLI as a
@@ -581,7 +560,7 @@ rag_pipeline/
   ingest.py      load → split → embed → store (build_embeddings and open_store live here)
   pipeline.py    RAGPipeline: open the index + models, stream_answer(...) / answer(...)
   claude_model.py  Claude behind LangChain's chat-model interface
-  tracing.py     optional tracing to a self-hosted Phoenix (setup_tracing)
+  tracing.py     optional tracing to LangSmith: the client each question's trace is sent with
   evaluation.py  rag eval: the questions as a LangSmith dataset, scored by Claude
   cli.py         rag ingest | rag query "..." | rag eval
 streamlit_app.py Streamlit chat UI
