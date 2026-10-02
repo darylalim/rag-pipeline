@@ -23,7 +23,7 @@ dependencies = [
     # the client, pipeline.py the runs), and `rag eval`, whose question set is
     # a LangSmith dataset and each run an experiment. Imported directly, so
     # declared, though it also arrives through langchain-core.
-    "langsmith>=0.14.1",
+    "langsmith>=0.14.4",
     # Claude, through its own SDK: the chat model (claude_model.py, an adapter
     # of our own because langchain-anthropic does not close a stream its
     # consumer abandons) and the eval's judge.
@@ -60,7 +60,7 @@ packages = ["rag_pipeline"]
 dev = [
     "pytest>=9.1.1",
     "pytest-cov>=7.0",
-    "ruff>=0.16.9",
+    "ruff>=0.16.10",
     # The store tests run against MongoDB's atlas-local image in Docker, one
     # container per session (conftest's `atlas_uri`).
     "testcontainers>=4.15.0",
