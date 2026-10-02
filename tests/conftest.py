@@ -8,8 +8,8 @@ reproduce exactly the behaviour that matters -- an index built asynchronously,
 writes that become searchable later, pre-filters on declared fields -- so the
 store is the one part that is real. The models are the part that is never
 real: a deterministic fake embedding model, a fake reranker and a fake chat
-model are injected, because the real ones are multi-gigabyte MLX checkpoints
-(about 22 GB together) that only run on Apple Silicon.
+model are injected, because the real ones are paid APIs -- Voyage AI's and
+Anthropic's.
 
 The developer's own ``MONGODB_URI`` -- a real cluster -- is removed for every
 test (``_no_real_store``), and only the container's is ever set.
@@ -17,11 +17,10 @@ test (``_no_real_store``), and only the container's is ever set.
 Two autouse guards back that injection convention, since forgetting it is
 silent otherwise:
 
-- ``_no_real_models`` makes MLX unimportable, so a test that forgets
-  ``embeddings=``/``reranker=``/``llm=`` fails with the loader's RuntimeError
-  instead of quietly loading weights from the local Hugging Face cache. With the
-  models cached, no socket is involved, so a network block alone would not
-  notice. Tests marked ``models`` (deselected by default) opt out of it.
+- ``_no_real_store`` removes the developer's credentials -- the API keys as well
+  as ``MONGODB_URI`` -- so a test that forgets ``embeddings=``/``reranker=``/
+  ``llm=`` reaches a model factory that stops at the missing key, before any
+  request. Tests marked ``live`` (deselected by default) keep the API keys.
 - ``_offline`` blocks every socket to a host other than this machine, so
   nothing -- a model download, telemetry, a real Atlas cluster -- is reached;
   the container is on loopback. ``_no_tracing`` keeps
@@ -55,12 +54,10 @@ from pymongo import MongoClient
 from pymongo.operations import SearchIndexModel
 
 from rag_pipeline import ingest as ingest_mod
-from rag_pipeline import mlx_models
 from rag_pipeline import pipeline as pipeline_mod
 from rag_pipeline.config import ENV_VARS, Settings
 from rag_pipeline.ingest import reset_store_cache
-from tests.fake_mlx import FakeMLX, write_model
-from tests.fake_mlx import modules as fake_mlx_modules
+from tests.fake_claude import FakeClaude
 
 # pytest's own harness for running a pytest session inside a test: how
 # test_offline_guard shows what the tracing guard leaves for the test after it.
@@ -72,10 +69,6 @@ _EMBED_SIZE = 32
 
 _CANNED_ANSWER = "Chunks overlap to preserve context across boundaries. (a.md)"
 _PARTIAL_ANSWER = "a partial ans"
-
-# The modules whose import means "a real model is about to run". `mlx` covers
-# `mlx.core`: a None parent makes every submodule import fail too.
-_MLX_MODULES = ("mlx", "mlx_lm")
 
 
 # --- the injection seam ------------------------------------------------------
@@ -153,11 +146,13 @@ def sample_data_dir(tmp_path):
 
 # Pinned, so a new image cannot change the suite's results unannounced.
 _ATLAS_IMAGE = "mongodb/mongodb-atlas-local:8.0.17"
+_START_ATTEMPTS = 3
+_START_RETRY_S = 5.0
 # Credentials and other variables a developer's environment (or .env) holds
 # that no test may inherit.
 _CREDENTIALS = ("MONGODB_URI", "ANTHROPIC_API_KEY", "VOYAGE_API_KEY")
 # What a test marked `models` keeps: the live tests call Voyage's API.
-_LIVE_CREDENTIALS = ("VOYAGE_API_KEY",)
+_LIVE_CREDENTIALS = ("VOYAGE_API_KEY", "ANTHROPIC_API_KEY")
 
 
 def _await_search_ready(uri: str, timeout_s: float = 180.0) -> None:
@@ -218,16 +213,29 @@ def atlas_uri() -> Iterator[str]:
     this message, rather than being skipped: a skipped store test is not a
     passed one.
     """
+    import time
+
     from docker.errors import DockerException
     from testcontainers.core.container import DockerContainer
 
-    container = DockerContainer(_ATLAS_IMAGE).with_exposed_ports(27017)
-    try:
-        container.start()
-    except DockerException as exc:
+    # Retried: Docker Desktop's Resource Saver pauses its VM after a few idle
+    # minutes, and the first start after that can fail while the VM wakes --
+    # every store test in the session then errors at setup, though a rerun a
+    # moment later passes. A Docker that is not running fails every attempt.
+    failures: list[str] = []
+    for attempt in range(_START_ATTEMPTS):
+        container = DockerContainer(_ATLAS_IMAGE).with_exposed_ports(27017)
+        try:
+            container.start()
+            break
+        except DockerException as exc:
+            failures.append(f"attempt {attempt + 1}: {exc}")
+            time.sleep(_START_RETRY_S)
+    else:
         pytest.fail(
-            f"The store tests need Docker, to run {_ATLAS_IMAGE}: {exc}. "
-            "Start Docker (Docker Desktop on a Mac) and run them again.",
+            f"The store tests need Docker, to run {_ATLAS_IMAGE}, and it did not "
+            f"start ({'; '.join(failures)}). Start Docker (Docker Desktop on a "
+            "Mac) and run them again.",
             pytrace=False,
         )
     try:
@@ -309,25 +317,10 @@ def wired_env(settings, fake_embeddings, fake_reranker, monkeypatch) -> Settings
 
 
 @pytest.fixture
-def fake_mlx(monkeypatch) -> FakeMLX:
-    """A fake MLX stack in ``sys.modules``, and a fresh model memo.
-
-    For driving the real adapters -- down to the generation lock -- with no MLX
-    and no weights. Set after ``_no_real_models`` has put ``None`` there, so it
-    wins for this test only; the memo is swapped rather than cleared so no fake
-    model outlives the test that made it.
-    """
-    fake = FakeMLX()
-    for name, module in fake_mlx_modules(fake).items():
-        monkeypatch.setitem(sys.modules, name, module)
-    monkeypatch.setattr(mlx_models, "_LOADED", {})
-    return fake
-
-
-@pytest.fixture
-def model_dir(tmp_path) -> str:
-    """A complete local model directory, as a model id, for ``fake_mlx`` to load."""
-    return str(write_model(tmp_path / "model"))
+def fake_claude() -> FakeClaude:
+    """A stand-in Anthropic server, for driving the real ``ClaudeChatModel`` --
+    down to whether closing an answer closes its HTTP response -- offline."""
+    return FakeClaude()
 
 
 @pytest.fixture
@@ -416,9 +409,8 @@ def fresh_interpreter(tmp_path) -> Callable[..., subprocess.CompletedProcess[str
     .env is switched off, or config.py would read it straight back in. So is
     what this package sets for itself as it is imported
     (TRANSFORMERS_NO_ADVISORY_WARNINGS): this process's import already put it
-    in os.environ, and inherited, it would answer for the child's own. MLX is
-    made unimportable and no MONGODB_URI is set, so the child can load no model
-    and open no store, which is also what keeps it offline: ``_offline`` cannot
+    in os.environ, and inherited, it would answer for the child's own. No
+    credential is set, so the child can reach no model and open no store, which is also what keeps it offline: ``_offline`` cannot
     reach into another process.
 
     Here rather than in one frontend's test file because both frontends have to
@@ -439,9 +431,8 @@ def fresh_interpreter(tmp_path) -> Callable[..., subprocess.CompletedProcess[str
             "DATA_DIR": str(tmp_path / "data"),
             **env,
         }
-        prelude = 'import sys\nsys.modules["mlx"] = sys.modules["mlx_lm"] = None\n'
         return subprocess.run(
-            [sys.executable, "-c", prelude + code, *args],
+            [sys.executable, "-c", code, *args],
             env=child,
             cwd=tmp_path,
             capture_output=True,
@@ -474,48 +465,24 @@ def _no_real_store(request, monkeypatch):
     into it. Only the ``atlas`` fixture sets ``MONGODB_URI``, to the container.
     ``_offline`` is the second guard: a real cluster is not on loopback.
 
-    Tests marked ``models`` keep ``VOYAGE_API_KEY``: they call Voyage's real
-    API, by hand, on purpose. Never ``MONGODB_URI``.
+    The API keys are the other half of the injection guard: a test that forgets
+    to inject a fake reaches a model factory, which stops at the missing key
+    before any request. Tests marked ``live`` keep them: they call the real
+    APIs, by hand, on purpose. Never ``MONGODB_URI``.
     """
-    live = request.node.get_closest_marker("models") is not None
     for name in _CREDENTIALS:
-        if live and name in _LIVE_CREDENTIALS:
+        if is_live(request.node) and name in _LIVE_CREDENTIALS:
             continue
         monkeypatch.delenv(name, raising=False)
 
 
-def _hide_mlx(node, monkeypatch) -> None:
-    """Make MLX unimportable for ``node``'s test, unless it is marked ``models``."""
-    if node.get_closest_marker("models"):
-        return
-    for name in _MLX_MODULES:
-        monkeypatch.setitem(sys.modules, name, None)
+def is_live(node) -> bool:
+    """Whether ``node``'s test is exempt from the API-key and network guards.
 
-
-@pytest.fixture
-def hide_mlx():
-    """`_no_real_models`' decision, callable on any node.
-
-    Exposed so test_offline_guard can check the ``models`` exemption from both
-    sides: a test that is actually marked is deselected from the default run,
-    so the exemption could otherwise only be seen from a run that loads models.
+    One function for both guards, and for test_offline_guard to check from both
+    sides: a test really marked ``live`` is deselected from the default run.
     """
-    return _hide_mlx
-
-
-@pytest.fixture(autouse=True)
-def _no_real_models(request, monkeypatch):
-    """Make MLX unimportable, so no test can load a real model by accident.
-
-    A ``None`` entry in ``sys.modules`` makes ``import mlx_lm`` (and
-    ``mlx.core``) raise ImportError, which the model loader reports as a
-    RuntimeError before it ever looks in the Hugging Face cache. That catches
-    every route to a real model -- a forgotten ``embeddings=``, a factory called
-    directly, an import added somewhere new -- identically on a Mac with MLX
-    installed and on the Linux CI legs without it. Tests marked ``models`` are
-    the deliberate exception.
-    """
-    _hide_mlx(request.node, monkeypatch)
+    return node.get_closest_marker("live") is not None
 
 
 @pytest.fixture(autouse=True, scope="session")
@@ -596,10 +563,10 @@ def _offline(request, monkeypatch):
     load from local files, so nothing in the suite has a reason to connect
     anywhere else: such a connection means something is downloading (a model),
     phoning home, or reaching a real cluster, and it fails the test that made
-    it. Unix sockets -- Docker's own API -- stay open. Tests marked ``models``
-    are exempt: they call Voyage's API, and run only by hand (``-m models``).
+    it. Unix sockets -- Docker's own API -- stay open. Tests marked ``live`` are
+    exempt: they call the real APIs, and run only by hand (``-m live``).
     """
-    if request.node.get_closest_marker("models"):
+    if is_live(request.node):
         return
     connect = socket.socket.connect
     connect_ex = socket.socket.connect_ex

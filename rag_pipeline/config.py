@@ -138,12 +138,10 @@ class Settings:
     # index's numDimensions: an index serves vectors of one width only.
     embedding_dimensions: int = 1024
 
-    # Local generation model, run with mlx-lm (thinking disabled, greedy
-    # decoding). Any mlx-lm chat checkpoint whose chat template accepts a system
-    # turn works -- the grounding rules are sent as one, and a template that
-    # rejects it (Gemma 2's) fails every question, not the load. The default is
-    # a 27B 4-bit model that needs about 16 GB of unified memory on its own.
-    chat_model: str = "mlx-community/Qwen3.8-27B-4bit"
+    # The Claude model that writes the answer, over the Anthropic API. The
+    # request sets thinking to `between_tools`, which only Claude Sonnet 5.5
+    # accepts (claude_model.py), so another model needs that changed too.
+    chat_model: str = "claude-sonnet-5-5"
     max_tokens: int = 1024
 
     # Splitter: 1000-char chunks with 200-char (20%) overlap keeps enough

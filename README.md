@@ -4,24 +4,24 @@ A small, readable **Retrieval-Augmented Generation** pipeline built with
 [LangChain](https://docs.langchain.com). Documents are embedded with
 **Voyage AI**'s `voyage-4-large`, stored and searched in **MongoDB Atlas** with
 Atlas Vector Search, reranked with Voyage's `rerank-3`, and answered by
-**Qwen3.8-27B**, running locally on an Apple Silicon Mac with
-[MLX](https://github.com/ml-explore/mlx). It ships with a reusable core library,
-a CLI, and a Streamlit chat app — all sharing the same code.
+**Claude Sonnet 5.5**. It ships with a reusable core library, a CLI, and a
+Streamlit chat app — all sharing the same code.
 
 ![The Streamlit chat app answering a question from the sample documents, citing its source, with the active models in the sidebar](docs/chat-app.png)
 
 ```
 Ingest (once):   data/ ──load──▶ split ──embed──▶ store (MongoDB Atlas + vector index)
-Query (per Q):   question ──embed──▶ search ──rerank──▶ [top-k chunks + question] ──▶ local LLM ──▶ grounded answer + sources
+Query (per Q):   question ──embed──▶ search ──rerank──▶ [top-k chunks + question] ──▶ Claude ──▶ grounded answer + sources
 ```
 
-The models load from the local Hugging Face cache and never touch the network;
-the index is the one thing that lives elsewhere, in a MongoDB Atlas cluster —
-a free one is enough — reached through `MONGODB_URI`. So your documents' text
-and vectors are stored in Atlas, and every question's search runs there. Beyond
-that cluster nothing needs an account: the optional [`rag eval`](#evaluation),
-which scores the pipeline, is the only other part that does. The chat app keeps
-to that too: `.streamlit/config.toml`
+Everything but the code runs as a service, so your documents leave the
+machine: their text and vectors are stored in a MongoDB Atlas cluster — a free
+one is enough — reached through `MONGODB_URI`, Voyage AI embeds them and every
+question, and each question goes to Voyage's reranker with its candidate
+passages and to Anthropic's API with the passages kept. Those three accounts
+are all it needs; the optional [`rag eval`](#evaluation), which scores the
+pipeline, adds a LangSmith one. The chat app sends nothing else:
+`.streamlit/config.toml`
 switches off Streamlit's usage statistics, which its browser front end would
 otherwise send to Streamlit, and its first-run prompt for an email address, and
 keeps the app to this machine — though
@@ -41,23 +41,19 @@ questions and results there — but see [below](#tracing-with-phoenix) if an old
 
 ## Prerequisites
 
-- An **Apple Silicon Mac** (M1 or later) on **macOS 14** or newer. The project
-  targets MLX's Metal backend and declares MLX for macOS only, so the chat model
-  runs only there. Linux can install the project and run its test suite — that
-  is what CI does — but not the chat model.
-- About **32 GB of unified memory**. The default chat model holds about 15 GB,
-  so a 16 GB Mac cannot run it.
-- About **15 GB of disk** for the chat model, in the Hugging Face cache.
-- [uv](https://docs.astral.sh/uv/) and Python 3.11+.
+- [uv](https://docs.astral.sh/uv/) and Python 3.11+, on macOS or Linux. No GPU
+  and no model download: every model is an API.
 - A **MongoDB Atlas** cluster. The free tier (M0) holds the index of a few
   thousand pages; [Setup](#setup) walks through creating one.
 - A **Voyage AI** API key, for embedding and reranking. Each account's first
   200 million tokens per model are free, which covers indexing and querying a
   personal corpus for a long time.
+- An **Anthropic** API key, for the answers. At the default settings a question
+  costs about half a US cent (a few thousand tokens in, a few hundred out).
 - To run the tests: **Docker** (Docker Desktop on a Mac). The suite runs
   MongoDB's `atlas-local` image, so it needs no cluster of yours.
 
-The optional [`rag eval`](#evaluation) needs two API keys besides.
+The optional [`rag eval`](#evaluation) needs a LangSmith API key besides.
 
 ## Setup
 
@@ -65,19 +61,8 @@ The optional [`rag eval`](#evaluation) needs two API keys besides.
 uv sync                      # create the venv and install dependencies
 ```
 
-Then download the chat model, once:
-
-```bash
-uvx --from huggingface_hub hf download mlx-community/Qwen3.8-27B-4bit
-```
-
-It lands in the Hugging Face cache (`~/.cache/huggingface/hub`, or wherever
-`HF_HOME`/`HF_HUB_CACHE` points — set it the same way for the download and for
-the app). Loading is **cache-only**: the pipeline never downloads it. A model
-that is missing, or whose download stopped partway, fails with an error naming
-the exact `hf download` command, rather than starting a 15 GB download in the
-middle of a question. `CHAT_MODEL` can also be a path to a model directory,
-which is used as-is.
+Create an Anthropic API key in the [Claude Console](https://platform.claude.com)
+for `ANTHROPIC_API_KEY`.
 
 Then create a Voyage AI API key in the [Voyage AI dashboard](https://dashboard.voyageai.com)
 for `VOYAGE_API_KEY`, and **add a payment method** there. Without one the
@@ -98,10 +83,10 @@ Then point it at a MongoDB Atlas cluster. In
 4. On the cluster, **Connect → Drivers → Python** gives the connection string.
 
 ```bash
-cp .env.example .env         # then set MONGODB_URI (password filled in) and VOYAGE_API_KEY
+cp .env.example .env         # then set MONGODB_URI (password filled in), VOYAGE_API_KEY and ANTHROPIC_API_KEY
 ```
 
-`.env` is git-ignored, and the app never displays either value. A free cluster that
+`.env` is git-ignored, and the app never displays any of the three. A free cluster that
 goes unused for a long time is paused; resume it in Atlas if the app suddenly
 cannot reach it. Everything else in `.env` is an optional override (see
 [Configuration](#configuration)).
@@ -119,7 +104,7 @@ extension case-insensitively — splits them into overlapping chunks, embeds the
 with Voyage AI, and stores them in the Atlas collection `rag_db.rag_docs`. The
 first run creates that collection and its Atlas Vector Search index, and every
 run waits until what it wrote is searchable, so a question asked right after an
-ingest finds it. Ingest loads no local model.
+ingest finds it. Ingest never calls Claude.
 
 A file it cannot use is skipped rather than aborting the run: an unreadable one
 (bad encoding, corrupt PDF, permissions) warns on stderr, and one that yields no
@@ -153,12 +138,10 @@ most five minutes.
 uv run rag query "What is chunking and why do we overlap chunks?"
 ```
 
-Streams the grounded answer as the local model produces it, then prints the
-source files it drew from. Each `rag query` is a fresh process, so it loads the
-chat model before it answers; for more than a question or two, the app, which
-keeps it loaded, is the faster route. Ctrl-C abandons an answer (exit status
-130) once the model finishes the step it is on — a few seconds at most while
-it is still reading the prompt.
+Streams the grounded answer as Claude writes it, then prints the source files
+it drew from. Ctrl-C abandons an answer (exit status 130) and ends the request
+to Claude with it, so an abandoned answer stops being generated — and billed —
+there.
 
 ### 3. Or use the chat app
 
@@ -187,18 +170,17 @@ another website, say. Streamlit refuses it, but first looks up the external IP
 address, since a page served from that address is one it would allow. The
 request carries nothing about the app.
 
-Opening the app loads the chat model, behind a spinner; after that it stays in
-memory for the life of the server, including across the index rebuilds an
-upload or a `rag ingest` triggers. Answers are generated one at a time: a
-question asked from a second tab while one is being answered waits for it to
-finish. The toolbar's **Stop** ends an answer where it is — the model stops
-generating there and then — and the turn stays in the history, marked as
-interrupted.
+Opening the app connects to the index and the model APIs, behind a spinner;
+after that the connections are kept for the life of the server, including
+across the index rebuilds an upload or a `rag ingest` triggers. The toolbar's
+**Stop** ends an answer where it is — the request to Claude ends there and
+then, so the rest is neither generated nor billed — and the turn stays in the
+history, marked as interrupted.
 
-Editing `streamlit_app.py` does not rerun it: `.streamlit/config.toml` turns Streamlit's
-file watcher off, because on every run it walks every loaded module and logs a
-traceback for each of transformers' lazily loaded ones — over a hundred a turn.
-While working on the app itself, run it with
+Editing `streamlit_app.py` does not rerun it: `.streamlit/config.toml` turns
+Streamlit's file watcher off, because on every run it walks every loaded module,
+which with this many libraries loaded is wasted work on every turn. While
+working on the app itself, run it with
 `uv run streamlit run streamlit_app.py --server.fileWatcherType auto`.
 
 The sidebar also takes uploads, so the whole loop — add a document, index it,
@@ -206,29 +188,24 @@ ask about it — can happen in the browser. See below.
 
 ### What to expect
 
-Measured on an M2 Max with 32 GB, using the default models and settings:
+Measured from a Mac in Singapore, against an M0 (free) Atlas cluster, using the
+default models and settings:
 
 | Step | Time |
 | ---- | ---- |
-| Loading the chat model | about 6 s once the weights are in macOS's file cache; longer on a first load after a reboot, which reads them from disk |
+| Connecting (`rag query`, or the app's first load) | about 1.3 s: the Atlas connection and its first round trip |
 | Embedding documents (ingest) | about 435 chunks per second, in Voyage batches of 256 |
 | Embedding a question | about 0.18 s, a round trip to Voyage |
-| Searching the index in Atlas | about 0.4 s (median, M0 free cluster), against 0.07 s for the on-disk store of earlier versions: the round trip to the cluster |
+| Searching the index in Atlas | about 0.4 s (median), against 0.07 s for the on-disk store of earlier versions: the round trip to the cluster |
 | Reranking the 20 candidates | about 0.18 s, at Voyage |
-| First token of the answer | about 6–8 s with the default four 1000-character chunks (about 1k tokens of prompt) — the model reads the whole prompt, at 100–150 tokens per second, before it writes anything; about 15 s for the first answer after the models load, while MLX warms up |
-| The rest of the answer | about 17–21 tokens per second |
+| First word of the answer | about 0.9 s after retrieval, 1.4 s after the question (median of five) |
+| The whole answer | about 2 s for a typical answer of a few sentences |
 
-So a question takes roughly 8–12 seconds, almost all of it the local chat
-model — most of that before the first word appears (the app shows a spinner for
-that wait) — and the first one after the model loads nearer 17. Each `rag query` is a fresh process, so it pays for the
-load and that slow first answer every time. The first-token wait scales with
-the retrieved context: each extra chunk (`RETRIEVAL_K`) or longer one
-(`CHUNK_SIZE`) adds a couple of seconds.
-
-Leave Docker Desktop closed while the models run. Its virtual machine reserves
-8 GB, and beside the chat model's 15 GB and the rest of a 32 GB Mac's load it
-can push the model into swap: in one `rag eval` run, with the local embedder and
-reranker loaded too, a single answer took 14 minutes instead of 17 seconds. Docker is only needed to run the test suite.
+So a question takes about 2 seconds end to end, against 8–12 seconds when an
+earlier version ran a 27-billion-parameter model on the Mac itself, and the
+first word arrives in under a second and a half. Most of what remains is three
+network round trips before Claude starts — embedding, search, rerank — so a
+cluster in a region near you matters more than any setting here.
 
 ## Add your own documents
 
@@ -297,32 +274,31 @@ Each question gets four scores:
 | `correct` | the answer matches the reference answer — or, for a question the documents cannot answer, says so rather than answering from general knowledge | Claude Opus 5.5 |
 | `grounded` | every claim in the answer is supported by the chunks it was generated from | Claude Opus 5.5 |
 
-It needs two keys, in `.env` or the environment — the only ones anything in this
-project reads:
+Beside the three keys the pipeline itself needs, it reads one of its own, in
+`.env` or the environment; and it uses `ANTHROPIC_API_KEY` twice over:
 
 | Variable | Used for |
 | -------- | -------- |
 | `LANGSMITH_API_KEY` | The questions are uploaded as a [LangSmith](https://smith.langchain.com) dataset, and each run is recorded there as an experiment, with every answer, its retrieved passages and the judge's reasoning |
-| `ANTHROPIC_API_KEY` | Claude grades `correct` and `grounded` |
+| `ANTHROPIC_API_KEY` | Claude Sonnet 5.5 answers, as in the app; Claude Opus 5.5 grades `correct` and `grounded` |
 
 ```bash
 uv run rag eval                    # score, and compare with the saved baseline
 uv run rag eval --save-baseline    # score, and save these scores as the baseline
 ```
 
-A run indexes the corpus (only what changed, after the first run), loads the
-models and answers every question: about 20 minutes on the machine in
-[What to expect](#what-to-expect), judging included, and an estimated $1–2 of
-Anthropic API usage for the judge. It prints each score, its change from the
+A run indexes the corpus (only what changed, after the first run) and answers
+every question: about 7 minutes, judging included, and an estimated $1–2 of
+Anthropic API usage, almost all of it the judge. It prints each score, its change from the
 baseline in `evals/baseline.json`, and a link to the experiment in LangSmith.
 It stops before loading any model if a key is missing or the judge or LangSmith
 cannot be reached.
 
 Some things to know:
 
-- **What leaves this machine** is the eval corpus's questions, the passages
-  retrieved from it and the answers, sent to LangSmith and to Anthropic. Your
-  own documents are never part of a run.
+- **What leaves this machine** is the eval corpus, its questions, the passages
+  retrieved from it and the answers, sent to Voyage AI, Atlas, Anthropic and
+  LangSmith. Your own documents are never part of a run.
 - **Scores compare only within one question set and one judge.** The dataset's
   name is derived from the questions' content, so editing `evals/questions.json`
   starts a new dataset, and the report then declines to compare with a baseline
@@ -348,7 +324,7 @@ RAGPipeline                 CHAIN      the question, and the answer
 ├─ VoyageAIRerank           RERANKER   those candidates in; the RETRIEVAL_K kept, with scores, out
 └─ generate                 CHAIN
    ├─ ChatPromptTemplate    PROMPT     the prompt, with the passages filled in
-   └─ MLXChatModel          LLM        the messages, the answer, token counts, finish reason
+   └─ ClaudeChatModel       LLM        the messages, the answer, token counts, finish reason
 ```
 
 Start the server (no Docker: `uvx` fetches it into uv's cache on the first run,
@@ -408,18 +384,18 @@ them in SQLite under `~/.phoenix` (`PHOENIX_WORKING_DIR` moves it).
 
 ## Configuration
 
-`MONGODB_URI` is required (see [Setup](#setup)); it is a credential, not a
-setting, so it has no default and the app never displays it. Every setting has
+`MONGODB_URI`, `VOYAGE_API_KEY` and `ANTHROPIC_API_KEY` are required (see
+[Setup](#setup)); they are credentials, not settings, so it has no default and the app never displays it. Every setting has
 a default and can be overridden in `.env` (see `.env.example`) or the
 environment:
 
 | Variable            | Default            | Purpose |
 | ------------------- | ------------------ | ------- |
-| `CHAT_MODEL`        | `mlx-community/Qwen3.8-27B-4bit` | Generation model, run with mlx-lm (thinking off, greedy decoding); any mlx-lm chat checkpoint whose chat template accepts a system turn works (Gemma 2's, for one, rejects it, and every question then fails) |
+| `CHAT_MODEL`        | `claude-sonnet-5-5` | Claude model that writes the answers. The request is built for Claude Sonnet 5.5 — its lowest thinking setting, `between_tools`, which other models refuse — so another model needs that request changed in `claude_model.py` |
 | `MAX_TOKENS`        | `1024`             | Maximum length of a generated answer, in tokens; an answer cut off there ends with a note saying so |
 | `EMBEDDING_MODEL`   | `voyage-4-large`   | Voyage AI embedding model (ingest + query); any Voyage text embedding model that accepts an output dimension. A change re-embeds everything |
 | `EMBEDDING_DIMENSIONS` | `1024`          | Width of the stored vectors: 256, 512, 1024 or 2048, the widths Voyage returns; a change needs a new `COLLECTION_NAME` |
-| `RETRIEVAL_K`       | `4`                | Chunks kept after reranking and put in the prompt; each adds a couple of seconds before the first token |
+| `RETRIEVAL_K`       | `4`                | Chunks kept after reranking and put in the prompt; each adds input tokens to every question |
 | `FETCH_K`           | `20`               | Candidates retrieved before reranking |
 | `RERANK_MODEL`      | `rerank-3`         | Voyage AI reranker |
 | `CHUNK_SIZE`        | `1000`             | Characters per chunk |
@@ -432,12 +408,9 @@ environment:
 | `PHOENIX_COLLECTOR_ENDPOINT` |           | Base URL of the Phoenix server to trace questions to — `http://localhost:6006` for a local `phoenix serve`. Unset, tracing is off (see [Tracing with Phoenix](#tracing-with-phoenix)) |
 | `PHOENIX_PROJECT`   | `rag-pipeline`     | Phoenix project the traces are filed under; the first trace creates it |
 
-Each model setting is a Hugging Face repo id, resolved from the local cache, or a
-path to a model directory.
-
 API keys are not settings: they have no default, and are never shown in the
-app's sidebar or in an error. The two that `rag eval` reads are listed under
-[Evaluation](#evaluation).
+app's sidebar or in an error. The three the pipeline reads are in
+[Setup](#setup); the one `rag eval` adds is under [Evaluation](#evaluation).
 
 The chat app's own Streamlit settings are in `.streamlit/config.toml`, each with
 a comment on why: usage statistics and the email prompt off
@@ -462,18 +435,14 @@ uv run ty check              # type check
 Run `ruff check` before `ruff format` — lint fixes can reorder code that
 formatting then tidies.
 
-ty treats the MLX modules as `Any` on every platform (`replace-imports-with-any`
-in `pyproject.toml`): they are installed only on macOS, so this is what keeps a
-Mac and CI giving the same answer.
-
 ### Tests
 
 ```bash
 uv run pytest
 ```
 
-The suite needs **Docker**, and **no models, no MLX, no network and no Atlas
-cluster of yours**. It injects a deterministic fake embedding model, a fake
+The suite needs **Docker**, and **no API keys, no network and no Atlas cluster
+of yours**. It injects a deterministic fake embedding model, a fake
 reranker and a fake chat model, and runs a real Atlas Vector Search: MongoDB's
 `mongodb-atlas-local` image (about 1 GB, pulled on the first run), one container
 for the session and one database per test. The store is the one real part,
@@ -484,12 +453,11 @@ an M2 Max, most of it building a vector index per test. Without Docker, the
 tests that need the store fail with a message saying to start it. Four guards
 keep the rest honest:
 
-- MLX is made unimportable, so a test that forgets to inject a fake fails
-  instead of quietly loading gigabytes of weights from the Hugging Face cache.
-- Your own `MONGODB_URI` — a real cluster — is removed for every test; only the
-  container's is ever set.
+- Your API keys and your own `MONGODB_URI` — a real cluster — are removed for
+  every test, so a test that forgets to inject a fake fails at the missing key
+  instead of calling a paid API; only the container's URI is ever set.
 - Every socket to a host other than this machine is blocked, so nothing reaches
-  a real cluster, the model hub or anywhere else.
+  a real cluster, a model API or anywhere else.
 - Tracing is forced off, whatever `.env` says. That covers Phoenix, and also
   LangSmith, which still ships inside langchain-core. A test that leaves a
   tracer switched on fails, because the tracing stack catches the socket block's
@@ -498,44 +466,41 @@ keep the rest honest:
 Most of the tests that check traces record spans in memory. The two that check
 what reaches a collector run the real exporter in a subprocess, against a
 stand-in collector inside that subprocess, so the test process itself still
-opens no socket. The suite runs the same on a Mac with MLX installed as on
-Linux without it.
+opens no socket. The suite runs the same on a Mac as on Linux.
 
 It covers the configuration, the loader and splitter, ingest idempotency and
 scoping, upload handling, an ingest→retrieve→generate round trip, the CLI as a
 terminal program, and the Streamlit app driven headlessly — so the frontend is
-covered by CI rather than by hand. The model adapters in `mlx_models.py` are
-unit-tested the same way, against a fake MLX and a fake tokenizer: their prompt
-formats, truncation, batching, ordering, locking and error translation are all
-checked where MLX does not exist. `CLAUDE.md` has the design behind the
-injection seam and what the app-level tests are there to guarantee.
+covered by CI rather than by hand. The chat-model adapter in `claude_model.py`
+is tested the same way, through the real Anthropic SDK against a stand-in
+server: the request it sends, how it reads the stream, a refusal, a cut-off,
+error translation — and that stopping an answer closes its HTTP request.
+`CLAUDE.md` has the design behind the injection seam and what the app-level
+tests are there to guarantee.
 
 What the fakes cannot check is whether the models themselves are driven
 correctly, so that has a suite of its own:
 
 ```bash
-uv run pytest -m models
+uv run pytest -m live
 ```
 
-These tests load the real chat model (an Apple Silicon Mac with it downloaded
-and the memory to hold it) and call Voyage AI's real API (with
-`VOYAGE_API_KEY`, for a fraction of a cent): about a minute on an M2 Max. They
-check that the Voyage factories embed documents and questions the right way
-round, at the configured width, and that the reranker puts the relevant passage
-first; that the chat model streams a grounded answer with no reasoning in it
-and reports why it stopped (the `MAX_TOKENS` note reads it); and run an
-ingest-and-answer pass over `data/` on the test container. They are the only
-tests allowed onto the network, and the only ones that keep `VOYAGE_API_KEY`.
-They skip, rather than fail, when MLX, the chat model or the key is missing —
-and the ingest-and-answer pass skips when the sample document its question is
-about is no longer in `data/`. A plain `uv run pytest` deselects them
-(`addopts = ["-m", "not models"]`), so it never loads a model or calls an API.
-Run this suite by hand, since CI cannot, whenever what the fakes stand in for
-may have moved: after changing anything in `mlx_models.py` or the factories,
-after a `uv.lock` change that moves `mlx`, `mlx-lm`, `mlx-metal`,
-`transformers`, `tokenizers`, `huggingface-hub`, `voyageai` or
-`langchain-voyageai`, and after re-downloading the model. A run that skipped a
-test has not checked it.
+These tests call Anthropic's and Voyage AI's real APIs (with
+`ANTHROPIC_API_KEY` and `VOYAGE_API_KEY`, for a few cents a run): about a
+minute. They check that the Voyage factories embed documents and questions the
+right way round, at the configured width, and that the reranker puts the
+relevant passage first; that Claude streams a grounded answer with no reasoning
+in it, declines what the context does not say, and reports why it stopped (the
+`MAX_TOKENS` note reads it); and run an ingest-and-answer pass over `data/` on
+the test container. They are the only tests allowed onto the network, and the
+only ones that keep the API keys — never `MONGODB_URI`. They skip, rather than
+fail, when a key is missing — and the ingest-and-answer pass skips when the
+sample document its question is about is no longer in `data/`. A plain
+`uv run pytest` deselects them (`addopts = ["-m", "not live"]`), so it never
+calls an API. Run this suite by hand, since CI cannot, whenever what the fakes
+stand in for may have moved: after changing `claude_model.py` or the factories,
+and after a `uv.lock` change that moves `anthropic`, `voyageai` or
+`langchain-voyageai`. A run that skipped a test has not checked it.
 
 Coverage is measured on demand rather than in CI, and carries no threshold — a
 number to keep green invites tests that execute code without asserting anything:
@@ -545,8 +510,9 @@ uv run pytest --cov=rag_pipeline --cov=streamlit_app --cov-report=term-missing
 ```
 
 The lines it reports uncovered should be the ones only a real terminal or a real
-model reaches: `cli.py`'s `if __name__ == "__main__"` guard, and the MLX calls in
-`mlx_models.py` that the fakes stand in for — which is what `-m models` is for.
+API reaches: `cli.py`'s `if __name__ == "__main__"` guard, and the client
+construction in each factory that the injected fakes stand in for — which is
+what `-m live` is for.
 
 ### Continuous integration
 
@@ -563,12 +529,10 @@ Both install with `uv sync --locked`, which fails if `uv.lock` has drifted from
 `pyproject.toml` — so a dependency added by hand without re-locking is caught
 rather than silently skipped.
 
-Both run on Linux, where the project does not install MLX. That costs nothing:
-MLX is declared macOS-only in `pyproject.toml` (`; sys_platform == 'darwin'`), so
-the runners never install it, and the suite never imports it anyway. The tests
-need no secrets and no models; Docker, which they do need for the atlas-local
-container, is preinstalled on the runners, and the image is pulled in a step of
-its own. The `models` tests are the part CI never runs.
+Both run on Linux. The tests need no secrets and call no model; Docker, which
+they do need for the atlas-local container, is preinstalled on the runners, and
+the image is pulled in a step of its own. The `live` tests are the part CI never
+runs.
 
 Every branch push gets CI immediately, so a branch that has been broken for
 several commits is visible before review rather than after. A pull request gets
@@ -615,8 +579,8 @@ taken.
 rag_pipeline/
   config.py      Settings, loaded from environment variables
   ingest.py      load → split → embed → store (build_embeddings and open_store live here)
-  pipeline.py    RAGPipeline: load index + local models, stream_answer(...) / answer(...)
-  mlx_models.py  the three local models behind LangChain's interfaces, loaded once per process
+  pipeline.py    RAGPipeline: open the index + models, stream_answer(...) / answer(...)
+  claude_model.py  Claude behind LangChain's chat-model interface
   tracing.py     optional tracing to a self-hosted Phoenix (setup_tracing)
   evaluation.py  rag eval: the questions as a LangSmith dataset, scored by Claude
   cli.py         rag ingest | rag query "..." | rag eval
@@ -649,24 +613,28 @@ evals/           rag eval's corpus/ (a fictional handbook), questions.json about
   approximates, and keeps the top `RETRIEVAL_K`. This is the
   single query-time factory that lives in `pipeline.py` rather than `ingest.py`,
   because reranking has no ingest-side counterpart.
-- **Local generation** (Qwen3.8-27B, 4-bit, via `mlx-lm`) is prompted to answer
-  only from the retrieved context and to cite its sources, which is what turns a
-  general chat model into a document-grounded question-answerer. Thinking is
-  switched off — left on, the model streams its reasoning straight into the
-  answer — and decoding is greedy, so the same question over the same context
-  gets the same answer. Both frontends stream it: `stream_answer(question)` hands
+- **Claude Sonnet 5.5** writes the answer, prompted to answer only from the
+  retrieved context and to cite its sources, which is what turns a general chat
+  model into a document-grounded question-answerer. Thinking is at its lowest
+  setting (with no tools in the request, none at all) and effort is low: an
+  answer from a few retrieved passages needs neither, and both add to the wait
+  before the first word. Claude takes no sampling parameters, so the same
+  question over the same context can be worded differently from one run to the
+  next; what keeps answers checkable is the grounding, and the cited passages
+  the app shows beside them. A question Claude declines is reported as declined,
+  never as an empty answer. Both frontends stream it: `stream_answer(question)` hands
   back the retrieved sources and a lazy stream of the answer together, and
   `answer()` — for library callers who just want the finished string — is a join
   over the same path.
 
-The chat model's weights load once per process, however many times the
-pipeline is rebuilt: the app rebuilds after every ingest, and reuses what is
-already in memory rather than loading a second copy.
+Stopping an answer — the app's Stop, Ctrl-C in `rag query` — closes its request
+to Claude, so generation, and billing, stop there rather than running on to
+`MAX_TOKENS`. LangChain's own Anthropic integration leaves that request open,
+which is why `claude_model.py` has an adapter of its own.
 
-Swapping a model is a one-line change in `.env`: any mlx-lm chat checkpoint
-whose template takes a system turn for `CHAT_MODEL` (the grounding prompt is
-one), and any Voyage embedding model or reranker for `EMBEDDING_MODEL` and
-`RERANK_MODEL`. Another provider's embedder or reranker is a code change in the
+Swapping a model is a one-line change in `.env` for any Voyage embedding model
+or reranker (`EMBEDDING_MODEL`, `RERANK_MODEL`); another Claude model for
+`CHAT_MODEL` also needs the request in `claude_model.py` changed to suit it. Another provider's embedder or reranker is a code change in the
 factories, `build_embeddings()` and `build_reranker()`. Swapping the vector store
 is a code change too: `open_store()` in `ingest.py` is the single place the
 vector store is constructed, so it is the main place to edit — though the

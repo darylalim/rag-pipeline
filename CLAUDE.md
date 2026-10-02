@@ -5,16 +5,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-uv sync                              # install deps (creates .venv; MLX only on macOS)
-uvx --from huggingface_hub hf download <model id>   # once per model (README Setup lists the three); loading never downloads
-uv run rag ingest                    # embed data/ into the Atlas collection (needs MONGODB_URI)
-uv run rag query "your question"     # ask from the terminal (loads the chat model first)
-uv run rag eval                      # score the pipeline on evals/questions.json (needs LANGSMITH_API_KEY + ANTHROPIC_API_KEY; indexes evals/corpus itself; ~20 min, ~$1-2)
+uv sync                              # install deps (creates .venv)
+uv run rag ingest                    # embed data/ into the Atlas collection (needs MONGODB_URI + VOYAGE_API_KEY)
+uv run rag query "your question"     # ask from the terminal (needs ANTHROPIC_API_KEY too)
+uv run rag eval                      # score the pipeline on evals/questions.json (needs LANGSMITH_API_KEY too; indexes evals/corpus itself; ~$1-2)
 uv run rag eval --save-baseline      # ...and save the scores as evals/baseline.json
 uv run streamlit run streamlit_app.py # chat UI over the same pipeline
 uv run streamlit run streamlit_app.py --server.fileWatcherType auto   # while editing streamlit_app.py (config.toml turns the watcher off)
-uv run pytest                        # full suite (fakes + atlas-local in Docker; no models, network or secrets; ~4 min)
-uv run pytest -m models              # live tests against the real models (Apple Silicon + models downloaded; ~1 min)
+uv run pytest                        # full suite (fakes + atlas-local in Docker; no API, network or secrets; ~4 min)
+uv run pytest -m live                # live tests against Anthropic's and Voyage's real APIs (needs both keys; ~1 min, a few cents)
 uv run pytest tests/test_config.py::test_defaults   # single test
 uv run pytest -k idempotent -v                      # by keyword
 uv run pytest --cov=rag_pipeline --cov=streamlit_app --cov-report=term-missing   # coverage, on demand
@@ -42,16 +41,14 @@ Plain `uv run -p 3.11` would recreate `.venv` itself at 3.11, and the next
 ordinary `uv run` would rebuild it at 3.13 — two full environment reinstalls.
 
 More generally: probe uv/tool behaviour in a throwaway project elsewhere, never
-here. This venv is ~135 packages and ~940 MB on a Mac (MLX included; Linux gets
-~720 MB without it), and several uv commands rebuild it without asking.
+here. This venv is ~120 packages and ~500 MB, and several uv commands rebuild
+it without asking.
 
 Add dependencies with `uv add` / `uv add --dev` rather than hand-editing
 `pyproject.toml`, so constraints and `uv.lock` stay derived rather than invented.
 `uv add` silently no-ops if the current constraint already allows the resolved
 version — pass the locked version as an explicit floor
 (`uv add --dev "ruff>=<locked version>"`) to tighten one.
-A macOS-only dependency takes the marker the MLX ones carry:
-`uv add --marker "sys_platform == 'darwin'" <pkg>`.
 
 Lint runs ruff's own default rule set plus the families pyproject's
 `extend-select` adds (a `select` would replace that default rather than extend
@@ -75,12 +72,12 @@ main, so a broken step in it is first seen there — hence `actionlint` above.
 ## Architecture
 
 Two phases with a hard boundary between them, one shared config object, and the
-local models behind LangChain's interfaces:
+hosted models behind LangChain's interfaces:
 
 ```
 ingest  (rag_pipeline/ingest.py)      load → split → embed → store (MongoDB Atlas + vector index)
-query   (rag_pipeline/pipeline.py)    embed question → search → rerank → stuff prompt → local LLM
-models  embeddings + rerank: Voyage AI's API (factories in ingest.py / pipeline.py) · chat: MLXChatModel, over MLX (mlx_models.py)
+query   (rag_pipeline/pipeline.py)    embed question → search → rerank → stuff prompt → Claude
+models  embeddings + rerank: Voyage AI's API (factories in ingest.py / pipeline.py) · chat: ClaudeChatModel, over Anthropic's SDK (claude_model.py)
 tracing (rag_pipeline/tracing.py)     optional: each question as one trace, to a self-hosted Phoenix
 eval    (rag_pipeline/evaluation.py)  rag eval: evals/questions.json as a LangSmith dataset, judged by Claude
 ```
@@ -131,8 +128,9 @@ not what it computes.
 rank, because the local stack scored a 100% hit rate and a hit rate cannot see a
 right file slipping from first place), `correct` and `grounded` (judged by
 Claude). It exists so the migration to
-hosted models can be measured: each phase is compared with `evals/baseline.json`,
-scored on the local stack.
+hosted models could be measured: each phase was compared with
+`evals/baseline.json`, scored on the earlier local stack (Chroma and Qwen models
+under MLX), and a change to the pipeline is compared with it the same way.
 
 The questions are about `evals/corpus/`, a fictional company's handbook, which
 `run()` ingests through `eval_settings()` — the caller's models and chunking,
@@ -156,10 +154,10 @@ Two things make scores comparable, and both are deliberate:
   LangSmith records against the example as unscored, and `--save-baseline`
   refuses any run with an unscored example.
 
-Its two keys are read through `require_env_key` inside `run()`, which checks the
-question set, both keys, the judge and the dataset before any model loads.
-`anthropic` and `langsmith` are imported only there (cli imports
-`evaluation` inside `cmd_eval`; `anthropic` is in `test_cli.py`'s `HEAVY`). The
+Its keys are read through `require_env_key` inside `run()`, which checks the
+question set, both keys, the judge and the dataset before it builds the
+pipeline. `langsmith` is imported only there (cli imports `evaluation` inside
+`cmd_eval`). The
 tests stand in for LangSmith through the `DatasetStore` protocol and for Claude
 through the `Judge` callable; nothing in the suite calls either service.
 
@@ -186,7 +184,7 @@ The reranker is the deliberate exception: `build_reranker()` lives in
 counterpart, so the "same model must serve both phases" reason that pins the
 embedding/store factories here simply does not apply. It sits beside
 `build_chat_model()`, the other query-time model factory. This is enforced by an
-ordinary behavioral test (the MLX block + the injection seam), not a text
+ordinary behavioral test (the key scrub + the injection seam), not a text
 invariant, because the risk it guards — offline testability — is one a behavioral
 test already covers.
 
@@ -217,61 +215,66 @@ A Voyage account with no payment method is held to 3 requests and 10,000 tokens
 a minute — less than one ingest slice — and fails with `RateLimitError` even
 after the retries. Its free tokens apply with a payment method added.
 
-### The chat model loads once per process (`mlx_models.py`)
+### Claude: the chat model (`claude_model.py`)
 
-`build_chat_model()` constructs `MLXChatModel`, which gets its weights from
-`load_mlx_model()` — the only place weights load. It is memoized by resolved
-snapshot path under a double-checked lock, so concurrent first calls from
-Streamlit sessions load once. That memo is what makes the factory cheap to call
-again: the app rebuilds its pipeline after every ingest and wraps the weights
-already in memory rather than loading a second copy of ~15 GB. Never call
-`mlx_lm.load` anywhere else.
+`build_chat_model()` constructs `ClaudeChatModel`, an adapter of this repo's own
+over the Anthropic SDK's `client.beta.messages.stream`, rather than
+langchain-anthropic's `ChatAnthropic`: that one iterates the SDK's HTTP stream
+without closing it, so an answer stopped early is abandoned rather than ended,
+and Claude generates — and bills — on to `MAX_TOKENS`. Here the SDK stream is a
+context manager around the `yield`s, so closing the adapter's generator closes
+the HTTP response there and then.
 
-`load_mlx_model()`'s ordering is load-bearing:
-
-1. It imports `mlx_lm` *first*, so a machine without MLX gets the same
-   `RuntimeError` whether or not the model is cached — and the test suite's MLX
-   block catches every route to a real model, memoized or not.
-2. `resolve_model_path()` finds the model without the network:
-   `snapshot_download(local_files_only=True, allow_patterns=<mlx-lm's>)`, then
-   checks every shard the weight index lists. Not cached, or incomplete →
-   `FileNotFoundError` naming `uvx --from huggingface_hub hf download <id>`. An
-   existing directory is used as-is.
-3. `mlx_lm.load()` gets that resolved path, never the repo id — given an id,
-   mlx-lm tries the network first even when the model is cached.
-
-Concurrency: one module-level `_GENERATION_LOCK` is held for a whole
-generation, because mlx-lm
-sets and restores the process-wide Metal wired limit around each one and
-overlapping calls race on it. mlx-lm's stream is closed while that lock is still
-held, and the lock is released however the stream ends — exhausted, failed, or
-closed half-way. **A stream that is dropped rather than closed keeps the lock
-until the garbage collector finalizes it**, which for one a Streamlit script
-holds as a module global can be never — every later question, from every
-session, then hangs on the lock. So everything between the model and a frontend
-closes rather than drops: `streamlit_app.py` wraps generation in `closing(chunks)` (the
-Stop button raises inside `st.write_stream` with the stream suspended),
+That only helps if everything between the model and a frontend closes rather
+than drops: `streamlit_app.py` wraps generation in `closing(chunks)` (the Stop
+button raises inside `st.write_stream` with the stream suspended),
 `stream_answer`'s tracing wrapper (`_traced`) closes `_generate`'s stream with
-its own, and `RAGPipeline._generate` closes the chain's stream with its own. That chain is
-`_PROMPT | llm`, with **no `StrOutputParser`**: closing a parser's stream does
-not stop the model — langchain-core catches the `GeneratorExit` and drains the
-parser's input, i.e. generates on to `MAX_TOKENS` under the lock.
-`test_a_real_stop_releases_the_model_and_keeps_the_turn` delivers Stop the way
-the button does, with the garbage collector off, over the real `MLXChatModel`.
+its own, and `RAGPipeline._generate` closes the chain's stream with its own.
+**A stream that is dropped rather than closed lives until the garbage collector
+finalizes it**, which for one a Streamlit script holds as a module global can be
+never. That chain is `_PROMPT | llm`, with **no `StrOutputParser`**: closing a
+parser's stream does not stop the model — langchain-core catches the
+`GeneratorExit` and drains the parser's input, i.e. generates on to
+`MAX_TOKENS`. `test_a_real_stop_ends_the_models_request_and_keeps_the_turn`
+delivers Stop the way the button does, with the garbage collector off, over the
+real adapter and a real SDK client, and checks the HTTP response was closed.
 
-MLX itself is reached only in the generation loop and `_release_buffers`, so
-the prompt, locking, stopping and error translation are all unit-tested in CI
-(`test_mlx_models.py`, over the shared fake MLX stack in `tests/fake_mlx.py`).
-What the fakes cannot check — that the real chat model streams a grounded
-answer with thinking off, and that the Voyage factories embed documents and
-questions the right way round at the configured width — is
-`tests/test_models_live.py` (`-m models`): run it after touching
-`mlx_models.py` or a factory, after a `uv.lock` change that moves `mlx`,
-`mlx-lm`, `mlx-metal`, `transformers`, `tokenizers`, `huggingface-hub`,
-`voyageai` or `langchain-voyageai`, and after re-downloading the model: the
-fakes stay put while all of those move. It calls Voyage's real API, so conftest
-exempts the `models` mark from `_offline` and lets it keep `VOYAGE_API_KEY`.
-Skipped is not passed.
+The request is fixed in the adapter and nowhere else — not settings, because
+each is what this model accepts rather than a user tunable:
+
+- **Thinking `{"type": "between_tools"}`**, Claude Sonnet 5.5's lowest setting:
+  with no tools in the request, no thinking at all. `{"type": "disabled"}` is a
+  400 on this model, and `between_tools` is refused by every other model — so
+  `CHAT_MODEL` set to another model needs the request changed, as the README
+  says.
+- **`output_config={"effort": "low"}`**, and **no sampling parameters** (the
+  model rejects them): the same question can be worded differently run to run,
+  which is why `rag eval` compares rates rather than answers.
+- **Server-side fallback** (`fallbacks="default"`, beta
+  `server-side-fallback-2026-07-01`): a question the safety classifiers decline
+  in a category another model may answer is re-run there on the same stream. A
+  decline that falls back nowhere ends with `stop_reason: "refusal"`, which the
+  adapter raises as a `RuntimeError` saying so — never an empty answer.
+- **`max_retries=4`** on the client (the SDK's default is 2): rate limits,
+  overloads and connection errors are retried with backoff before a user sees
+  an error.
+
+`stop` and generation kwargs are refused with a `ValueError` at call time rather
+than ignored. A `max_tokens` stop reason becomes LangChain's
+`finish_reason: "length"`, which `_generate()` turns into the cut-off note.
+
+The adapter is tested offline through a *real* SDK client whose server is
+`httpx2.MockTransport` (`tests/fake_claude.py`, conftest's `fake_claude`), so
+the body the SDK builds, its event-stream parsing and the closing of the HTTP
+response are all exercised; only the server is a stand-in. What it cannot check
+— that the real API accepts the request and answers as assumed, and that the
+Voyage factories embed documents and questions the right way round at the
+configured width — is `tests/test_live.py` (`-m live`): run it after touching
+`claude_model.py` or a factory, and after a `uv.lock` change that moves
+`anthropic`, `voyageai` or `langchain-voyageai`: the fakes stay put while all of
+those move. It calls the real APIs, so conftest exempts the `live` mark from
+`_offline` and lets it keep `ANTHROPIC_API_KEY` and `VOYAGE_API_KEY` — never
+`MONGODB_URI`. Skipped is not passed.
 
 ### Tracing is the API in the pipeline, the SDK in the frontends
 
@@ -332,9 +335,8 @@ A question is one trace, and every path out of it ends the root span:
 The model's own span still shows ERROR on a Stop: LangChain reports a closed
 stream to its tracer as an error. `_tracer()` is looked up per question, not
 held at import, because a tracer keeps the provider it first resolved and tests
-reset it. `MLXChatModel._get_ls_params` sets `ls_model_name`, since LangChain
-fills it only from a `model`/`model_name` field; without it the LLM span names no
-model. `tests/test_tracing.py` asserts the trace in-process and the wire format
+reset it. `ClaudeChatModel._get_ls_params` sets `ls_provider` and
+`ls_model_name`; LangChain would otherwise name the provider after the class. `tests/test_tracing.py` asserts the trace in-process and the wire format
 in a subprocess, against a stand-in collector that runs inside the subprocess.
 
 ### One MongoDB client per process
@@ -474,18 +476,16 @@ number, and what both frontends' "Indexed N chunks" means.
 `embeddings` / `llm` — and `RAGPipeline.__init__` also `reranker`. **Production
 always passes `None`**; the parameters exist so tests can inject
 `DeterministicFakeEmbedding`, `FakeListChatModel`, and a fake
-`BaseDocumentCompressor`. This is why the suite needs no model, no API key and
-no Apple Silicon: the real `build_embeddings()`/`build_reranker()` call Voyage's
-paid API and `build_chat_model()` loads a 15 GB MLX checkpoint, but none runs
-under test. Any new code path touching an embedding model, the reranker, or the
+`BaseDocumentCompressor`. This is why the suite needs no API key: the real
+`build_embeddings()`/`build_reranker()` call Voyage's paid API and
+`build_chat_model()` Anthropic's, but none runs under test. Any new code path touching an embedding model, the reranker, or the
 LLM should thread these through rather than constructing them unconditionally.
 
 Injection is a convention, so `conftest.py` backs it with autouse guards, each
-pinned by `tests/test_offline_guard.py` so one that loosens reads as a failure: `_no_real_models` makes MLX unimportable (**the one that catches a
-forgotten chat-model injection** — with the model cached, a network block alone
-would let it load), `_no_real_store` removes the developer's real `MONGODB_URI`
-and API keys (so a forgotten embedder or reranker injection stops at the
-missing `VOYAGE_API_KEY`),
+pinned by `tests/test_offline_guard.py` so one that loosens reads as a failure:
+`_no_real_store` removes the developer's real `MONGODB_URI` and API keys (**the
+one that catches a forgotten injection**: each factory stops at its missing key
+before it builds a client),
 `_offline` blocks every socket to a host other than this machine (the atlas-local
 container is on loopback), `_no_tracing` keeps Phoenix and
 LangSmith off whatever `.env` says, and `_no_tracer_left_on` fails a test that
@@ -493,10 +493,10 @@ left tracing on (which `_offline` cannot see: the tracing stack swallows the
 socket error). How each works, and which fixture a new test takes, is in
 `tests/CLAUDE.md`.
 
-Tests marked `@pytest.mark.models` are the deliberate exception: they load the
-real models, are deselected by pyproject's `addopts = ["-m", "not models"]`, and
-run only with `uv run pytest -m models` (a later `-m` replaces the default). They
-skip rather than fail when MLX or a model is missing. CI never runs them.
+Tests marked `@pytest.mark.live` are the deliberate exception: they call the
+real APIs, are deselected by pyproject's `addopts = ["-m", "not live"]`, and
+run only with `uv run pytest -m live` (a later `-m` replaces the default). They
+skip rather than fail when a key is missing. CI never runs them.
 
 Neither frontend takes such parameters — `streamlit_app.py` is a script, and `cli.py`
 builds its own `Settings.from_env()` — so conftest's `wired_env` is the seam for
@@ -524,11 +524,11 @@ because they are only observable at the frontend:
   a yield point that raises `StopException` again. (`fail_mid_stream` raises
   from inside generation and cannot show that; the real-Stop test calls
   `script_requests.request_stop()`, as the button does.)
-- A stopped answer releases the model: see the concurrency paragraph above.
+- A stopped answer ends the model's request: see the Claude section above.
 - A Stop during *retrieval* still closes the stream. It is raised at the
   retrieval spinner's exit (a Streamlit call), after `stream_answer` returned
   and before generation starts, so `streamlit_app.py` registers `closing(chunks)` inside
-  the spinner through an `ExitStack`. No lock is held then, but the stream holds
+  the spinner through an `ExitStack`. No request is open then, but the stream holds
   the question's root span, and a dropped stream means a trace never sent.
 - An upload is reported as added only if it reached the index
   (`indexed_sources()`): ingest skips a textless file — a scanned PDF — without
@@ -553,8 +553,9 @@ because they are only observable at the frontend:
   into test runs — config tests must `monkeypatch.setenv`/`delenv` explicitly.
   This is why `test_config.py` clears `config.ENV_VARS` rather than a
   hand-written list — see the Settings rule above. At runtime it overrides the
-  defaults too: a stale model id left in `.env` fails as "not in the Hugging
-  Face cache".
+  defaults too: a stale `CHAT_MODEL` left in `.env` from the local stack (an
+  `mlx-community/…` id) fails at the first question as a model Anthropic does
+  not have.
 - `cli.py` imports `ingest`/`pipeline` lazily inside the command functions. This
   is load-bearing: importing them pulls in pymongo, langchain-mongodb and the
   langchain stack, so `rag --help` and a usage error stay cheap. Keep
@@ -564,7 +565,7 @@ because they are only observable at the frontend:
   imported, and refuse a malformed one with a `ValueError` — tracing on or off.
   langsmith, inside langchain-core, imports the OpenTelemetry SDK, whose
   `opentelemetry.sdk.trace` validates `OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT`; numpy,
-  langsmith and huggingface_hub (through transformers, on a Mac) each `int()` a
+  langsmith and huggingface_hub (through voyageai's tokenizers) each `int()` a
   variable or two of theirs (`HF_HUB_ETAG_TIMEOUT`, say). So `streamlit_app.py` imports the
   pipeline inside its `Settings` guard, not at the top of the file, where any of
   these was a traceback in place of the whole page. It does so once per process,
@@ -575,22 +576,6 @@ because they are only observable at the frontend:
   imports all of it before its first test — so
   `test_a_variable_refused_at_import_*`, in `test_streamlit_app.py` and `test_cli.py`, run
   the frontends through conftest's `fresh_interpreter`.
-- MLX is **macOS-only**: `mlx` and `mlx-lm` are declared
-  `; sys_platform == 'darwin'`, so the Linux CI legs never install them. Every
-  MLX import is therefore lazy, inside `mlx_models.py`'s functions — a
-  module-level one breaks collection on Linux. ty types them as `Any` on every
-  platform (`replace-imports-with-any` in `pyproject.toml`), so a Mac and CI give
-  the same answer; the price is untyped MLX call sites, which is why they are
-  kept thin. It covers `mlx.**`/`mlx_lm.**` only — not a place to park other
-  unresolved imports.
-- MLX keeps freed buffers for reuse, and with varying shapes that cache grew to
-  several GB beside a model. `_release_buffers()` (`mx.clear_cache()`) runs
-  after every generation; a new MLX call path must do the same.
-- The Qwen3.8 chat template treats an unset `enable_thinking` as *on*: it adds a
-  reasoning instruction and the model streams raw reasoning into the answer with
-  no `<think>` tag to strip. `MLXChatModel` passes `enable_thinking=False`;
-  filtering afterwards cannot work. mlx-lm's `stream_generate` also defaults to
-  `max_tokens=256`, so it is passed explicitly.
 - Atlas Vector Search is **asynchronous** twice over, and each is silent: an index
   is queryable some time after it is created, and a write is searchable some
   time after it lands — until then a search returns nothing, with no error.
@@ -611,11 +596,6 @@ because they are only observable at the frontend:
 - Don't call `reset_store_cache()` outside the tests (see "One MongoDB client per
   process"), and don't remove the ingest's `_WriterLock`: two writers at once are
   silent until a later query finds the index missing what one of them added.
-- `rag_pipeline/__init__.py` sets `TRANSFORMERS_NO_ADVISORY_WARNINGS` before
-  anything imports LangChain, which on a Mac imports transformers (with mlx-lm,
-  without torch) and prints a false "PyTorch was not found". It must stay in the
-  package `__init__`, the earliest import on every entry point;
-  `test_importing_the_pipeline_prints_no_pytorch_warning` checks it.
 - Phoenix's own clients read `PHOENIX_COLLECTOR_ENDPOINT` too, with different
   semantics: unset means `localhost:6006` to them and *off* here, and given no
   protocol they infer gRPC. The name is shared so Phoenix's docs on it apply;
@@ -655,18 +635,18 @@ behavior is:
 
 | Invariant | Enforced by |
 | --------- | ----------- |
-| the exception union, the empty-collection guards, `source` metadata on loaders | `test_pipeline.py`, `test_ingest.py`, `test_mlx_models.py` |
-| `cli.py`'s imports stay cheap | `test_importing_cli_does_not_load_the_heavy_stack` — subprocess-imports the module, asserts pymongo/langchain_mongodb/mlx/mlx_lm/anthropic are absent from `sys.modules`, with the same probe required to see the store stack once the pipeline is imported, so it cannot pass vacuously |
-| the chat model decodes greedily, with thinking off | `test_generation_is_greedy_with_thinking_off_and_explicit_max_tokens` — asserts the exact arguments generation is called with, so no sampler reaches mlx-lm by any route |
+| the exception union, the empty-collection guards, `source` metadata on loaders | `test_pipeline.py`, `test_ingest.py`, `test_claude_model.py` |
+| `cli.py`'s imports stay cheap | `test_importing_cli_does_not_load_the_heavy_stack` — subprocess-imports the module, asserts pymongo/langchain_mongodb/voyageai/anthropic are absent from `sys.modules`, with the same probe required to see every one of them once the pipeline is imported, so it cannot pass vacuously |
+| the chat model's request carries no sampler, thinking at its lowest | `test_the_request_is_the_pipelines_with_no_sampling_parameters` — reads the body the SDK actually sends, so no sampling parameter reaches Claude by any route |
 | `ingest()` never deletes documents it did not write | `test_ingest_preserves_foreign_documents_in_a_shared_collection` — a foreign doc survives a rebuild that deletes |
-| a stopped answer releases the generation lock, and its turn is still stored | `test_a_real_stop_releases_the_model_and_keeps_the_turn` — Stop as Streamlit delivers it, garbage collector off, real `MLXChatModel` over a fake MLX |
-| no test loads a real model | conftest's `_no_real_models`, pinned by `tests/test_offline_guard.py` |
+| a stopped answer ends the model's request, and its turn is still stored | `test_a_real_stop_ends_the_models_request_and_keeps_the_turn` — Stop as Streamlit delivers it, garbage collector off, real `ClaudeChatModel` and SDK client over a stand-in server |
+| no test calls a real model | conftest's `_no_real_store` (the API keys) and `_offline`, pinned by `tests/test_offline_guard.py` |
 | a question is one trace, ended however the question ends (answered, failed, stopped, closed unread) | `tests/test_tracing.py`, plus `test_a_stop_during_retrieval_still_sends_the_questions_trace` in `test_streamlit_app.py` |
 | no test leaves tracing on | conftest's `_no_tracer_left_on`, after every test |
 | secrets (`.env`, `.env.*`, `.streamlit/secrets.toml`), the user's documents in `data/`, coverage's parallel data files and Claude Code worktrees stay out of git; `.env.example` and the three samples stay addable | `test_gitignore_keeps_secrets_and_your_documents_out_of_git` — the repo's `.gitignore` in a scratch repository made with no template, global excludes off |
-| the real chat model and Voyage's API behave as the fakes assume | `tests/test_models_live.py` (`-m models`, by hand on a Mac with `VOYAGE_API_KEY`) |
+| Anthropic's and Voyage's real APIs behave as the fakes assume | `tests/test_live.py` (`-m live`, by hand, with both keys) |
 
-The cheap-imports, greedy-decoding and foreign-document rows each replaced a
+The cheap-imports, no-sampler and foreign-document rows each replaced a
 text rule and are strictly stronger than it: don't reintroduce one.
 
 ## Conventions
@@ -685,25 +665,23 @@ text rule and are strictly stronger than it: don't reintroduce one.
   fourth type — `_add_documents()` catching `OSError` is not one: it is the
   filesystem's own error on a write, and `FileNotFoundError` is already a
   subclass of it. Nor is `cli.py`'s `KeyboardInterrupt` arm ("Interrupted.",
-  exit 130): Ctrl-C is how a slow local answer is abandoned, not a failure.
+  exit 130): Ctrl-C is how an unwanted answer is abandoned, not a failure.
 - Nothing on the pipeline-load path may raise `ValueError`: its guard catches
   only the other two, so one escapes as a traceback under the sidebar, every
-  rerun. That is why every adapter's *construction* raises only
-  `FileNotFoundError` (model not cached, naming the `hf download` command) or
-  `RuntimeError` (MLX missing, a failed load, a model of the wrong family, an
-  out-of-range `EMBEDDING_DIMENSIONS`/`MAX_TOKENS`/`top_n`) — mlx-lm's own
-  `ValueError` for an unsupported model type and huggingface_hub's
-  `HFValidationError` are translated. The pydantic adapters load in a
-  `model_validator(mode="after")` (langchain reserves `model_post_init`), and
-  raise `RuntimeError` there deliberately: pydantic would wrap a `ValueError` in
-  a `ValidationError`.
-- Model failures are translated where the model runs — in the adapters in
-  `mlx_models.py`. Embedding and reranking failures become `RuntimeError`.
-  `MLXChatModel._stream` passes `RuntimeError`/`ValueError` through, wraps
-  anything else (a jinja `TemplateError`, say) in `RuntimeError`, and lets
-  `BaseException` — Streamlit's stop signal, `GeneratorExit` — through
-  untouched. A message type it cannot map, `stop=`, or any generation kwarg is a
-  `ValueError` at *call* time, refused rather than silently ignored.
+  rerun. That is why every model factory and adapter *construction* raises only
+  `RuntimeError` — a missing key, an out-of-range
+  `EMBEDDING_DIMENSIONS`/`MAX_TOKENS`/`RETRIEVAL_K`. `ClaudeChatModel` checks
+  in a `model_validator(mode="after")` (langchain reserves `model_post_init`),
+  and raises `RuntimeError` there deliberately: pydantic would wrap a
+  `ValueError` in a `ValidationError`.
+- Model failures are translated where the model runs. Voyage's become
+  `RuntimeError` in `provider_errors_as_runtime`. `ClaudeChatModel._stream`
+  passes `RuntimeError`/`ValueError` through, turns `anthropic.APIError` (the
+  SDK's root: status errors and connection errors alike) and anything else into
+  `RuntimeError`, raises a refusal as `RuntimeError`, and lets `BaseException` —
+  Streamlit's stop signal, `GeneratorExit` — through untouched. A message type
+  it cannot map, `stop=`, or any generation kwarg is a `ValueError` at *call*
+  time, refused rather than silently ignored.
 - Generation-level checks live in `_generate()` and nowhere else — today the
   empty-answer guard that stops a frontend presenting no content under a full
   citation list, and the note appended to an answer the model cut off at
@@ -718,14 +696,13 @@ text rule and are strictly stronger than it: don't reintroduce one.
   displayed citations from drifting via a second search. Its two halves settle at
   different times — retrieval has run when it returns, generation has not — which
   is what lets a caller wrap a spinner around just the call. The app adds a
-  second spinner until the *first* chunk arrives, since the model reads the
-  whole prompt (several seconds; ~15 s on the first answer after loading)
-  before it writes anything. The stream is a `Generator` because a caller that
-  stops early must `close()` it (see the concurrency paragraph).
+  second spinner until the *first* chunk arrives (about a second after
+  retrieval). The stream is a `Generator` because a caller that
+  stops early must `close()` it (see the Claude section).
 - `RAGPipeline.__init__` checks `1 <= FETCH_K <= 1000` (a `RuntimeError`;
   `$vectorSearch` caps candidates at 10,000 and langchain-mongodb asks for ten
   per result), then calls `require_index()` before building any model, so a
-  fresh setup is told to run `rag ingest` without first loading ~15 GB. Three
+  fresh setup is told to run `rag ingest` before any model client is built. Three
   cases, each a `FileNotFoundError` naming the fix, checked in order: no
   collection of that name (a wrong `COLLECTION_NAME` is a *different*
   collection, and one that silently searched empty would answer every question
@@ -743,12 +720,11 @@ text rule and are strictly stronger than it: don't reintroduce one.
   `MONGODB_URI` (pymongo's `ConfigurationError`) lands there too. A message
   mentioning a dimension gets a hint: a new `COLLECTION_NAME` (or drop that
   collection's vector index), then `rag ingest`.
-- `MLXChatModel` has no `temperature`/`top_p`/`top_k` fields and passes no
-  sampler: decoding is greedy, so the same question over the same retrieved
-  context gets the same answer — grounding comes from the context, and an answer
-  that changes from run to run is harder to check against it. Thinking stays off
-  (`enable_thinking=False`) and `max_tokens` stays explicit. Don't add sampling
-  params.
+- `ClaudeChatModel` has no `temperature`/`top_p`/`top_k` fields and sends no
+  sampler — Claude Sonnet 5.5 rejects them — so answers can vary in wording run
+  to run; grounding comes from the context, and the cited passages are what an
+  answer is checked against. Thinking stays at `between_tools` and `max_tokens`
+  stays explicit. Don't add sampling params.
 - Env-var helpers in `config.py` treat set-but-empty (`CHAT_MODEL=`) as unset and
   fall back to the default, and report a malformed value as `ValueError` — for a
   path too, where pathlib's own signal (a `~user` with no home directory) is a

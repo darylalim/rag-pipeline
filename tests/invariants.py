@@ -16,15 +16,15 @@ thought to enumerate. Enforced that way, and deliberately not in ``RULES``:
   ``test_ingest_preserves_foreign_documents_in_a_shared_collection`` notices a
   foreign document being deleted by any means, not only a literal wipe
 - cli.py's lazy imports -- ``test_importing_cli_does_not_load_the_heavy_stack``
-  imports the module in a subprocess and asserts pymongo/mlx never loaded,
-  covering routes no list of import spellings would reach
-- the chat model decoding greedily --
-  ``test_generation_is_greedy_with_thinking_off_and_explicit_max_tokens``
-  asserts the exact arguments generation is called with, so no sampler reaches
-  mlx-lm by any route
-- no test loading a real model -- conftest's ``_no_real_models`` makes MLX
-  unimportable, which catches a forgotten ``embeddings=`` that names no banned
-  symbol at all
+  imports the module in a subprocess and asserts the store and model clients
+  never loaded, covering routes no list of import spellings would reach
+- the chat model's request carrying no sampler --
+  ``test_the_request_is_the_pipelines_with_no_sampling_parameters`` reads the
+  body the SDK actually sends, so no sampling parameter reaches Claude by any
+  route
+- no test calling a real model -- conftest's ``_no_real_store`` removes the API
+  keys, which catches a forgotten ``embeddings=`` that names no banned symbol at
+  all
 
 What remains is the residue: rules about how source is *written*, where there is
 nothing to observe precisely because the point is that a call never happens.

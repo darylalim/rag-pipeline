@@ -780,7 +780,7 @@ def test_changing_the_embedding_model_re_embeds_everything(
     counting_embeddings.embedded.clear()
 
     n = ingest_mod.ingest(
-        dataclasses.replace(settings, embedding_model="mlx-community/another-embedder"),
+        dataclasses.replace(settings, embedding_model="voyage-another-embedder"),
         embeddings=counting_embeddings,
     )
 
@@ -1189,8 +1189,9 @@ def _ingest_in_another_process(settings: Settings) -> None:
 
     Configured the way the CLI is -- through the environment, every variable
     derived from ENV_VARS, and MONGODB_URI the container's -- with .env off so
-    the developer's cannot answer, and with MLX hidden and a fake injected,
-    since conftest's guards do not reach a child process.
+    the developer's cannot answer, and with a fake injected: the child inherits
+    this process's environment, which conftest has cleared of the API keys,
+    but none of its patches.
     """
     env = {
         **os.environ,
@@ -1199,8 +1200,6 @@ def _ingest_in_another_process(settings: Settings) -> None:
     }
     code = textwrap.dedent(
         f"""
-        import sys
-        sys.modules["mlx"] = sys.modules["mlx_lm"] = None
         from langchain_core.embeddings import DeterministicFakeEmbedding
         from rag_pipeline.config import Settings
         from rag_pipeline.ingest import ingest

@@ -1,7 +1,7 @@
 [project]
 name = "rag-pipeline"
 version = "0.1.0"
-description = "A RAG pipeline built with LangChain, MongoDB Atlas, and MLX models"
+description = "A RAG pipeline built with LangChain, MongoDB Atlas, Voyage AI and Claude"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -14,28 +14,11 @@ dependencies = [
     # start a fresh interpreter set so a developer's .env stays out of the child.
     "python-dotenv>=1.2.0",
     "pypdf>=5.0",
-    # The local models: mlx-lm loads all three checkpoints (text-only) and runs
-    # generation; mlx is declared too because mlx_models.py imports mlx.core
-    # itself. The models target Apple Silicon (MLX's Metal backend), so both are
-    # declared macOS-only: the Linux CI legs never install them, which is why
-    # every MLX import is lazy (inside mlx_models.py's loaders) and why the tests
-    # inject fakes rather than models.
-    "mlx>=0.32.2 ; sys_platform == 'darwin'",
-    "mlx-lm>=0.31.3 ; sys_platform == 'darwin'",
-    # The reranker and chat-model adapters are pydantic models, as their
-    # langchain base classes are, and mlx_models.py imports PrivateAttr and
-    # model_validator itself -- at module level, so pydantic is declared
-    # directly, and on every platform, rather than left to langchain-core.
-    # 2.10 is where pydantic stopped reserving the whole `model_` prefix: below
-    # it, the reranker's `model_id` field is a UserWarning on every `rag
-    # ingest`, `rag query` and app start.
+    # The chat-model adapter is a pydantic model, as its langchain base class
+    # is, and claude_model.py imports model_validator (and ingest.py SecretStr)
+    # itself, so pydantic is declared directly rather than left to
+    # langchain-core.
     "pydantic>=2.10",
-    # Resolves model ids to their local snapshot with local_files_only=True, so
-    # loading a model never reaches the network. Below 2 because transformers
-    # (via mlx-lm, so on macOS) refuses 2.x, even at import, along with its
-    # tokenizers; stated here so the Linux legs, which install neither, resolve
-    # the same hub as a Mac.
-    "huggingface-hub>=1.24,<2",
     # Optional tracing to a self-hosted Phoenix (off unless
     # PHOENIX_COLLECTOR_ENDPOINT is set). pipeline.py opens its spans through
     # the OpenTelemetry API alone -- a no-op until a provider exists -- and
@@ -53,11 +36,12 @@ dependencies = [
     "openinference-instrumentation>=0.1.66",
     "openinference-instrumentation-langchain>=0.1.76",
     # `rag eval` (rag_pipeline/evaluation.py): the question set is a LangSmith
-    # dataset and each run a LangSmith experiment, and Claude judges the
-    # answers through the Anthropic SDK. Imported directly, so declared, though
-    # langsmith also arrives through langchain-core. Both are imported only
-    # inside the eval command, so `rag --help` and the app never load them.
+    # dataset and each run a LangSmith experiment. Imported directly, so
+    # declared, though it also arrives through langchain-core.
     "langsmith>=0.14.1",
+    # Claude, through its own SDK: the chat model (claude_model.py, an adapter
+    # of our own because langchain-anthropic does not close a stream its
+    # consumer abandons) and the eval's judge.
     "anthropic>=1.11.0",
     # The vector store: MongoDB Atlas, with Atlas Vector Search. pymongo is
     # declared directly because ingest.py imports it -- the client, search
@@ -65,7 +49,11 @@ dependencies = [
     # RuntimeError translation -- not only through langchain-mongodb.
     "langchain-mongodb>=0.12.1",
     "pymongo>=4.18.2",
+    # Voyage AI's embedder and reranker, behind LangChain's interfaces
+    # (ingest.build_embeddings, pipeline.build_reranker); voyageai itself is
+    # imported for its clients and errors, so it is declared too.
     "langchain-voyageai>=0.4.1",
+    "voyageai>=0.5.0",
 ]
 
 [project.scripts]
@@ -104,11 +92,11 @@ testpaths = ["tests"]
 # exit 5) — indistinguishable on screen from a pass — and `-v` only reaches 0,
 # pytest's default. Terseness is not worth a green-looking empty run.
 #
-# The one default flag is `-m "not models"`: tests marked `models` load the real
-# MLX checkpoints (about 22 GB of weights, from the local Hugging Face cache), so
-# a plain `uv run pytest` must never reach them. A later `-m` replaces this one,
-# which is how they are opted into: `uv run pytest -m models`.
-addopts = ["-m", "not models"]
+# The one default flag is `-m "not live"`: tests marked `live` call the real
+# Anthropic and Voyage AI APIs, with the developer's keys and at their expense,
+# so a plain `uv run pytest` must never reach them. A later `-m` replaces this
+# one, which is how they are opted into: `uv run pytest -m live`.
+addopts = ["-m", "not live"]
 # An exception in a worker thread, or one Python can only report rather than
 # raise (in a finalizer, or a generator's cleanup), is a pytest *warning* by
 # default: a lock test passed with five of its six workers crashed. These two
@@ -124,7 +112,7 @@ filterwarnings = [
 # interpreter), so a dump means a hang rather than a slow wait.
 faulthandler_timeout = 300
 markers = [
-    "models: loads the real local MLX models (opt in with `-m models`; needs Apple Silicon and the models in the HF cache)",
+    "live: calls the real Anthropic and Voyage AI APIs (opt in with `-m live`; needs ANTHROPIC_API_KEY and VOYAGE_API_KEY)",
 ]
 
 [tool.coverage.run]
@@ -162,11 +150,4 @@ ignore = ["E501", "S105", "S106", "S107"]
 [tool.ruff.lint.isort]
 known-first-party = ["rag_pipeline"]
 
-[tool.ty.analysis]
-# The MLX stack is declared `; sys_platform == 'darwin'`, so it is absent from
-# the Linux environment CI type-checks in. Treating its modules as Any on every
-# platform keeps `uv run ty check` giving the same answer on a Mac as in CI —
-# the alternative (allowing them unresolved) type-checks MLX call sites on a Mac
-# only, where CI can never reproduce a finding. The cost is that MLX calls are
-# untyped, which is why mlx_models.py keeps them thin.
-replace-imports-with-any = ["mlx.**", "mlx_lm.**"]
+

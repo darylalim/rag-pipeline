@@ -21,6 +21,7 @@ import subprocess
 import sys
 import threading
 
+import httpx2
 import pytest
 from langchain_core.documents import Document
 from langchain_core.documents.compressor import BaseDocumentCompressor
@@ -33,8 +34,6 @@ from opentelemetry.sdk.trace import TracerProvider as SDKTracerProvider
 from opentelemetry.trace import StatusCode
 
 from rag_pipeline import ingest as ingest_mod
-from rag_pipeline import mlx_models
-from rag_pipeline.mlx_models import MLXChatModel
 from rag_pipeline.pipeline import RAGPipeline
 from rag_pipeline.tracing import setup_tracing, traces_url
 
@@ -177,50 +176,41 @@ def test_the_rerank_span_shows_what_went_in_and_what_was_kept(
     assert json.loads(kept[0]["metadata"])["source"] == docs[0].metadata["source"]
 
 
-def test_the_model_span_names_the_local_model(
-    settings, fake_embeddings, fake_reranker, fake_mlx, model_dir, spans
+def test_the_model_span_names_the_model(
+    settings, fake_embeddings, fake_reranker, fake_claude, spans
 ):
-    """LangChain names a model from a `model` or `model_name` field, and the
-    adapter's is `model_id`: without its override, no trace says which model
-    answered."""
-    pipeline = _pipeline(
-        settings,
-        fake_embeddings,
-        MLXChatModel(model_id=model_dir, max_tokens=50),
-        fake_reranker,
-    )
+    """The adapter tells a tracer which model answered and whose it is --
+    LangChain would otherwise name the provider after the class."""
+    pipeline = _pipeline(settings, fake_embeddings, fake_claude.chat(), fake_reranker)
 
     pipeline.answer(_QUESTION)
 
-    attributes = _attributes(_named(spans.get_finished_spans(), "MLXChatModel"))
-    assert attributes["llm.model_name"] == model_dir
-    assert attributes["llm.provider"] == "mlx"
+    attributes = _attributes(_named(spans.get_finished_spans(), "ClaudeChatModel"))
+    assert attributes["llm.model_name"] == "claude-sonnet-5-5"
+    assert attributes["llm.provider"] == "anthropic"
 
 
 def test_a_stopped_answer_ends_its_trace_as_stopped_not_failed(
-    settings, fake_embeddings, fake_reranker, fake_mlx, model_dir, spans
+    settings, fake_embeddings, fake_reranker, fake_claude, spans
 ):
     """A Stop is the reader's choice, not a failure of the pipeline.
 
     Recorded -- an event, and the partial answer as the output -- with the
     status left unset, so Phoenix does not count every Stop as a failed
     question. And tracing must not cost the property the Stop exists for:
-    closing the stream still stops the model there, lock released.
+    closing the stream still ends the model's request there.
     """
-    fake_mlx.pieces = [f"word{i} " for i in range(20)]
+    fake_claude.pieces = [f"word{i} " for i in range(200)]
     pipeline = _pipeline(
-        settings,
-        fake_embeddings,
-        MLXChatModel(model_id=model_dir, max_tokens=50),
-        fake_reranker,
+        settings, fake_embeddings, fake_claude.chat(max_tokens=500), fake_reranker
     )
 
     _docs, chunks = pipeline.stream_answer(_QUESTION)
     assert next(chunks) == "word0 "
     chunks.close()
 
-    assert fake_mlx.pieces_generated == 1, "the model ran on after the close"
-    assert not mlx_models._GENERATION_LOCK.locked()
+    (body,) = fake_claude.bodies
+    assert body.closed, "the model's request was left open after the close"
     root = _named(spans.get_finished_spans(), "RAGPipeline")
     assert root.status.status_code is StatusCode.UNSET
     assert [(e.name, dict(e.attributes or {})) for e in root.events] == [
@@ -256,15 +246,21 @@ def test_a_stream_closed_before_its_first_piece_still_ends_the_trace(
 
 @pytest.mark.parametrize("empty_answer", [False, True], ids=["model-error", "empty"])
 def test_a_failed_answer_ends_its_trace_in_error(
-    settings, fake_embeddings, fake_reranker, fake_mlx, model_dir, spans, empty_answer
+    settings, fake_embeddings, fake_reranker, fake_claude, spans, empty_answer
 ):
     """A failure while generating -- the model's own, or the pipeline's
     empty-answer check -- marks the question failed, with the error recorded."""
     if empty_answer:
         llm = FakeListChatModel(responses=["   "])  # whitespace: nothing to show
     else:
-        fake_mlx.stream_error = OSError("metal ran out of memory")
-        llm = MLXChatModel(model_id=model_dir, max_tokens=50)
+        fake_claude.respond = lambda _r: httpx2.Response(
+            529,
+            json={
+                "type": "error",
+                "error": {"type": "overloaded_error", "message": "busy"},
+            },
+        )
+        llm = fake_claude.chat()
     pipeline = _pipeline(settings, fake_embeddings, llm, fake_reranker)
 
     with pytest.raises(RuntimeError):

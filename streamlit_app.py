@@ -40,7 +40,9 @@ st.session_state.setdefault("messages", [])
 # One entry. Every pipeline shares the process-wide models and the process-wide
 # MongoDB client, so a rebuild only reopens the collection, and a second slot
 # would save nothing worth keeping.
-@st.cache_resource(max_entries=1, show_spinner="Loading the index and local models...")
+@st.cache_resource(
+    max_entries=1, show_spinner="Connecting to the index and the models..."
+)
 def load_pipeline(_settings: Settings, version: str) -> RAGPipeline:
     """Build the pipeline, cached until the indexed corpus changes.
 
@@ -91,10 +93,9 @@ def _add_documents(settings: Settings, uploads: list[UploadedFile]) -> None:
         except (OSError, RuntimeError, ValueError) as exc:
             # The files are on disk regardless, so this reports a failed *index*
             # rather than a failed upload — `rag ingest` retries it. RuntimeError
-            # covers MLX being unavailable, an embedding model that fails to load
-            # or run, and any store error; OSError includes the FileNotFoundError
-            # for an embedding model not yet downloaded. Without them those
-            # escape and crash the sidebar mid-upload.
+            # covers a missing key, a Voyage failure and any store error; OSError
+            # is the filesystem's own. Without them those escape and crash the
+            # sidebar mid-upload.
             st.error(f"Indexing failed: {exc}", icon=":material/error:")
         else:
             # Checked against what the index now holds, not against what was
@@ -157,7 +158,8 @@ def _import_failure() -> str:
 # or one a library reads for itself as the pipeline's imports first load it —
 # the OpenTelemetry SDK, which langsmith imports inside langchain-core, refuses
 # OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT=abc, tracing on or off, and huggingface_hub
-# refuses HF_HUB_ETAG_TIMEOUT=abc. Hence those imports here, inside the guard,
+# (under voyageai's tokenizers) refuses HF_HUB_ETAG_TIMEOUT=abc. Hence those
+# imports here, inside the guard,
 # rather than at the top of the file, where either was a traceback in place of
 # the whole page;
 # nothing below works without them, the uploader included. The advice is to
@@ -255,9 +257,8 @@ try:
     setup_tracing(cfg)
     pipeline = load_pipeline(cfg, index_version(cfg))
 except (FileNotFoundError, RuntimeError) as exc:
-    # FileNotFoundError: no/empty index, or a model missing from the Hugging
-    # Face cache. RuntimeError: MLX unavailable, a model that fails to load, or
-    # a store error.
+    # FileNotFoundError: no/empty index. RuntimeError: a missing key, an
+    # unreachable service, or a store error.
     # One callout, not an error stacked on an info: the advice is a continuation
     # of the error, meaningless on its own. Left generic because it covers every
     # case and each exception already names its own remedy: a reload picks up a

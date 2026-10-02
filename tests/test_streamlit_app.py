@@ -7,7 +7,7 @@ model, the reranker and the chat model only through `build_embeddings()`,
 requires of every caller, and all three are resolved as module globals at call
 time. Patching them there is the same dependency-injection seam entering by a
 different door, and it is what keeps these tests inside the suite's guarantees:
-no model loaded, no MLX, no socket.
+no model called, no API key, no socket beyond the test container.
 
 What earns these tests their runtime is the turn-pairing invariant. Every other
 guarantee in this repo is about a function's return value, which an ordinary
@@ -34,10 +34,8 @@ from streamlit.runtime.scriptrunner_utils.script_run_context import get_script_r
 from streamlit.testing.v1 import AppTest
 
 from rag_pipeline import ingest as ingest_mod
-from rag_pipeline import mlx_models
 from rag_pipeline import pipeline as pipeline_mod
 from rag_pipeline import tracing as tracing_mod
-from rag_pipeline.mlx_models import MLXChatModel
 
 APP = Path(__file__).resolve().parent.parent / "streamlit_app.py"
 
@@ -206,41 +204,41 @@ def _stop_the_run() -> None:
     ctx.script_requests.request_stop()
 
 
-def test_a_real_stop_releases_the_model_and_keeps_the_turn(
-    app, fake_mlx, model_dir, monkeypatch
+def test_a_real_stop_ends_the_models_request_and_keeps_the_turn(
+    app, fake_claude, monkeypatch
 ):
-    """The Stop button as Streamlit delivers it, against the real local model.
+    """The Stop button as Streamlit delivers it, against the real chat model.
 
     Unlike `fail_mid_stream`, which raises from inside generation, the button
     asks the runner to stop; the exception arrives inside write_stream, with the
-    answer stream suspended mid-generation. Two things then rest on streamlit_app.py:
+    answer stream suspended mid-generation. Two things then rest on
+    streamlit_app.py:
 
-    - The stream is *closed*, so the model stops and releases the process-wide
-      generation lock there and then. Merely dropped, it lives on as a global of
-      the script module, which Streamlit keeps after the run, and the next
-      question -- from any session -- waits on the lock for good. The garbage
-      collector is off for the stopped run, so nothing else can release it.
+    - The stream is *closed*, so the model's HTTP request ends there and then.
+      Merely dropped, the stream lives on as a global of the script module,
+      which Streamlit keeps after the run, and Claude keeps generating -- and
+      billing -- to MAX_TOKENS. The garbage collector is off for the stopped
+      run, so nothing else can close it.
     - The turn is still stored as a pair. The runner stays stopped, so reading
       st.session_state in the `finally` would raise again and drop both halves.
     """
-    fake_mlx.pieces = [f"word{i} " for i in range(20)]
-    fake_mlx.on_piece = lambda i: _stop_the_run() if i == 3 else None
-    chat = MLXChatModel(model_id=model_dir, max_tokens=50)
-    monkeypatch.setattr(pipeline_mod, "build_chat_model", lambda _s: chat)
+    fake_claude.pieces = [f"word{i} " for i in range(200)]
+    fake_claude.on_piece = lambda i: _stop_the_run() if i == 3 else None
+    monkeypatch.setattr(
+        pipeline_mod, "build_chat_model", lambda _s: fake_claude.chat(max_tokens=500)
+    )
     at = app.run()
 
     gc.disable()
     try:
         at.chat_input[0].set_value("Why do chunks overlap?").run()
-        held = mlx_models._GENERATION_LOCK.locked()
+        (body,) = fake_claude.bodies
+        closed = body.closed
     finally:
         gc.enable()
-        if mlx_models._GENERATION_LOCK.locked():
-            # So a failure here fails this test, not every later one that waits.
-            mlx_models._GENERATION_LOCK.release()
 
-    assert not held, "the stopped answer kept the generation lock"
-    assert fake_mlx.pieces_generated < len(fake_mlx.pieces), (
+    assert closed, "the stopped answer left the model's request open"
+    assert body.pieces_sent < len(fake_claude.pieces) / 2, (
         "the model generated on after the Stop"
     )
     assert _roles(at) == ["user", "assistant"], "the stopped turn was not stored"
@@ -248,7 +246,7 @@ def test_a_real_stop_releases_the_model_and_keeps_the_turn(
     assert reply["error"] is True
     assert "Interrupted" in reply["content"]
 
-    fake_mlx.on_piece = None
+    fake_claude.on_piece = None
     at.chat_input[0].set_value("Tell me about apples.").run()
     assert not at.exception, [e.value for e in at.exception]
     assert _roles(at) == ["user", "assistant"] * 2
@@ -695,17 +693,12 @@ def test_an_upload_with_no_text_is_not_reported_as_added(app, wired_env):
             ValueError("No readable documents found in data"), id="value-error"
         ),
         pytest.param(
-            RuntimeError(
-                "Cannot load 'm': the local models run on MLX, which needs Apple "
-                "Silicon macOS."
-            ),
+            RuntimeError("Voyage AI request failed: rate limited"),
             id="runtime-error",
         ),
         pytest.param(
-            FileNotFoundError(
-                "Model 'm' is not in the Hugging Face cache (or incomplete)."
-            ),
-            id="model-not-downloaded",
+            FileNotFoundError("Data directory does not exist: data"),
+            id="file-not-found",
         ),
     ],
 )
@@ -715,11 +708,11 @@ def test_a_failed_rebuild_is_reported_not_raised(app, monkeypatch, exc):
     should re-run `rag ingest`, not re-upload.
 
     Parametrized over the exception because _add_documents must catch the whole
-    frontend union. ValueError is the empty-corpus case; RuntimeError is MLX
-    being unavailable, an embedding model that fails to load or run, or a
-    translated store error; FileNotFoundError is an embedding model not yet in
-    the Hugging Face cache. The historical (OSError, ValueError) catch would
-    have let the RuntimeError escape straight through the sidebar.
+    frontend union. ValueError is the empty-corpus case; RuntimeError is a
+    missing key, a Voyage failure or a translated store error;
+    FileNotFoundError is a data directory that is gone. The historical
+    (OSError, ValueError) catch would have let the RuntimeError escape straight
+    through the sidebar.
     """
 
     def failing_ingest(_settings, embeddings=None):
@@ -793,11 +786,12 @@ print(json.dumps(loads))
             "OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT",
             id="opentelemetry",
         ),
-        # huggingface_hub's, read as it is imported (through transformers).
-        pytest.param("HF_HUB_ETAG_TIMEOUT", "abc", "'abc'", id="huggingface-hub"),
         # numpy's message is int()'s own, naming only the value -- and a failed
         # numpy import cannot be repeated, which is what the reload checks.
         pytest.param("NUMPY_MADVISE_HUGEPAGE", "abc", "'abc'", id="numpy"),
+        # huggingface_hub's, read as it is imported (through voyageai's
+        # tokenizers).
+        pytest.param("HF_HUB_ETAG_TIMEOUT", "abc", "'abc'", id="huggingface-hub"),
     ],
 )
 def test_a_variable_refused_at_import_stops_before_the_sidebar(

@@ -44,7 +44,7 @@ def test_defaults(fresh_interpreter):
 
 
 def test_from_env_overrides(monkeypatch, tmp_path):
-    monkeypatch.setenv("CHAT_MODEL", "mlx-community/Qwen3-8B-4bit")
+    monkeypatch.setenv("CHAT_MODEL", "claude-test-model")
     monkeypatch.setenv("RERANK_MODEL", str(tmp_path / "reranker"))
     monkeypatch.setenv("RETRIEVAL_K", "7")
     monkeypatch.setenv("FETCH_K", "30")
@@ -64,7 +64,7 @@ def test_from_env_overrides(monkeypatch, tmp_path):
 
     s = Settings.from_env()
 
-    assert s.chat_model == "mlx-community/Qwen3-8B-4bit"
+    assert s.chat_model == "claude-test-model"
     # A model setting is a string passed through as-is: a local directory is as
     # valid as a repo id, and resolving either is the loader's job.
     assert s.rerank_model == str(tmp_path / "reranker")

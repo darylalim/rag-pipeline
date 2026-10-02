@@ -25,9 +25,7 @@ import importlib.util
 import json
 import subprocess
 import sys
-import types
 
-import huggingface_hub.constants as hf_constants
 import pytest
 
 from rag_pipeline import cli
@@ -114,48 +112,26 @@ def test_a_missing_index_is_an_error_not_a_traceback(wired_env, capsys):
     assert "rag ingest" in err
 
 
-def test_a_machine_without_mlx_is_an_error_not_a_traceback(
-    indexed, capsys, monkeypatch
+def test_a_query_without_the_anthropic_key_is_an_error_not_a_traceback(
+    wired_env, capsys, monkeypatch
 ):
-    """RuntimeError: the local models need MLX, which only Apple Silicon has.
+    """RuntimeError: the answer model's key is missing, named as such.
 
-    conftest already makes MLX unimportable, which is exactly the state of a
-    machine without it, so all this needs is the real chat factory back -- the
-    production path this test is about. The message has to say why, or a Linux
-    user is left with an import error from a package they never asked for.
+    Through `rag query` with the real chat factory back -- the production path
+    this test is about; conftest has removed the developer's key. The message
+    has to name the variable, or a user is left guessing which of three
+    services' credentials is missing.
     """
     monkeypatch.setattr(pipeline_mod, "build_chat_model", build_chat_model)
+    cli.main(["ingest"])
+    capsys.readouterr()
 
     assert cli.main(["query", "anything"]) == 1
 
     err = capsys.readouterr().err
     assert err.startswith("Error: ")
     assert "Traceback" not in err
-    assert "Apple Silicon" in err
-
-
-def test_a_model_missing_from_the_cache_is_an_error_not_a_traceback(
-    indexed, capsys, monkeypatch, tmp_path
-):
-    """FileNotFoundError: a chat model that was never downloaded names the download.
-
-    Through `rag query`, the command that loads it. MLX is a stand-in -- the
-    loader only needs its import to succeed before it looks in the cache -- and
-    the cache is an empty directory, so the developer's own is not what
-    answers. Nothing is fetched: conftest blocks every socket, so a lookup that
-    tried the network would fail differently.
-    """
-    monkeypatch.setitem(sys.modules, "mlx_lm", types.ModuleType("mlx_lm"))
-    monkeypatch.setattr(hf_constants, "HF_HUB_CACHE", str(tmp_path / "empty-hub"))
-    monkeypatch.setattr(pipeline_mod, "build_chat_model", build_chat_model)
-    monkeypatch.setenv("CHAT_MODEL", "some-org/never-downloaded")
-
-    assert cli.main(["query", "anything"]) == 1
-
-    err = capsys.readouterr().err
-    assert err.startswith("Error: ")
-    assert "Traceback" not in err
-    assert "hf download some-org/never-downloaded" in err
+    assert "ANTHROPIC_API_KEY is not set" in err
 
 
 def test_eval_without_its_keys_is_an_error_not_a_traceback(
@@ -362,13 +338,11 @@ def test_a_question_sets_up_tracing_and_an_ingest_does_not(indexed, monkeypatch)
 
 # --- the cost of `rag --help` ------------------------------------------------
 
-# The heavy half of the dependency tree: the vector store and the model runtime.
+# The heavy half of the dependency tree: the vector store and the model clients.
 # cli.py reaches all of it, but only from inside a command function: importing
 # the module must not pay for a stack the user may never reach, since `rag
 # --help` and a usage error load cli.py and then exit.
-# `anthropic` is the eval command's alone (its judge): `rag --help`, `rag ingest`
-# and `rag query` have no use for it.
-HEAVY = ("pymongo", "langchain_mongodb", "mlx", "mlx_lm", "anthropic")
+HEAVY = ("pymongo", "langchain_mongodb", "voyageai", "anthropic")
 
 # What tracing loads once it is on: the LangChain instrumentation and the span
 # exporter. Off, the pipeline carries the OpenTelemetry API alone.
@@ -420,7 +394,7 @@ def heavy_modules_loaded() -> dict:
 
 
 def test_importing_cli_does_not_load_the_heavy_stack(heavy_modules_loaded):
-    """`import rag_pipeline.cli` must not drag in the store stack or MLX.
+    """`import rag_pipeline.cli` must not drag in the store or model clients.
 
     The behavioral form of what used to be a text rule matching import
     spellings in cli.py. Asserting on `sys.modules` is strictly stronger: it
@@ -430,24 +404,13 @@ def test_importing_cli_does_not_load_the_heavy_stack(heavy_modules_loaded):
 
     The second reading is the control: a list of module names that nothing
     imports passes the first assertion vacuously, and a provider swap is exactly
-    when HEAVY drifts out of date. The same probe must see the store stack once
-    the pipeline itself is imported.
+    when HEAVY drifts out of date. The same probe must see every one of them
+    once the pipeline itself is imported.
     """
     assert not heavy_modules_loaded["cli"], (
         f"importing cli.py loaded: {heavy_modules_loaded['cli']}"
     )
-    assert {"pymongo", "langchain_mongodb"} <= set(heavy_modules_loaded["pipeline"])
-
-
-def test_importing_the_pipeline_does_not_load_mlx(heavy_modules_loaded):
-    """MLX is imported when a model loads, not when the pipeline does.
-
-    The project installs MLX only on macOS, while CI runs on Linux: an eager
-    import anywhere in ingest.py or pipeline.py would fail the Linux run at
-    collection, and on a Mac it would pass unnoticed until then.
-    """
-    loaded = set(heavy_modules_loaded["pipeline"])
-    assert not {"mlx", "mlx_lm"} & loaded, f"importing the pipeline loaded: {loaded}"
+    assert set(HEAVY) <= set(heavy_modules_loaded["pipeline"])
 
 
 def test_tracing_off_loads_none_of_the_tracing_stack(heavy_modules_loaded):
@@ -464,35 +427,3 @@ def test_tracing_off_loads_none_of_the_tracing_stack(heavy_modules_loaded):
     assert not heavy_modules_loaded["tracing"], (
         f"tracing off loaded: {heavy_modules_loaded['tracing']}"
     )
-
-
-@pytest.mark.skipif(
-    importlib.util.find_spec("transformers") is None,
-    reason="transformers arrives only with mlx-lm, which is installed only on macOS",
-)
-def test_importing_the_pipeline_prints_no_pytorch_warning(fresh_interpreter):
-    """No "PyTorch was not found" on every command.
-
-    transformers is only mlx-lm's tokenizer backend, and torch is deliberately
-    absent -- but LangChain imports transformers as soon as the pipeline is
-    imported, before mlx-lm can silence the notice, so without the package's
-    own setting every `rag` command and the app would open by announcing that
-    models won't be available.
-
-    The pipeline modules are imported first and alone: whichever module an
-    entry point starts from, the package's `__init__` runs before it, so only a
-    setting made there holds for all of them -- one moved into cli.py would
-    leave the app printing the notice. In a scrubbed interpreter, because this
-    one set the variable when it imported the package, and a child inheriting it
-    would pass whether or not the package still sets it. The transformers check
-    is the control: transformers has to have been imported for the notice check
-    to mean anything.
-    """
-    result = fresh_interpreter(
-        "import sys, rag_pipeline.ingest, rag_pipeline.pipeline\n"
-        "print('transformers' in sys.modules)\n"
-    )
-
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.split()[-1] == "True"
-    assert "PyTorch was not found" not in result.stderr

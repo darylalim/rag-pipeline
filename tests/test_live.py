@@ -1,22 +1,21 @@
-"""Live tests: the real local chat model and Voyage AI's real API.
+"""Live tests: Anthropic's and Voyage AI's real APIs.
 
-Deselected by default -- pyproject's ``addopts`` carries ``-m "not models"`` --
-and run with ``uv run pytest -m models``. Each test skips, rather than fails,
-where it cannot run: without MLX (anything but Apple Silicon macOS) or the chat
-model downloaded, without ``VOYAGE_API_KEY``, or -- the ingest-and-answer pass
-over ``data/`` -- without the sample document its question is about, since
-``data/`` is the user's to replace.
+Deselected by default -- pyproject's ``addopts`` carries ``-m "not live"`` --
+and run with ``uv run pytest -m live``. Each test skips, rather than fails,
+without the key it needs (``ANTHROPIC_API_KEY``, ``VOYAGE_API_KEY``), and the
+ingest-and-answer pass over ``data/`` also without the sample document its
+question is about, since ``data/`` is the user's to replace. A run costs a few
+cents.
 
-The Voyage tests check what the fakes cannot: that the factories ask for
-documents and questions the right way round (a query embedded as a document
-still retrieves something, just worse), at the configured width, and that the
-reranker's order is the one ``retrieve()`` relies on. They cost a fraction of
-a cent. These are the only tests allowed onto the network, and the only ones
-that keep ``VOYAGE_API_KEY`` (conftest's ``_offline`` and ``_no_real_store``
-exempt the ``models`` mark); ``MONGODB_URI`` is still the test container's.
-
-The chat model loads once per process (``load_mlx_model`` memoizes it), so the
-fixture below is cheap after the first test that needs it.
+These check what the fakes cannot: that the request each factory builds is one
+the real API accepts and answers as the pipeline assumes -- Voyage embedding
+documents and questions the right way round, at the configured width, and its
+reranker putting the relevant passage first; Claude streaming a grounded answer
+with no reasoning in it, declining what the context does not say, and
+reporting a cut-off at MAX_TOKENS the way the pipeline's note reads it. They
+are the only tests allowed onto the network and the only ones that keep the
+API keys (conftest's ``_offline`` and ``_no_real_store`` exempt the ``live``
+mark); ``MONGODB_URI`` is still the test container's.
 """
 
 from __future__ import annotations
@@ -31,12 +30,11 @@ from langchain_core.embeddings import Embeddings
 from langchain_core.prompts import ChatPromptTemplate
 
 from rag_pipeline import ingest as ingest_mod
-from rag_pipeline import mlx_models
+from rag_pipeline.claude_model import ClaudeChatModel
 from rag_pipeline.config import Settings
-from rag_pipeline.mlx_models import MLXChatModel, resolve_model_path
-from rag_pipeline.pipeline import RAGPipeline, build_reranker
+from rag_pipeline.pipeline import RAGPipeline, build_chat_model, build_reranker
 
-pytestmark = pytest.mark.models
+pytestmark = pytest.mark.live
 
 _DEFAULTS = Settings()
 
@@ -47,18 +45,9 @@ _FACTS = [
 ]
 
 
-def _require(model_id: str) -> None:
-    """Skip unless MLX is importable and ``model_id`` is fully downloaded."""
-    pytest.importorskip("mlx_lm", reason="MLX needs Apple Silicon macOS")
-    try:
-        resolve_model_path(model_id)
-    except FileNotFoundError as exc:
-        pytest.skip(str(exc))
-
-
-def _require_voyage() -> None:
-    if not os.environ.get("VOYAGE_API_KEY"):
-        pytest.skip("VOYAGE_API_KEY is not set")
+def _require(key: str) -> None:
+    if not os.environ.get(key):
+        pytest.skip(f"{key} is not set")
 
 
 def _dot(a: list[float], b: list[float]) -> float:
@@ -67,15 +56,18 @@ def _dot(a: list[float], b: list[float]) -> float:
 
 @pytest.fixture
 def embedder() -> Embeddings:
-    _require_voyage()
+    _require("VOYAGE_API_KEY")
     return ingest_mod.build_embeddings(_DEFAULTS)
 
 
 @pytest.fixture
-def chat() -> MLXChatModel:
-    _require(_DEFAULTS.chat_model)
-    # Small, to keep the run short; every expected answer fits well inside it.
-    return MLXChatModel(model_id=_DEFAULTS.chat_model, max_tokens=64)
+def chat() -> ClaudeChatModel:
+    _require("ANTHROPIC_API_KEY")
+    # The production factory, at a small cap to keep the run short; every
+    # expected answer fits well inside it.
+    model = build_chat_model(dataclasses.replace(_DEFAULTS, max_tokens=256))
+    assert isinstance(model, ClaudeChatModel)
+    return model
 
 
 # --- Voyage AI ----------------------------------------------------------------
@@ -106,7 +98,7 @@ def test_a_question_retrieves_its_passage(embedder):
 
 
 def test_the_reranker_puts_the_relevant_passage_first():
-    _require_voyage()
+    _require("VOYAGE_API_KEY")
     reranker = build_reranker(dataclasses.replace(_DEFAULTS, retrieval_k=3))
     docs = [Document(page_content=text, id=str(i)) for i, text in enumerate(_FACTS)]
 
@@ -141,7 +133,7 @@ _CONTEXT = (
 )
 
 
-def _stream(chat: MLXChatModel, question: str) -> list[str]:
+def _stream(chat: ClaudeChatModel, question: str) -> list[str]:
     # The pipeline's own chain shape: prompt then model, with no output parser.
     chain = _PROMPT | chat
     return [
@@ -156,10 +148,8 @@ def test_the_chat_model_streams_a_grounded_answer(chat):
 
     assert len([p for p in pieces if p]) > 1  # streamed, not delivered whole
     assert "200" in answer
-    # Thinking left on streams the model's reasoning into the answer instead.
-    assert "<think>" not in answer
-    assert "</think>" not in answer
-    assert not mlx_models._GENERATION_LOCK.locked()
+    # No reasoning in the visible answer: thinking is at its lowest.
+    assert "<thinking>" not in answer
 
 
 def test_the_chat_model_declines_what_the_context_does_not_say(chat):
@@ -180,13 +170,14 @@ def test_the_chat_model_declines_what_the_context_does_not_say(chat):
 
 
 def test_the_chat_model_reports_why_it_stopped(chat):
-    """The metadata the MAX_TOKENS note is read from, as mlx-lm really sends it.
+    """The metadata the MAX_TOKENS note is read from, as the API really sends it.
 
     The pipeline says an answer was cut off only when the model reports
-    "length", and the fake that CI runs against cannot follow mlx-lm: were an
-    upgrade to rename that value or move it, the note would vanish with every
-    other test still green. An answer that fits must stop on its own, and one
-    given four tokens must be cut off at exactly four.
+    "length", which the adapter maps from the API's `max_tokens` stop reason;
+    the mock server CI runs against cannot follow the real API: were it to
+    rename the value, the note would vanish with every other test still green.
+    An answer that fits must stop on its own, and one given four tokens must be
+    cut off at exactly four.
     """
     prompt = _PROMPT.invoke(
         {
@@ -195,9 +186,11 @@ def test_the_chat_model_reports_why_it_stopped(chat):
         }
     )
     finished = chat.invoke(prompt)
-    cut_off = MLXChatModel(model_id=_DEFAULTS.chat_model, max_tokens=4).invoke(prompt)
+    cut_off = build_chat_model(dataclasses.replace(_DEFAULTS, max_tokens=4)).invoke(
+        prompt
+    )
 
-    assert finished.response_metadata["finish_reason"] == "stop"
+    assert finished.response_metadata["finish_reason"] == "end_turn"
     assert finished.usage_metadata is not None
     assert 0 < finished.usage_metadata["output_tokens"] < chat.max_tokens
     assert cut_off.response_metadata["finish_reason"] == "length"
@@ -209,10 +202,10 @@ def test_the_chat_model_reports_why_it_stopped(chat):
 
 
 def test_ingest_then_answer_over_the_repo_corpus(atlas):
-    """Voyage and the chat model together, through the real factories, over
-    data/, in the test's own database on the atlas-local container."""
-    _require(_DEFAULTS.chat_model)
-    _require_voyage()
+    """Voyage and Claude together, through the real factories, over data/, in
+    the test's own database on the atlas-local container."""
+    _require("ANTHROPIC_API_KEY")
+    _require("VOYAGE_API_KEY")
     # The question and both assertions are about the sample corpus, and data/ is
     # the user's to replace: a replaced corpus says nothing about whether the
     # models are driven correctly, so it is a skip, not a failure.

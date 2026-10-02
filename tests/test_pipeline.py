@@ -1,27 +1,24 @@
 """Tests for the query phase: helpers, guards, retrieval, and generation.
 
 Generation *is* exercised here, through an injected fake chat model rather than
-a real one — so no weights load and MLX is never imported, per the injection
-seam described in CLAUDE.md. That covers both shapes (`stream_answer()` and the
+a real one — so no API is called, per the injection seam described in
+CLAUDE.md. That covers both shapes (`stream_answer()` and the
 `answer()` join over it), that they cannot drift apart, that streaming stays
 incremental, and that every failure lands in the union both frontends catch.
 
-The index guards are tested with *no* models injected. conftest makes MLX
-unimportable, so a pipeline that built a model before checking the index would
-fail with the loader's RuntimeError instead of the guard's FileNotFoundError --
-which makes each guard test a proof of ordering as well as of the message.
+The index guards are tested with *no* models injected. conftest removes the API
+keys, so a pipeline that built a model before checking the index would fail
+with the factory's missing-key RuntimeError instead of the guard's
+FileNotFoundError -- which makes each guard test a proof of ordering as well as
+of the message.
 """
 
 from __future__ import annotations
 
 import dataclasses
-import sys
 import time
-import types
 from types import SimpleNamespace
-from typing import Any
 
-import huggingface_hub.constants as hf_constants
 import pytest
 import voyageai.error
 from langchain_core.documents import Document
@@ -33,10 +30,9 @@ from langchain_core.runnables import RunnableLambda
 from langchain_voyageai import VoyageAIEmbeddings, VoyageAIRerank
 
 from rag_pipeline import ingest as ingest_mod
-from rag_pipeline import mlx_models
 from rag_pipeline import pipeline as pipeline_mod
+from rag_pipeline.claude_model import ClaudeChatModel
 from rag_pipeline.config import Settings
-from rag_pipeline.mlx_models import MLXChatModel
 from rag_pipeline.pipeline import (
     RAGPipeline,
     build_chat_model,
@@ -478,52 +474,46 @@ def test_a_model_that_returns_plain_text_is_streamed_as_is(
     assert pipeline.answer("Why do chunks overlap?").text == "A plain-text answer."
 
 
-def test_closing_the_answer_stream_stops_the_local_model(
-    settings, fake_embeddings, fake_reranker, fake_mlx, model_dir
+def test_closing_the_answer_stream_ends_the_models_request(
+    settings, fake_embeddings, fake_reranker, fake_claude
 ):
     """What the app's Stop relies on: closing the stream stops generation there.
 
-    Through the real local chat model, over a fake MLX, because the property is
-    about the stack between them: the model holds a process-wide lock for as
-    long as it generates, and a chain that drained the model when closed (a
-    `StrOutputParser` on the end does) would keep every other question waiting
-    until MAX_TOKENS. Closed after one piece, the model must have produced one
-    -- and have finished, lock held, before the lock is let go.
+    Through the real chat model, over a real client and a stand-in server,
+    because the property is about the stack between them: a chain that drained
+    the model when closed (a `StrOutputParser` on the end does) would keep
+    Claude generating, and billing, to MAX_TOKENS. Closed after one piece, the
+    answer's HTTP response must be closed then, with the rest never read.
     """
-    fake_mlx.pieces = [f"word{i} " for i in range(20)]
+    fake_claude.pieces = [f"word{i} " for i in range(200)]
     pipeline = _ingested_pipeline(
-        settings,
-        fake_embeddings,
-        MLXChatModel(model_id=model_dir, max_tokens=50),
-        fake_reranker,
+        settings, fake_embeddings, fake_claude.chat(max_tokens=500), fake_reranker
     )
 
     _docs, chunks = pipeline.stream_answer("Why do chunks overlap?")
     assert next(chunks) == "word0 "
     chunks.close()
 
-    assert fake_mlx.pieces_generated == 1, "the model ran on after the close"
-    assert fake_mlx.lock_held_at_close == [True]
-    assert not mlx_models._GENERATION_LOCK.locked()
+    (body,) = fake_claude.bodies
+    assert body.closed, "the model's request was left open after the close"
+    assert body.pieces_sent < len(fake_claude.pieces) / 2
 
 
 def test_an_answer_cut_off_at_max_tokens_says_so(
-    settings, fake_embeddings, fake_reranker, fake_mlx, model_dir
+    settings, fake_embeddings, fake_reranker, fake_claude
 ):
     """A truncated answer must not read as a finished one.
 
     The model reports why it stopped only in metadata that the text alone does
     not carry, so without this an answer cut off mid-sentence reaches both
     frontends looking complete. Said in the answer itself because that is the
-    one channel both of them show.
+    one channel both of them show. Through the real chat model, whose
+    `max_tokens` stop reason is what the note keys off.
     """
-    fake_mlx.pieces = ["Chunks overlap ", "so that"]
-    fake_mlx.finish_reason = "length"
+    fake_claude.pieces = ["Chunks overlap ", "so that"]
+    fake_claude.stop_reason = "max_tokens"
     pipeline = _ingested_pipeline(
-        settings,
-        fake_embeddings,
-        MLXChatModel(model_id=model_dir, max_tokens=50),
-        fake_reranker,
+        settings, fake_embeddings, fake_claude.chat(), fake_reranker
     )
 
     text = pipeline.answer("Why do chunks overlap?").text
@@ -531,54 +521,42 @@ def test_an_answer_cut_off_at_max_tokens_says_so(
     assert text.startswith("Chunks overlap so that")
     assert f"MAX_TOKENS={settings.max_tokens}" in text
 
-    fake_mlx.finish_reason = "stop"
+    fake_claude.stop_reason = "end_turn"
     assert pipeline.answer("Why do chunks overlap?").text == "Chunks overlap so that"
+
+
+def test_a_refused_question_is_an_error_not_an_empty_answer(
+    settings, fake_embeddings, fake_reranker, fake_claude
+):
+    """A refusal arrives as a stop reason on an empty answer; read as text, it
+    would be the "empty answer" error at best -- a frontend must be told why."""
+    fake_claude.pieces, fake_claude.stop_reason = [], "refusal"
+    pipeline = _ingested_pipeline(
+        settings, fake_embeddings, fake_claude.chat(), fake_reranker
+    )
+
+    with pytest.raises(RuntimeError, match="declined to answer"):
+        pipeline.answer("Why do chunks overlap?")
 
 
 # --- the model factories -----------------------------------------------------
 
 
-def _stub_weights(monkeypatch, model: Any, tokenizer: Any) -> list[str]:
-    """Replace the one weight loader with a stub; return the ids it is asked for.
+def test_build_chat_model_builds_claude_from_settings(settings, monkeypatch):
+    """Production builds the Claude adapter from settings, with no sampling
+    parameters -- Claude Sonnet 5.5 rejects them -- and the configured cap.
 
-    The factories are tested for real, down to the adapter they construct, with
-    only the load taken out -- the real one is gigabytes, and conftest makes it
-    unreachable anyway.
+    Distinctive settings, so a factory that ignored them in favour of the
+    defaults (or a literal) fails. The request it sends is the adapter's,
+    tested in test_claude_model.py.
     """
-    requested: list[str] = []
-
-    def load(model_id: str) -> tuple[Any, Any]:
-        requested.append(model_id)
-        return model, tokenizer
-
-    monkeypatch.setattr(mlx_models, "load_mlx_model", load)
-    return requested
-
-
-def test_build_chat_model_sets_no_sampling_params(settings, monkeypatch):
-    """Production builds the local chat model from settings, decoding greedily.
-
-    Greedy on purpose: grounding comes from the retrieved context, and the same
-    question over the same context should get the same answer to be checkable
-    against it. Greedy is the *absence* of sampling parameters, and the model
-    drops unknown keywords silently, so a field is the only place one could
-    live -- which is why the check reads the constructed model's fields rather
-    than the factory's call. Distinctive settings, so a factory that ignored
-    them in favour of the defaults (or a literal) fails; MAX_TOKENS matters
-    because mlx-lm's own default of 256 would cut a cited answer short.
-    """
-    requested = _stub_weights(monkeypatch, object(), object())
-    configured = dataclasses.replace(
-        settings, chat_model="some-org/some-chat-model", max_tokens=321
-    )
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    configured = dataclasses.replace(settings, chat_model="claude-test", max_tokens=321)
 
     model = build_chat_model(configured)
 
-    # Narrowed before the reads, so they are type-checked -- and because
-    # "production builds the local MLX model" is half of what this is for.
-    assert isinstance(model, MLXChatModel)
-    assert (model.model_id, model.max_tokens) == ("some-org/some-chat-model", 321)
-    assert requested == ["some-org/some-chat-model"]
+    assert isinstance(model, ClaudeChatModel)
+    assert (model.model, model.max_tokens) == ("claude-test", 321)
     sampling = {"temperature", "top_p", "top_k", "min_p", "sampler"}
     assert not sampling & set(type(model).model_fields)
 
@@ -722,7 +700,7 @@ def test_model_errors_pass_through_unchanged(
     """The adapters translate their own failures; the pipeline must not again.
 
     A model failure already arrives as a RuntimeError naming the model --
-    `mlx_models` translates where the model runs -- so neither retrieve()'s
+    `claude_model` translates where the model runs -- so neither retrieve()'s
     store translation nor `_generate()` may re-wrap it: relabelled "Vector store
     request failed", it would send a reader to the wrong component. A
     BaseException must pass untouched as well: it is how Streamlit stops a
@@ -902,28 +880,13 @@ def _fail_pipeline_fetch_k_above_the_cap(
     RAGPipeline(dataclasses.replace(settings, fetch_k=1001))
 
 
-def _fail_pipeline_without_mlx(
+def _fail_pipeline_without_anthropic_key(
     settings, fake_embeddings, fake_reranker, monkeypatch, tmp_path
 ):
-    # conftest's MLX block is exactly what a machine without MLX looks like.
+    # No chat model injected: the factory needs the key first, and conftest has
+    # removed the developer's.
     ingest_mod.ingest(settings, embeddings=fake_embeddings)
     RAGPipeline(settings, embeddings=fake_embeddings, reranker=fake_reranker)
-
-
-def _fail_pipeline_model_not_cached(
-    settings, fake_embeddings, fake_reranker, monkeypatch, tmp_path
-):
-    # MLX present -- a stand-in, since the loader only needs the import to
-    # succeed before it looks in the cache -- but the chat model never
-    # downloaded, against an empty cache so the developer's own is not read.
-    monkeypatch.setitem(sys.modules, "mlx_lm", types.ModuleType("mlx_lm"))
-    monkeypatch.setattr(hf_constants, "HF_HUB_CACHE", str(tmp_path / "empty-hub"))
-    ingest_mod.ingest(settings, embeddings=fake_embeddings)
-    RAGPipeline(
-        dataclasses.replace(settings, chat_model="some-org/never-downloaded"),
-        embeddings=fake_embeddings,
-        reranker=fake_reranker,
-    )
 
 
 def _fail_ingest_without_voyage_key(
@@ -1151,16 +1114,10 @@ def _fail_stream_answer_on_empty_response(
             id="pipeline-fetch-k-above-the-cap",
         ),
         pytest.param(
-            _fail_pipeline_without_mlx,
+            _fail_pipeline_without_anthropic_key,
             RuntimeError,
-            "Apple Silicon",
-            id="pipeline-without-mlx",
-        ),
-        pytest.param(
-            _fail_pipeline_model_not_cached,
-            FileNotFoundError,
-            "hf download some-org/never-downloaded",
-            id="pipeline-model-not-cached",
+            "ANTHROPIC_API_KEY is not set",
+            id="pipeline-without-anthropic-key",
         ),
         pytest.param(
             _fail_ingest_without_voyage_key,
@@ -1239,7 +1196,7 @@ def test_failure_modes_stay_inside_the_frontend_exception_union(
 
     Individual tests above already cover most of these one at a time; this one
     exists to make the *union* the thing under test, so adding a fourth type
-    (or letting a pymongo or huggingface_hub exception escape untranslated,
+    (or letting a pymongo, voyageai or anthropic exception escape untranslated,
     which would drag that library into both frontends) fails here rather than
     at a user's terminal. `expected_type` is checked exactly, so a path can't
     drift to a different member of the union unnoticed -- and nothing on the

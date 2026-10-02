@@ -10,7 +10,7 @@ the root `CLAUDE.md`: production passes no models and tests inject fakes, what
 | --- | ---- |
 | the store | `settings` — which takes `atlas`: the session's atlas-local container as `MONGODB_URI`, and a database of the test's own, dropped after it. A test that needs a second collection uses another `COLLECTION_NAME` in that database, never another database |
 | a frontend (`streamlit_app.py` or `cli.py`) over fakes | `wired_env` — every `ENV_VARS` name from `settings`, and fakes behind the three model factories. Derived from `ENV_VARS` because a hand-kept list would let the developer's `.env` answer a missed name |
-| the real adapters, down to the generation lock, with no MLX | `fake_mlx` over a `model_dir` — the shared fake stack in `fake_mlx.py`, installed for one test after `_no_real_models`, with the model memo swapped so no fake model outlives it |
+| the real chat model, down to whether its HTTP response was closed | `fake_claude` — a real Anthropic SDK client over `httpx2.MockTransport` (`fake_claude.py`): set `pieces`, `stop_reason`, `on_piece` or `respond`, take `.chat()`, read `requests`/`bodies` afterwards |
 | asserting on spans | `spans` — production's provider, a synchronous processor into memory, LangChain instrumented; all undone after |
 | running `setup_tracing` for real | `undo_tracing` |
 | what only a fresh process shows (a library reading a variable as it is first imported) | `fresh_interpreter` |
@@ -18,22 +18,21 @@ the root `CLAUDE.md`: production passes no models and tests inject fakes, what
 
 ## The autouse guards
 
-- `_no_real_models` puts `None` in `sys.modules` for `mlx` and `mlx_lm`, so
-  `import mlx_lm` raises and `load_mlx_model()` reports a RuntimeError before it
-  looks in the cache. **This is the one that catches a forgotten injection.** A
-  test that forgets `embeddings=` names no banned symbol, and with the models
-  cached it opens no socket either — a network block alone would let it load
-  gigabytes of weights. It behaves identically on a Mac with MLX installed and on
-  the Linux CI legs without it. Tests marked `models` are exempt; `hide_mlx`
-  exposes that decision.
+- `_no_real_store` removes `MONGODB_URI` and the API keys for every test:
+  config.py loads the developer's `.env`, which holds a real cluster's URI and
+  real keys. **This is the one that catches a forgotten injection**: a test that
+  forgets `embeddings=` names no banned symbol, but the factory it reaches stops
+  at the missing key, before it builds a client. Only `atlas` sets
+  `MONGODB_URI`, to the container. Tests marked `live` keep the API keys (never
+  the URI); `is_live()` is that decision, shared with `_offline`. Without
+  Docker, `atlas_uri` fails every store test with a message saying to start it
+  — failed, not skipped; a start that fails while Docker Desktop's VM wakes is
+  retried.
 - `_offline` blocks every socket to a host other than this machine: the store is
-  the atlas-local container on loopback and the models are local files, so any
-  other connection means something is downloading (a model), phoning home, or
-  reaching a real cluster. Unix sockets — Docker's API — stay open.
-- `_no_real_store` removes `MONGODB_URI` (and the API keys) for every test:
-  config.py loads the developer's `.env`, which holds a real cluster's URI.
-  Only `atlas` sets it, to the container. Without Docker, `atlas_uri` fails
-  every store test with a message saying to start it — failed, not skipped.
+  the atlas-local container on loopback and every model is a fake, so any other
+  connection means something is calling a model API, phoning home, or reaching
+  a real cluster. Unix sockets — Docker's API — stay open. `live` tests are
+  exempt.
 - `_no_tracing` (session-scoped) deletes `PHOENIX_COLLECTOR_ENDPOINT` and forces
   LangSmith's switches to `false` (the pipeline no longer uses LangSmith, but
   langsmith ships inside langchain-core and still acts on them). `.env` is loaded
@@ -55,7 +54,7 @@ the root `CLAUDE.md`: production passes no models and tests inject fakes, what
 
 `test_offline_guard.py` trips every route to a real model on purpose — each
 factory, an ingest and a pipeline left without a fake — and checks the socket
-block, the tracing guards and the `models` exemption, so a guard that loosens
+block, the tracing guards and the `live` exemption, so a guard that loosens
 reads as a failure rather than as green.
 
 ## The invariant sweep (`invariants.py`, `test_invariants.py`)

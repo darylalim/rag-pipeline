@@ -1,13 +1,11 @@
 """conftest's guards are the offline guarantee -- assert they actually hold.
 
-A test that forgets to inject a fake must *fail*, not quietly run a real model.
-Two kinds of model, two guards. The chat model is local: weights already in the
-Hugging Face cache load without opening a socket, so a network block alone
-would never notice, and ``_no_real_models`` makes MLX unimportable. The
-embedder and the reranker are Voyage AI's API: ``_no_real_store`` removes
-``VOYAGE_API_KEY``, so their factories stop before any request, and
-``_offline`` blocks the socket besides. Any of these silently loosening reads as
-green everywhere else, so each route to a real model is tripped here on purpose
+A test that forgets to inject a fake must *fail*, not quietly call a real model.
+Every model is an API -- the embedder and the reranker Voyage AI's, the chat
+model Anthropic's -- so two guards cover them all: ``_no_real_store`` removes
+the API keys, so each factory stops before it builds a client, and ``_offline``
+blocks the socket besides. Either silently loosening reads as green everywhere
+else, so each route to a real model is tripped here on purpose
 -- every factory, and both entry points that build one when a fake is left out
 -- and the socket block is checked on its own. So is the tracing guard: an
 exporter is the one route out the socket block cannot stop, since the tracing
@@ -18,10 +16,8 @@ it, not every test after.
 from __future__ import annotations
 
 import dataclasses
-import importlib
 import os
 import socket
-import sys
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -34,42 +30,33 @@ from rag_pipeline import pipeline as pipeline_mod
 from rag_pipeline.config import Settings
 from rag_pipeline.pipeline import RAGPipeline
 from rag_pipeline.tracing import setup_tracing
+from tests.conftest import _LIVE_CREDENTIALS, is_live
 
-
-def _assert_stopped_by_the_mlx_guard(
-    excinfo: pytest.ExceptionInfo[RuntimeError], model_id: str
-) -> None:
-    # Exact type: the loader's RuntimeError, not a FileNotFoundError from a
-    # cache lookup it should never have reached. And the model id, so the
-    # message says which fake was forgotten.
-    assert excinfo.type is RuntimeError
-    assert "MLX" in str(excinfo.value)
-    assert model_id in str(excinfo.value)
-
-
-def _assert_stopped_by_the_key_guard(
-    excinfo: pytest.ExceptionInfo[RuntimeError], _model_id: str
-) -> None:
-    # The factory refuses before building a client, so no request was made.
-    assert excinfo.type is RuntimeError
-    assert str(excinfo.value).startswith("VOYAGE_API_KEY is not set")
-
-
-_GUARD_OF = {
-    "embedding_model": _assert_stopped_by_the_key_guard,
-    "rerank_model": _assert_stopped_by_the_key_guard,
-    "chat_model": _assert_stopped_by_the_mlx_guard,
+# The key each factory needs, and so the one its refusal must name.
+_KEY_OF = {
+    "embedding_model": "VOYAGE_API_KEY",
+    "rerank_model": "VOYAGE_API_KEY",
+    "chat_model": "ANTHROPIC_API_KEY",
 }
 
 
-# --- the model guard ---------------------------------------------------------
+def _assert_stopped_by_the_key_guard(
+    excinfo: pytest.ExceptionInfo[RuntimeError], setting: str
+) -> None:
+    # Exact type, and the right key: the factory refused before building a
+    # client, so no request was made -- and the message says which fake was
+    # forgotten.
+    assert excinfo.type is RuntimeError
+    assert str(excinfo.value).startswith(f"{_KEY_OF[setting]} is not set")
 
 
-@pytest.mark.parametrize("module", ["mlx_lm", "mlx.core"])
-def test_mlx_cannot_be_imported(module):
-    """What every other check here rests on: MLX is absent, as on the Linux legs."""
-    with pytest.raises(ImportError):
-        importlib.import_module(module)
+# --- the key guard -----------------------------------------------------------
+
+
+def test_no_api_key_reaches_a_test():
+    """What every other check here rests on: config.py loaded the developer's
+    .env at import, and `_no_real_store` has taken the keys back out."""
+    assert not {"VOYAGE_API_KEY", "ANTHROPIC_API_KEY"} & set(os.environ)
 
 
 @pytest.mark.parametrize(
@@ -83,24 +70,18 @@ def test_mlx_cannot_be_imported(module):
 def test_every_model_factory_is_stopped_by_the_guard(
     settings, module: ModuleType, factory: str, setting: str
 ):
-    """Each factory is stopped by its guard: Voyage's by the missing key, the
-    chat model's at the MLX import.
-
-    Run against the real default model ids, which may well be fully cached on
-    the machine running this: the MLX guard has to fire before the cache is
-    looked at, or it protects only the machines that never downloaded anything.
-    """
+    """Each factory stops at its missing key, before any client exists."""
     with pytest.raises(RuntimeError) as excinfo:
         getattr(module, factory)(settings)
 
-    _GUARD_OF[setting](excinfo, getattr(settings, setting))
+    _assert_stopped_by_the_key_guard(excinfo, setting)
 
 
 def test_an_ingest_without_injected_embeddings_is_stopped(settings):
     with pytest.raises(RuntimeError) as excinfo:
         ingest_mod.ingest(settings)
 
-    _assert_stopped_by_the_key_guard(excinfo, settings.embedding_model)
+    _assert_stopped_by_the_key_guard(excinfo, "embedding_model")
 
 
 @pytest.mark.parametrize(
@@ -131,30 +112,28 @@ def test_a_pipeline_missing_any_one_fake_is_stopped(
     with pytest.raises(RuntimeError) as excinfo:
         RAGPipeline(settings, **fakes)
 
-    _GUARD_OF[setting](excinfo, getattr(settings, setting))
+    _assert_stopped_by_the_key_guard(excinfo, setting)
 
 
-@pytest.mark.parametrize(("marked", "hidden"), [(False, True), (True, False)])
-def test_only_a_models_marked_test_may_import_mlx(request, hide_mlx, marked, hidden):
-    """The exemption is exactly the ``models`` marker, in both directions.
+@pytest.mark.parametrize("marked", [False, True])
+def test_only_a_live_marked_test_is_exempt(request, marked):
+    """The exemption is exactly the ``live`` marker, in both directions.
 
-    The live tests load the real checkpoints and would all fail under the guard;
-    every other test must stay under it. Checked through the guard's own logic on
-    this test's node, because a test that is really marked is deselected here.
+    The live tests call the real APIs and would all fail under the guards;
+    every other test must stay under them. Checked through the guards' own
+    decision on this test's node, because a test that is really marked is
+    deselected here.
     """
-    names = ("mlx", "mlx_lm")
     if marked:
-        request.node.add_marker(pytest.mark.models)
-    with pytest.MonkeyPatch.context() as mp:
-        # Start from a clean slate: the autouse guard has already run for this
-        # (unmarked, at the time) test and left None entries behind.
-        for name in names:
-            mp.delitem(sys.modules, name, raising=False)
+        request.node.add_marker(pytest.mark.live)
 
-        hide_mlx(request.node, mp)
+    assert is_live(request.node) is marked
 
-        blocked = [name in sys.modules and sys.modules[name] is None for name in names]
-    assert blocked == [hidden] * len(names)
+
+def test_no_test_keeps_the_developers_cluster():
+    """Even the exemption keeps only the API keys: a live test still writes to
+    the test container, never to the cluster in the developer's .env."""
+    assert "MONGODB_URI" not in _LIVE_CREDENTIALS
 
 
 # --- the socket block --------------------------------------------------------
@@ -163,19 +142,20 @@ def test_only_a_models_marked_test_may_import_mlx(request, hide_mlx, marked, hid
 @pytest.mark.parametrize(
     "address",
     [
-        pytest.param(("huggingface.co", 443), id="model-download"),
+        pytest.param(("api.anthropic.com", 443), id="the-anthropic-api"),
+        pytest.param(("api.voyageai.com", 443), id="the-voyage-api"),
         pytest.param(("cluster0.example.mongodb.net", 27017), id="an-atlas-cluster"),
         pytest.param(("10.0.0.1", 27017), id="the-local-network"),
     ],
 )
 def test_create_connection_is_blocked(address):
-    """The route every HTTP client takes, a Hugging Face download included.
+    """The route every HTTP client takes, the model APIs' included.
 
     Refused before the name is resolved, so not even a DNS lookup leaves. It
     raises RuntimeError rather than OSError on purpose -- httpcore turns an
-    OSError into a ConnectError, which huggingface_hub catches and answers by
-    falling back to the local cache, so an OSError would turn a blocked
-    download into a silent load of whatever is cached.
+    OSError into a ConnectError, which the SDKs retry with backoff and then
+    report as an ordinary outage, so a blocked call would read as a slow,
+    flaky network rather than as a test that reached for one.
     """
     with pytest.raises(RuntimeError, match="network socket"):
         socket.create_connection(address, timeout=1)

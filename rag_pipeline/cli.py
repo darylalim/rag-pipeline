@@ -73,7 +73,7 @@ def cmd_eval(settings: Settings, save_baseline: bool) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="rag",
-        description="A RAG pipeline built with LangChain, MongoDB Atlas, and MLX models.",
+        description="A RAG pipeline built with LangChain, MongoDB Atlas, Voyage AI and Claude.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 

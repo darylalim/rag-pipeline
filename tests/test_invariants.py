@@ -5,9 +5,9 @@ PR from a fork, are covered by these tests and nothing else.
 
 The rules that live in `invariants.py` are only the ones about how source is
 *written*. Their behavioral counterparts are asserted where the behavior is:
-`test_cli.py` proves cli.py's imports stay cheap, `test_mlx_models.py` proves
-generation decodes greedily, and `test_ingest.py` proves ingest leaves a shared
-collection's foreign documents alone.
+`test_cli.py` proves cli.py's imports stay cheap, `test_claude_model.py` proves
+the chat model's request carries no sampler, and `test_ingest.py` proves ingest
+leaves a shared collection's foreign documents alone.
 """
 
 from __future__ import annotations

@@ -34,6 +34,7 @@ from opentelemetry.trace import Span, Status, StatusCode
 from opentelemetry.util.types import AttributeValue
 from pydantic import SecretStr
 
+from rag_pipeline.claude_model import ClaudeChatModel
 from rag_pipeline.config import Settings, require_env_key
 from rag_pipeline.ingest import (
     OWN_CHUNKS,
@@ -42,7 +43,6 @@ from rag_pipeline.ingest import (
     require_index,
     voyage_clients,
 )
-from rag_pipeline.mlx_models import MLXChatModel
 
 # Grounding prompt: the model must answer from the retrieved context only, and
 # admit when the context does not contain the answer. This is what turns a
@@ -244,17 +244,14 @@ def _traced(
 
 
 def build_chat_model(settings: Settings) -> BaseChatModel:
-    """Construct the local chat model used for generation.
+    """Construct the chat model used for generation: Claude, over its API.
 
-    No temperature/top_p/top_k: the model decodes greedily, so the same question
-    over the same retrieved context gets the same answer — grounding comes from
-    the context, and an answer that changes from one run to the next is harder to
-    check against it. ``max_tokens`` is passed through because mlx-lm's own
-    default (256) would cut a cited answer short. Cheap to call again: the
-    weights load once per process, so the app's rebuild after every ingest wraps
-    the model it already holds rather than loading a second copy.
+    The request it sends -- thinking at its lowest, a fixed effort, no sampling
+    parameters -- is the adapter's, in claude_model.py. ``max_tokens`` is passed
+    through as the answer's cap. Cheap to call again: it builds a client and
+    loads nothing.
     """
-    return MLXChatModel(model_id=settings.chat_model, max_tokens=settings.max_tokens)
+    return ClaudeChatModel(model=settings.chat_model, max_tokens=settings.max_tokens)
 
 
 class _VoyageRerank(VoyageAIRerank):
