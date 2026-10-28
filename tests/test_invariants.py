@@ -242,6 +242,7 @@ GIT_IGNORES = {
     "data/notes/report.md": True,
     ".coverage.macbook_local.pid12345.XkqzyOax": True,
     ".claude/worktrees/wf-1/streamlit_app.py": True,
+    ".claude/settings.json": False,
     ".env.example": False,
     ".streamlit/config.toml": False,
     "data/langchain_overview.md": False,

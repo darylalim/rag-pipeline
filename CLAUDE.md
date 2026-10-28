@@ -637,7 +637,8 @@ behavior is:
 | no test calls a real model | conftest's `_no_real_store` (the API keys) and `_offline`, pinned by `tests/test_offline_guard.py` |
 | a question is one trace, ended however the question ends (answered, failed, stopped, closed unread), and nothing when off | `tests/test_tracing.py`, plus `test_a_stop_during_retrieval_still_ends_the_questions_trace` in `test_streamlit_app.py` |
 | no test leaves a tracing context set | conftest's `_no_tracer_left_on`, after every test |
-| secrets (`.env`, `.env.*`, `.streamlit/secrets.toml`), the user's documents in `data/`, coverage's parallel data files and Claude Code worktrees stay out of git; `.env.example` and the three samples stay addable | `test_gitignore_keeps_secrets_and_your_documents_out_of_git` — the repo's `.gitignore` in a scratch repository made with no template, global excludes off |
+| secrets (`.env`, `.env.*`, `.streamlit/secrets.toml`), the user's documents in `data/`, coverage's parallel data files and Claude Code worktrees stay out of git; `.env.example`, `.claude/settings.json` and the three samples stay addable | `test_gitignore_keeps_secrets_and_your_documents_out_of_git` — the repo's `.gitignore` in a scratch repository made with no template, global excludes off |
+| secrets aren't read in Claude Code sessions (each file named, so `.env.example` stays readable; Bash's `cat` is not covered) | `.claude/settings.json`'s `Read` deny rules |
 | Anthropic's and Voyage's real APIs behave as the fakes assume | `tests/test_live.py` (`-m live`, by hand, with both keys) |
 
 The cheap-imports, no-sampler and foreign-document rows each replaced a

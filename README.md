@@ -500,3 +500,7 @@ above (`test_every_rule_is_documented`).
 
 Everything else is tested through behavior, which catches cases a text rule
 would miss. See *Enforcing the invariants* in `CLAUDE.md`.
+
+## License
+
+MIT. See [`LICENSE`](LICENSE).
