@@ -29,12 +29,13 @@ When working with Python, invoke the relevant `/astral:<skill>` — `/astral:uv`
 
 `.python-version` pins local work to 3.13. It does *not* weaken the test matrix:
 `setup-uv`'s `python-version:` input sets `UV_PYTHON`, which takes precedence
-over the file, so the 3.11 CI leg really does run on 3.11.
+over the file, so the 3.11 and 3.15 CI legs really do run on 3.11 and 3.15.
 
-To reproduce that leg locally, send it to a *separate* environment:
+To reproduce either leg locally, send it to a *separate* environment:
 
 ```bash
 UV_PROJECT_ENVIRONMENT=.venv311 uv run -p 3.11 pytest
+UV_PROJECT_ENVIRONMENT=.venv315 uv run -p 3.15 pytest
 ```
 
 Plain `uv run -p 3.11` would recreate `.venv` itself at 3.11, and the next

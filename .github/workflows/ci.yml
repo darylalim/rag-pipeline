@@ -56,8 +56,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # requires-python's floor, and the version .python-version pins.
-        python-version: ["3.11", "3.13"]
+        # requires-python's floor, the version .python-version pins, and the
+        # newest CPython. On 3.15, pyyaml and zstandard have no wheels yet and
+        # build from source, with the runner's C compiler.
+        python-version: ["3.11", "3.13", "3.15"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
