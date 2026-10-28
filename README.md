@@ -393,7 +393,9 @@ the live tests cover.
 | `release` | `release` | On a push to `main`, after both pass: a GitHub release for a new version |
 
 Jobs install with `uv sync --locked`, which fails if `uv.lock` is out of date
-with `pyproject.toml`. They run on Linux with no secrets. Nothing gates `main`;
+with `pyproject.toml`. They run on Linux with no secrets. Each action is pinned
+to a commit SHA, and Dependabot proposes updates to them monthly
+(`.github/dependabot.yml`). Nothing gates `main`;
 to require checks before merging, add a repository ruleset for the `lint` and
 `test` check names above.
 

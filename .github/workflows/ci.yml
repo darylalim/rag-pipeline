@@ -7,8 +7,11 @@ on:
   pull_request:
 
 # Read-only whatever the repo's default token permissions: every job runs
-# third-party code with checkout's token left in .git/config. A job that has to
-# write raises its own permissions.
+# third-party code with checkout's token on disk (a file under $RUNNER_TEMP that
+# .git/config includes). A job that has to write raises its own permissions.
+#
+# Every action is pinned to a commit SHA, its exact version beside it: a tag can
+# be moved, and the release job's token can write. Dependabot proposes updates.
 permissions:
   contents: read
 
@@ -20,10 +23,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa  # v10.3.1
 
       # --locked, not --frozen: a uv.lock that has drifted from pyproject.toml
       # fails here, where --frozen would install it as-is and CI would pass.
@@ -56,10 +59,10 @@ jobs:
         # requires-python's floor, and the version .python-version pins.
         python-version: ["3.11", "3.13"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa  # v10.3.1
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -86,13 +89,13 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0  # the tags and history the notes are built from
           persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@18d369b23da25a81e9458561248e1aafff6a70fa  # v10.3.1
         with:
           # Nothing here fills uv's cache, and setup-uv fails a job that caches
           # with nothing to save.

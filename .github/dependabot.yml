@@ -1,0 +1,17 @@
+version: 2
+updates:
+  # Actions only. Python dependencies are upgraded by hand, behind the live
+  # tests CI never runs: a green PR that moved anthropic or voyageai would have
+  # been checked only against fakes that stayed put.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    # A new release waits a week before it is proposed: a compromised tag is
+    # usually caught within days, and ci.yml pins by SHA for exactly that
+    # reason.
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]
