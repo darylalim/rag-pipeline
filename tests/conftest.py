@@ -160,7 +160,9 @@ def _await_search_ready(uri: str, timeout_s: float = 180.0) -> None:
     mongod answers first and mongot warms up seconds later; until then creating
     a search index fails ("Error connecting to Search Index Management
     service"). Building and querying a throwaway index is the readiness check:
-    the image logs no documented marker for it.
+    the image logs no documented marker for it. Listing the index can fail the
+    same way after creating it has succeeded, so both steps retry: an error
+    escaping this session fixture errors every store test at setup.
     """
     import time
 
@@ -192,7 +194,14 @@ def _await_search_ready(uri: str, timeout_s: float = 180.0) -> None:
                 if time.monotonic() > deadline:
                     raise
                 time.sleep(1)
-        while not any(ix.get("queryable") for ix in probe.list_search_indexes("probe")):
+        while True:
+            try:
+                indexes = list(probe.list_search_indexes("probe"))
+                if any(ix.get("queryable") for ix in indexes):
+                    break
+            except Exception:
+                if time.monotonic() > deadline:
+                    raise
             if time.monotonic() > deadline:
                 raise RuntimeError("atlas-local never built its readiness index")
             time.sleep(1)

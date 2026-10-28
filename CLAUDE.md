@@ -580,6 +580,11 @@ because they are only observable at the frontend:
   document directly and then asserts a search does *not* return it must first
   see an unscoped search return it, or it passes only because the index has not
   caught up (`test_retrieve_never_returns_a_foreign_document` does).
+- On a GitHub-hosted runner that wait occasionally runs out: one store test
+  fails with "Vector index 'vector_index' did not become queryable within
+  180s", a different test each time, and the rest pass. Re-run the failed job
+  once. A second failure, or one locally, is real. Don't raise
+  `_INDEX_POLL_TIMEOUT_S` to quiet it: it is production's bound as well.
 - MongoDB refuses `$expr` in an upsert's query (code 224): a conditional upsert
   decides inside its update pipeline instead, as `_WriterLock.try_acquire` does.
   And atlas-local's `update_search_index` treats a definition as a full-text one
