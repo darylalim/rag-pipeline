@@ -65,8 +65,10 @@ _FALLBACK_BETA = "server-side-fallback-2026-07-01"
 # The SDK retries rate limits, overloads and connection errors with backoff;
 # two (its default) is thin for a question a user is waiting on.
 _MAX_RETRIES = 4
-
-_ROLES = ((HumanMessage, "user"), (AIMessage, "assistant"))
+# The SDK makes OpenTelemetry spans whenever a global tracer provider is
+# registered. Tracing here is LangSmith's, switched on per question
+# (pipeline._tracing), never picked up from whatever the process has registered.
+_OPEN_TELEMETRY = False
 
 
 def _split(messages: list[BaseMessage]) -> tuple[str, list[BetaMessageParam]]:
@@ -74,15 +76,19 @@ def _split(messages: list[BaseMessage]) -> tuple[str, list[BetaMessageParam]]:
     system: list[str] = []
     turns: list[BetaMessageParam] = []
     for message in messages:
-        if isinstance(message, SystemMessage):
-            system.append(str(message.text))
-            continue
-        for cls, role in _ROLES:
-            if isinstance(message, cls):
-                turns.append({"role": role, "content": str(message.text)})
-                break
-        else:
-            raise ValueError(f"The chat model cannot take a {message.type!r} message.")
+        # Each role spelled as its literal: a turn is one of several TypedDicts,
+        # told apart by `role`, so a role held in a variable matches none.
+        match message:
+            case SystemMessage():
+                system.append(str(message.text))
+            case HumanMessage():
+                turns.append({"role": "user", "content": str(message.text)})
+            case AIMessage():
+                turns.append({"role": "assistant", "content": str(message.text)})
+            case _:
+                raise ValueError(
+                    f"The chat model cannot take a {message.type!r} message."
+                )
     return "\n\n".join(system), turns
 
 
@@ -103,7 +109,9 @@ class ClaudeChatModel(BaseChatModel):
             raise RuntimeError(f"MAX_TOKENS must be at least 1, not {self.max_tokens}.")
         if self.client is None:
             key = require_env_key("ANTHROPIC_API_KEY", "Answers come from Claude")
-            self.client = anthropic.Anthropic(api_key=key, max_retries=_MAX_RETRIES)
+            self.client = anthropic.Anthropic(
+                api_key=key, max_retries=_MAX_RETRIES, open_telemetry=_OPEN_TELEMETRY
+            )
         return self
 
     @property

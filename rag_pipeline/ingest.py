@@ -16,7 +16,7 @@ import time
 import unicodedata
 import uuid
 from collections import Counter, defaultdict
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager, suppress
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, cast, get_args
@@ -229,7 +229,7 @@ def open_store(
 
 
 @contextmanager
-def provider_errors_as_runtime() -> Iterator[None]:
+def provider_errors_as_runtime() -> Generator[None, None, None]:
     """Translate MongoDB and Voyage AI failures into the RuntimeError the frontends catch.
 
     Wraps every call to either service on both sides: connecting, ingest's
@@ -800,7 +800,7 @@ class _WriterLock:
 
 
 @contextmanager
-def _writer_lock(settings: Settings) -> Iterator[_WriterLock]:
+def _writer_lock(settings: Settings) -> Generator[_WriterLock, None, None]:
     """Hold the collection's ingest lock for the body, failing inside the union."""
     lock = _WriterLock(settings)
     with provider_errors_as_runtime():

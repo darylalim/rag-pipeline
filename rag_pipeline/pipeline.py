@@ -7,7 +7,7 @@ build a single pipeline and reuse it across queries.
 
 from __future__ import annotations
 
-from collections.abc import Generator, Iterator, Sequence
+from collections.abc import Generator, Sequence
 from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from typing import Any, TypedDict, cast
@@ -127,7 +127,7 @@ _SCORE_KEY = "relevance_score"
 
 
 @contextmanager
-def _tracing(root: RunTree | None) -> Iterator[None]:
+def _tracing(root: RunTree | None) -> Generator[None, None, None]:
     """Trace what runs inside under ``root`` -- or, with no root, nothing.
 
     Explicit both ways. On, ``root`` is the parent every run inside nests

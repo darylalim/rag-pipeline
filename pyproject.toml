@@ -7,33 +7,33 @@ license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = [
-    "langchain-core>=1.2.5",
+    "langchain-core>=1.7.1",
     "langchain-text-splitters>=1.0",
-    "streamlit>=1.59",
+    "streamlit>=1.66.1",
     # 1.2.0 is the first to honour PYTHON_DOTENV_DISABLED, which the tests that
     # start a fresh interpreter set so a developer's .env stays out of the child.
     "python-dotenv>=1.2.0",
-    "pypdf>=5.0",
+    "pypdf>=6.21.4",
     # The chat-model adapter is a pydantic model, as its langchain base class
     # is, and claude_model.py imports model_validator (and ingest.py SecretStr)
     # itself, so pydantic is declared directly rather than left to
     # langchain-core.
-    "pydantic>=2.10",
+    "pydantic>=2.14.1",
     # LangSmith: optional tracing, one trace per question (tracing.py builds
     # the client, pipeline.py the runs), and `rag eval`, whose question set is
     # a LangSmith dataset and each run an experiment. Imported directly, so
     # declared, though it also arrives through langchain-core.
-    "langsmith>=0.14.4",
+    "langsmith>=0.14.14",
     # Claude, through its own SDK: the chat model (claude_model.py, an adapter
     # of our own because langchain-anthropic does not close a stream its
     # consumer abandons) and the eval's judge.
-    "anthropic>=1.11.0",
+    "anthropic>=2.3.0",
     # The vector store: MongoDB Atlas, with Atlas Vector Search. pymongo is
     # declared directly because ingest.py imports it -- the client, search
     # index management, the writer lock, and pymongo.errors for the
     # RuntimeError translation -- not only through langchain-mongodb.
     "langchain-mongodb>=0.12.1",
-    "pymongo>=4.18.2",
+    "pymongo>=4.19.0",
     # Voyage AI's embedder and reranker, behind LangChain's interfaces
     # (ingest.build_embeddings, pipeline.build_reranker); voyageai itself is
     # imported for its clients and errors, so it is declared too.
@@ -58,14 +58,14 @@ packages = ["rag_pipeline"]
 
 [dependency-groups]
 dev = [
-    "pytest>=9.1.1",
+    "pytest>=9.2.0",
     "pytest-cov>=7.0",
     "pytest-rerunfailures>=16.7",
-    "ruff>=0.16.10",
+    "ruff>=0.17.3",
     # The store tests run against MongoDB's atlas-local image in Docker, one
     # container per session (conftest's `atlas_uri`).
     "testcontainers>=4.15.0",
-    "ty>=0.0.84",
+    "ty>=0.0.94",
 ]
 
 [tool.pytest.ini_options]

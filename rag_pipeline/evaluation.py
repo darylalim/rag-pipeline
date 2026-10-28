@@ -637,7 +637,11 @@ def run(settings: Settings, *, save_baseline: bool = False) -> list[str]:
         "ANTHROPIC_API_KEY", "`rag eval` grades answers with Claude"
     )
 
-    judge = ClaudeJudge(anthropic.Anthropic(api_key=anthropic_key))
+    # No OpenTelemetry spans, as for the chat model: the run's tracing is
+    # LangSmith's experiment.
+    judge = ClaudeJudge(
+        anthropic.Anthropic(api_key=anthropic_key, open_telemetry=False)
+    )
     judge.check()
     client = Client(api_key=langsmith_key)
     dataset = sync_dataset(client, questions)

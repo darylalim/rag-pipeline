@@ -12,7 +12,7 @@ import sys
 import textwrap
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Generator
 from concurrent.futures import ThreadPoolExecutor, wait
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1273,7 +1273,7 @@ def test_an_ingest_leaves_a_held_store_searching(settings, fake_embeddings):
 
 
 @contextlib.contextmanager
-def _workers(count: int) -> Iterator[ThreadPoolExecutor]:
+def _workers(count: int) -> Generator[ThreadPoolExecutor, None, None]:
     """A thread pool whose exit does not wait for its workers.
 
     `with ThreadPoolExecutor()` joins every worker on the way out, unbounded,
@@ -1291,7 +1291,7 @@ def _workers(count: int) -> Iterator[ThreadPoolExecutor]:
 
 
 @contextlib.contextmanager
-def _held_by_another_writer(settings) -> Iterator[None]:
+def _held_by_another_writer(settings) -> Generator[None, None, None]:
     """Hold the collection's ingest lock the way another process's ingest would."""
     other = ingest_mod._WriterLock(settings)
     assert other.try_acquire()

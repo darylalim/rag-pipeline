@@ -220,6 +220,18 @@ def test_a_missing_key_is_a_runtime_error_at_construction(monkeypatch):
         ClaudeChatModel(model=MODEL, max_tokens=64)
 
 
+def test_the_client_makes_no_opentelemetry_spans(monkeypatch):
+    """The SDK traces into any tracer provider the process has registered,
+    unless told not to; tracing here is LangSmith's, switched on per question.
+    Its own variable unset, so the default -- spans on -- is what is overridden."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+    monkeypatch.delenv("ANTHROPIC_OPEN_TELEMETRY", raising=False)
+
+    client = ClaudeChatModel(model=MODEL, max_tokens=64).client
+
+    assert client.open_telemetry["traces"]["enabled"] is False
+
+
 def test_a_max_tokens_below_one_is_a_runtime_error(fake_claude):
     with pytest.raises(RuntimeError, match="MAX_TOKENS"):
         fake_claude.chat(max_tokens=0)

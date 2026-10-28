@@ -182,7 +182,7 @@ def test_the_passages_are_labelled_as_retrieved_not_as_sources(app, monkeypatch)
     assert not at.exception, [e.value for e in at.exception]
 
     _, assistant = at.session_state["messages"]
-    labels = [panel.label for panel in at.get("status")]
+    labels = [panel.label for panel in at.expander]
     assert labels == [f"Retrieved passages ({len(assistant['sources'])})"]
 
 
