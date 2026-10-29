@@ -389,7 +389,7 @@ the live tests cover.
 | Job | Status check name | Runs |
 | --- | ----------------- | ---- |
 | `lint` | `ruff + ty` | `ruff check`, `ruff format --check`, `ty check` |
-| `test` | `pytest (py3.11)`, `pytest (py3.13)` | The test suite on the oldest supported and the pinned Python |
+| `test` | `pytest (py3.11)`, `pytest (py3.13)` | The test suite on the oldest supported and the pinned Python; a test whose vector index never became queryable is rerun once, since atlas-local occasionally stalls one on a hosted runner |
 | `release` | `release` | On a push to `main`, after both pass: a GitHub release for a new version |
 
 Jobs install with `uv sync --locked`, which fails if `uv.lock` is out of date

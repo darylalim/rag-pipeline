@@ -60,6 +60,7 @@ packages = ["rag_pipeline"]
 dev = [
     "pytest>=9.1.1",
     "pytest-cov>=7.0",
+    "pytest-rerunfailures>=16.7",
     "ruff>=0.16.10",
     # The store tests run against MongoDB's atlas-local image in Docker, one
     # container per session (conftest's `atlas_uri`).

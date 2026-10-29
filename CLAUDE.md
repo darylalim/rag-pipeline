@@ -582,8 +582,11 @@ because they are only observable at the frontend:
   caught up (`test_retrieve_never_returns_a_foreign_document` does).
 - On a GitHub-hosted runner that wait occasionally runs out: one store test
   fails with "Vector index 'vector_index' did not become queryable within
-  180s", a different test each time, and the rest pass. Re-run the failed job
-  once. A second failure, or one locally, is real. Don't raise
+  180s", a different test each time, and the rest pass. CI reruns that test
+  once (`pytest-rerunfailures`, `--only-rerun` on that message, in `ci.yml`
+  only). It did not reproduce outside the suite — 6,000 create-wait-drop
+  cycles on hosted runners, in the suite's order, none stalled — so there is
+  no setup to fix. A second failure, or one locally, is real. Don't raise
   `_INDEX_POLL_TIMEOUT_S` to quiet it: it is production's bound as well.
 - MongoDB refuses `$expr` in an upsert's query (code 224): a conditional upsert
   decides inside its update pipeline instead, as `_WriterLock.try_acquire` does.

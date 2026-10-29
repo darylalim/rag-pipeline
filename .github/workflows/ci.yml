@@ -75,8 +75,14 @@ jobs:
       - name: Pull the atlas-local image
         run: docker pull mongodb/mongodb-atlas-local:8.0.17
 
+      # On a hosted runner atlas-local occasionally never makes one test's index
+      # queryable while every other builds in seconds. It did not reproduce in
+      # 6,000 create-wait-drop cycles on these runners, so there is no setup to
+      # fix: a test that fails with that message, and only that one, is run
+      # once more. Any other failure, or a second stall, still fails the job.
+      # Not in pyproject's addopts: a stall locally is real.
       - name: Run tests
-        run: uv run pytest
+        run: uv run pytest --reruns 1 --only-rerun "did not become queryable"
 
   # Once its checks pass, main's head releases its version if that has no
   # published release yet. The tag and the release are made in one call, so a
