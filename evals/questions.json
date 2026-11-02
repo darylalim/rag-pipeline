@@ -614,5 +614,95 @@
       "engineering/ci-quotas.md"
     ],
     "category": "version"
+  },
+  {
+    "id": "paraphrase-portal-logout",
+    "question": "How long can a customer stay logged in to the web portal before being signed out?",
+    "answer": "12 hours.",
+    "sources": [
+      "services/harbor.md"
+    ],
+    "category": "paraphrase"
+  },
+  {
+    "id": "paraphrase-lookup-rebuild",
+    "question": "At what time of day is the shipment lookup engine's catalogue regenerated from nothing, and how long does that take?",
+    "answer": "Every night at 02:00 UTC, taking about 40 minutes.",
+    "sources": [
+      "services/lantern.md"
+    ],
+    "category": "paraphrase"
+  },
+  {
+    "id": "paraphrase-bounced-submission",
+    "question": "A trucking partner's submissions are bounced as unprocessable and never retried. What is missing from them?",
+    "answer": "The carrier_id.",
+    "sources": [
+      "services/dockhand.md"
+    ],
+    "category": "paraphrase"
+  },
+  {
+    "id": "paraphrase-api-credential",
+    "question": "How long is a credential for the public programmatic interface good for before it lapses?",
+    "answer": "365 days.",
+    "sources": [
+      "services/gantry.md"
+    ],
+    "category": "paraphrase"
+  },
+  {
+    "id": "paraphrase-resend",
+    "question": "Once a customer's callback URL is switched back on, how much of what they missed is sent again?",
+    "answer": "The last 72 hours of events; anything older is not sent again.",
+    "sources": [
+      "runbooks/signalbox-webhook-disabled.md"
+    ],
+    "category": "paraphrase"
+  },
+  {
+    "id": "paraphrase-review-turnaround",
+    "question": "If I ask a colleague to look over my change, how soon should I hear back?",
+    "answer": "Within one business day.",
+    "sources": [
+      "engineering/code-review.md"
+    ],
+    "category": "paraphrase"
+  },
+  {
+    "id": "paraphrase-supplier-vetting",
+    "question": "Before we sign with an outside supplier who will handle client information, how long can the vetting take?",
+    "answer": "Up to 3 weeks.",
+    "sources": [
+      "policies/vendor-security-review.md"
+    ],
+    "category": "paraphrase"
+  },
+  {
+    "id": "paraphrase-pager-duty",
+    "question": "How long after starting does a new hire begin carrying the pager?",
+    "answer": "After 6 weeks, as the secondary.",
+    "sources": [
+      "onboarding/first-week.md"
+    ],
+    "category": "paraphrase"
+  },
+  {
+    "id": "paraphrase-dwell",
+    "question": "What is the term for how long a parcel sits in one warehouse between two sightings?",
+    "answer": "Dwell time.",
+    "sources": [
+      "glossary.md"
+    ],
+    "category": "paraphrase"
+  },
+  {
+    "id": "paraphrase-toggle-cleanup",
+    "question": "Once every user has a switch for turning functionality on, how long may that switch stay in the code?",
+    "answer": "60 days.",
+    "sources": [
+      "engineering/feature-flags.md"
+    ],
+    "category": "paraphrase"
   }
 ]
