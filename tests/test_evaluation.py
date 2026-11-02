@@ -82,6 +82,38 @@ def test_the_eval_corpus_outnumbers_what_vector_search_fetches():
     assert chunks >= 2 * defaults.fetch_k
 
 
+def test_a_context_question_cites_chunks_that_do_not_name_their_subject():
+    """What makes a `context` question hard: its document is long enough to
+    split into several chunks, and most of them never name the service the
+    file is about (its file name), so a chunk alone cannot be attributed to it.
+
+    An edit that put the name back into every section would make the category
+    quietly easy again, with every check still green.
+    """
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+    from rag_pipeline.config import Settings
+
+    defaults = Settings()
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=defaults.chunk_size, chunk_overlap=defaults.chunk_overlap
+    )
+    cited = {
+        source
+        for q in ev.load_questions()
+        if q.category == "context"
+        for source in q.sources
+    }
+
+    assert cited, "the shipped set has no context questions"
+    for source in sorted(cited):
+        chunks = splitter.split_text((ev.EVAL_CORPUS / source).read_text("utf-8"))
+        subject = Path(source).stem
+        named = [chunk for chunk in chunks if subject.lower() in chunk.lower()]
+        assert len(chunks) >= 4, source
+        assert len(named) < len(chunks) / 2, (source, len(named), len(chunks))
+
+
 def test_eval_settings_swap_the_corpus_and_collection_but_keep_the_models(settings):
     """The models are what is evaluated, so they are kept; tracing is on, so an
     experiment's rows carry each question's whole trace."""

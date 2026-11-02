@@ -443,5 +443,95 @@
     "answer": "The documents do not say; the answer should state that it is not in the provided documents.",
     "sources": [],
     "category": "easy"
+  },
+  {
+    "id": "context-capstan-retries",
+    "question": "How many attempts does Capstan make when a call to one of its dependencies fails, and what is the longest it waits between attempts?",
+    "answer": "6 attempts in total, with backoff capped at 120 seconds between attempts.",
+    "sources": [
+      "services/capstan.md"
+    ],
+    "category": "context"
+  },
+  {
+    "id": "context-bollard-retention",
+    "question": "How long does Bollard keep its records?",
+    "answer": "400 days.",
+    "sources": [
+      "services/bollard.md"
+    ],
+    "category": "context"
+  },
+  {
+    "id": "context-windlass-page",
+    "question": "When does Windlass page its on-call for errors?",
+    "answer": "When more than 5% of requests fail with a 5xx response for 5 minutes in a row.",
+    "sources": [
+      "services/windlass.md"
+    ],
+    "category": "context"
+  },
+  {
+    "id": "context-hawser-scaling",
+    "question": "What is the most replicas Hawser runs per region, and at what CPU does it add one?",
+    "answer": "At most 16 replicas per region; it adds one when average CPU stays above 55% for 3 minutes.",
+    "sources": [
+      "services/hawser.md"
+    ],
+    "category": "context"
+  },
+  {
+    "id": "context-bosun-maintenance",
+    "question": "When is Bosun's weekly maintenance window?",
+    "answer": "Wednesdays, 15:00 to 16:00 UTC.",
+    "sources": [
+      "services/bosun.md"
+    ],
+    "category": "context"
+  },
+  {
+    "id": "context-davit-dead-letters",
+    "question": "How long does Davit keep work that failed every retry?",
+    "answer": "36 hours, in a dead-letter table.",
+    "sources": [
+      "services/davit.md"
+    ],
+    "category": "context"
+  },
+  {
+    "id": "context-windlass-size",
+    "question": "What is the largest request body Windlass accepts?",
+    "answer": "25 MB.",
+    "sources": [
+      "services/windlass.md"
+    ],
+    "category": "context"
+  },
+  {
+    "id": "context-capstan-slo",
+    "question": "What is Capstan's SLO?",
+    "answer": "99.0% monthly availability.",
+    "sources": [
+      "services/capstan.md"
+    ],
+    "category": "context"
+  },
+  {
+    "id": "context-hawser-restore",
+    "question": "How long should restoring Hawser from a backup take?",
+    "answer": "About 20 minutes.",
+    "sources": [
+      "services/hawser.md"
+    ],
+    "category": "context"
+  },
+  {
+    "id": "context-bollard-concurrency",
+    "question": "How many requests can one Bollard replica have in flight?",
+    "answer": "64.",
+    "sources": [
+      "services/bollard.md"
+    ],
+    "category": "context"
   }
 ]
