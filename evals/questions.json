@@ -704,5 +704,95 @@
       "engineering/feature-flags.md"
     ],
     "category": "paraphrase"
+  },
+  {
+    "id": "table-enterprise-storage",
+    "question": "How much document storage does an Enterprise account get?",
+    "answer": "2 TB.",
+    "sources": [
+      "product/plans.md"
+    ],
+    "category": "table"
+  },
+  {
+    "id": "table-growth-sandbox",
+    "question": "How many sandbox environments come with the Growth plan?",
+    "answer": "1.",
+    "sources": [
+      "product/plans.md"
+    ],
+    "category": "table"
+  },
+  {
+    "id": "table-starter-sandbox",
+    "question": "Does the Starter plan include a sandbox environment?",
+    "answer": "No, Starter includes no sandbox environments.",
+    "sources": [
+      "product/plans.md"
+    ],
+    "category": "table"
+  },
+  {
+    "id": "table-business-webhooks",
+    "question": "How many webhook endpoints does the Business plan include?",
+    "answer": "25.",
+    "sources": [
+      "product/plans.md"
+    ],
+    "category": "table"
+  },
+  {
+    "id": "table-growth-history",
+    "question": "How long does the Growth plan keep shipment history in the dashboard?",
+    "answer": "1 year.",
+    "sources": [
+      "product/plans.md"
+    ],
+    "category": "table"
+  },
+  {
+    "id": "table-enterprise-p2-response",
+    "question": "What is the first response time for an Enterprise customer's P2 ticket?",
+    "answer": "1 hour.",
+    "sources": [
+      "support/escalation-matrix.md"
+    ],
+    "category": "table"
+  },
+  {
+    "id": "table-enterprise-p1-notified",
+    "question": "Who else is notified when an Enterprise customer opens a P1 ticket?",
+    "answer": "The account manager and the Support director.",
+    "sources": [
+      "support/escalation-matrix.md"
+    ],
+    "category": "table"
+  },
+  {
+    "id": "table-enterprise-p3-updates",
+    "question": "How often is an Enterprise customer updated on a P3 ticket?",
+    "answer": "Every business day.",
+    "sources": [
+      "support/escalation-matrix.md"
+    ],
+    "category": "table"
+  },
+  {
+    "id": "table-business-p4-escalation",
+    "question": "When is a Business customer's P4 ticket escalated to engineering?",
+    "answer": "Never.",
+    "sources": [
+      "support/escalation-matrix.md"
+    ],
+    "category": "table"
+  },
+  {
+    "id": "table-enterprise-p4-escalation",
+    "question": "When is an Enterprise customer's P4 ticket escalated to engineering?",
+    "answer": "After 15 business days.",
+    "sources": [
+      "support/escalation-matrix.md"
+    ],
+    "category": "table"
   }
 ]

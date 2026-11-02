@@ -114,6 +114,36 @@ def test_a_context_question_cites_chunks_that_do_not_name_their_subject():
         assert len(named) < len(chunks) / 2, (source, len(named), len(chunks))
 
 
+def test_a_table_question_cites_a_table_split_from_its_header():
+    """What makes a `table` question hard: its document's table is long
+    enough that the splitter cuts it, leaving rows in a chunk without the
+    header that says what each column means.
+
+    A table shortened, or moved so it fit in one chunk, would make the
+    category quietly easy again.
+    """
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+    from rag_pipeline.config import Settings
+
+    defaults = Settings()
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=defaults.chunk_size, chunk_overlap=defaults.chunk_overlap
+    )
+    cited = {
+        source
+        for q in ev.load_questions()
+        if q.category == "table"
+        for source in q.sources
+    }
+
+    assert cited, "the shipped set has no table questions"
+    for source in sorted(cited):
+        chunks = splitter.split_text((ev.EVAL_CORPUS / source).read_text("utf-8"))
+        headerless = [c for c in chunks if "\n| " in c and "| --- |" not in c]
+        assert headerless, f"{source}: no table rows without their header"
+
+
 def test_eval_settings_swap_the_corpus_and_collection_but_keep_the_models(settings):
     """The models are what is evaluated, so they are kept; tracing is on, so an
     experiment's rows carry each question's whole trace."""
