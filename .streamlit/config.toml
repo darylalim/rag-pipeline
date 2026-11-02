@@ -33,3 +33,65 @@ address = "127.0.0.1"
 # posts any address typed to Streamlit's servers. Nothing about this app is
 # meant to leave the machine, so the question is not asked.
 showEmailPrompt = false
+
+# "Paper and ink": warm neutrals for reading long passages, one teal accent,
+# and the same design in both modes with its lightness reversed.
+# test_the_theme_is_readable_in_both_modes_and_loads_no_remote_font pins the
+# contrast every pairing below was chosen for.
+[theme]
+# The fonts bundled with Streamlit (Source Sans, Serif and Code): a font URL
+# would have the browser fetch it from Google Fonts, and nothing about this app
+# is meant to leave the machine.
+font = "sans-serif"
+headingFont = "serif"
+codeFont = "monospace"
+headingFontWeights = 600
+baseRadius = "medium"
+showWidgetBorder = true
+showSidebarBorder = true
+
+# Both modes are defined, so the settings menu offers Light, Dark and System,
+# and the app follows the OS by default.
+[theme.light]
+# One teal does both jobs here: white button text on it is 6.15:1, and as
+# link text it is 5.90:1 on the background.
+primaryColor = "#0D6D6A"
+linkColor = "#0D6D6A"
+backgroundColor = "#FBFAF7"
+secondaryBackgroundColor = "#F1EEE7"
+codeBackgroundColor = "#F1EEE7"
+textColor = "#161412"
+borderColor = "#DCD6CA"
+redColor = "#B42318"
+orangeColor = "#A8510A"
+greenColor = "#1E7543"
+blueColor = "#1F5C99"
+grayColor = "#6B655B"
+
+[theme.light.sidebar]
+backgroundColor = "#F4F1EB"
+secondaryBackgroundColor = "#E9E5DC"
+borderColor = "#DCD6CA"
+
+[theme.dark]
+# Two teals. Streamlit draws white text on primaryColor, and on a background
+# this dark no one color gives 4.5:1 against both white and the background. So
+# primary carries the white button text (4.83:1) and the link color carries
+# text on the background (9.1:1).
+primaryColor = "#107F7B"
+linkColor = "#5CC8C2"
+backgroundColor = "#161513"
+secondaryBackgroundColor = "#211F1C"
+codeBackgroundColor = "#211F1C"
+textColor = "#ECE7DF"
+borderColor = "#36332E"
+redColor = "#F07167"
+orangeColor = "#E8A35A"
+greenColor = "#5CC98A"
+blueColor = "#7FB2EA"
+grayColor = "#A39C90"
+
+[theme.dark.sidebar]
+backgroundColor = "#1D1C19"
+secondaryBackgroundColor = "#2A2824"
+borderColor = "#36332E"

@@ -975,3 +975,105 @@ def test_the_app_config_keeps_streamlit_local_and_quiet():
     assert config["server"]["fileWatcherType"] == "none"
     assert config["server"]["address"] == "127.0.0.1"
     assert config["server"]["showEmailPrompt"] is False
+
+
+def _luminance(hex_color: str) -> float:
+    """WCAG 2.x relative luminance of a `#RRGGBB` color."""
+    channels = (int(hex_color[i : i + 2], 16) / 255 for i in (1, 3, 5))
+    r, g, b = (
+        c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in channels
+    )
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def _contrast(a: str, b: str) -> float:
+    """WCAG 2.x contrast ratio, the lighter color's luminance over the darker's."""
+    light, dark = sorted((_luminance(a), _luminance(b)), reverse=True)
+    return (light + 0.05) / (dark + 0.05)
+
+
+# What `st.caption` draws: the text color at this opacity, over whatever is
+# behind it. Streamlit's, not the config's -- measured in the browser on
+# Streamlit 1.66.
+_CAPTION_OPACITY = 0.6
+
+
+def _faded(fore: str, back: str, opacity: float) -> str:
+    """`fore` at `opacity` over `back`, as the eye receives it."""
+    mixed = (
+        round(
+            int(fore[i : i + 2], 16) * opacity
+            + int(back[i : i + 2], 16) * (1 - opacity)
+        )
+        for i in (1, 3, 5)
+    )
+    return "#" + "".join(f"{channel:02X}" for channel in mixed)
+
+
+def test_the_theme_is_readable_in_both_modes_and_loads_no_remote_font():
+    """The theme's palette meets WCAG AA in both modes, and its fonts are local.
+
+    Both modes are defined, so Streamlit's settings menu keeps offering the
+    switch. In each, body text is 4.5:1 on every surface it sits on, links and
+    the muted gray are 4.5:1 on the background, the white text Streamlit draws
+    on a primary-colored button is 4.5:1, and the primary color itself is 3:1
+    against the background (WCAG's minimum for a component). Dark mode needs a
+    separate link color to manage that: the reason the config gives is a sum
+    this test does, not a claim it trusts. Captions are 4.5:1 too, as drawn: a
+    caption is the text color faded, not the gray, and it carries each
+    passage's rank and source and the app's intro line. And no font is a URL:
+    the bundled fonts need no request, and the app is meant to make none off
+    the machine. A test run starts no server, so the file is what is checked,
+    with the fade Streamlit applies to it measured once, in the browser.
+    """
+    theme = tomllib.loads((APP.parent / ".streamlit" / "config.toml").read_text())[
+        "theme"
+    ]
+
+    for mode in ("light", "dark"):
+        colors, sidebar = theme[mode], theme[mode]["sidebar"]
+        background, text = colors["backgroundColor"], colors["textColor"]
+        surfaces = {
+            "background": background,
+            "secondary": colors["secondaryBackgroundColor"],
+            "sidebar": sidebar["backgroundColor"],
+            "sidebar secondary": sidebar["secondaryBackgroundColor"],
+        }
+        pairs = {
+            f"text on {name}": (text, surface) for name, surface in surfaces.items()
+        }
+        pairs |= {
+            "link on background": (colors["linkColor"], background),
+            "link on sidebar": (colors["linkColor"], sidebar["backgroundColor"]),
+            "gray on background": (colors["grayColor"], background),
+            "white on primary": ("#FFFFFF", colors["primaryColor"]),
+        }
+        pairs |= {
+            f"caption on {name}": (_faded(text, surface, _CAPTION_OPACITY), surface)
+            for name, surface in surfaces.items()
+            if name in ("background", "sidebar")
+        }
+        for name, (fore, back) in pairs.items():
+            assert _contrast(fore, back) >= 4.5, f"{mode}: {name}"
+        assert _contrast(colors["primaryColor"], background) >= 3, (
+            f"{mode}: primary on background"
+        )
+
+    sections = [
+        theme,
+        theme["light"],
+        theme["dark"],
+        theme["light"]["sidebar"],
+        theme["dark"]["sidebar"],
+    ]
+    fonts = [
+        s[key]
+        for s in sections
+        for key in ("font", "headingFont", "codeFont")
+        if key in s
+    ]
+    assert fonts
+    assert not [font for font in fonts if "://" in font]
+    assert not [
+        face for face in theme.get("fontFaces", []) if "://" in face.get("url", "")
+    ]

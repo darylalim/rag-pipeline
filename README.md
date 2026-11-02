@@ -7,7 +7,10 @@ Vector Search, reranked with Voyage (`rerank-3`), and answered by
 **Claude Sonnet 5.5**. A core library, a CLI and a Streamlit chat app share the
 same code.
 
-![The Streamlit chat app answering a question from the sample documents, citing its source, with the active models in the sidebar](docs/chat-app.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/chat-app-dark.png">
+  <img alt="The Streamlit chat app answering a question from the sample documents, citing its source, with the active models in the sidebar" src="docs/chat-app-light.png">
+</picture>
 
 ```
 Ingest (once):   data/ ──load──▶ split ──embed──▶ store (MongoDB Atlas + vector index)
@@ -138,7 +141,10 @@ the passages it was generated from, so you can check a claim against its source
 text. The sidebar shows the active configuration and accepts
 [uploads](#add-your-own-documents).
 
-![An answer with its retrieved passages open: the first passage holds the sentence the answer paraphrases](docs/retrieved-passages.png)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/retrieved-passages-dark.png">
+  <img alt="An answer with its retrieved passages open: the first passage holds the sentence the answer paraphrases" src="docs/retrieved-passages-light.png">
+</picture>
 
 - **Stop** ends an answer immediately, closing the request to Claude. The turn
   stays in the history, marked as interrupted.
