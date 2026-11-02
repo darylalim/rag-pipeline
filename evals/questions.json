@@ -533,5 +533,86 @@
       "services/bollard.md"
     ],
     "category": "context"
+  },
+  {
+    "id": "version-password-change",
+    "question": "How often do employees have to change their password?",
+    "answer": "Never on a schedule: a password is replaced only when it may have been exposed.",
+    "sources": [
+      "policies/authentication.md"
+    ],
+    "category": "version"
+  },
+  {
+    "id": "version-password-length",
+    "question": "What is the minimum password length?",
+    "answer": "14 characters.",
+    "sources": [
+      "policies/authentication.md"
+    ],
+    "category": "version"
+  },
+  {
+    "id": "version-lockout",
+    "question": "How many failed sign-in attempts lock an account, and for how long?",
+    "answer": "10 failed attempts in a row lock it for 30 minutes.",
+    "sources": [
+      "policies/authentication.md"
+    ],
+    "category": "version"
+  },
+  {
+    "id": "version-security-fix",
+    "question": "How quickly must a critical security advisory in a dependency be patched?",
+    "answer": "Within 72 hours.",
+    "sources": [
+      "adr/0031-weekly-dependency-updates.md"
+    ],
+    "category": "version"
+  },
+  {
+    "id": "version-dependency-cadence",
+    "question": "How often are dependency updates merged?",
+    "answer": "Every week: Dependabot opens the pull requests weekly and the owning team merges them within that week.",
+    "sources": [
+      "adr/0031-weekly-dependency-updates.md"
+    ],
+    "category": "version"
+  },
+  {
+    "id": "version-klaxon-down",
+    "question": "What happens when Klaxon cannot send pages?",
+    "answer": "It fails over automatically to SMS through a second provider after 2 minutes of failed sends.",
+    "sources": [
+      "postmortems/2025-10-klaxon-outage.md"
+    ],
+    "category": "version"
+  },
+  {
+    "id": "version-ci-concurrency",
+    "question": "How many CI jobs can one repository run at once?",
+    "answer": "20.",
+    "sources": [
+      "engineering/ci-quotas.md"
+    ],
+    "category": "version"
+  },
+  {
+    "id": "version-ci-timeout",
+    "question": "What is the CI job timeout?",
+    "answer": "30 minutes.",
+    "sources": [
+      "engineering/ci-quotas.md"
+    ],
+    "category": "version"
+  },
+  {
+    "id": "version-artifact-retention",
+    "question": "How long are CI artifacts kept?",
+    "answer": "14 days.",
+    "sources": [
+      "engineering/ci-quotas.md"
+    ],
+    "category": "version"
   }
 ]
