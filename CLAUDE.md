@@ -127,8 +127,15 @@ not what it computes.
 `langsmith.evaluate` and scores each answer `retrieval_hit` and
 `retrieval_rank` (computed from the chunks in the prompt; the rank, a reciprocal
 rank, because the local stack scored a 100% hit rate and a hit rate cannot see a
-right file slipping from first place), `correct` and `grounded` (judged by
-Claude). It exists so the migration to
+right file slipping from first place), `retrieval_recall` (the fraction of a
+question's expected files in the prompt: `retrieval_hit` passes a two-file
+question on one), `candidate_rank` (the rank over `pipeline.candidates()`, the
+`FETCH_K` vector-search results before the rerank — a diagnostic, not a target:
+it says whether a miss is the embedder's or the reranker's), `correct` and
+`grounded` (judged by Claude). Every score is reported overall and per
+`category` (`CATEGORIES`; carried in each example's LangSmith metadata), and a
+baseline keeps both; an older baseline without `scores_by_category` is compared
+overall only. It exists so the migration to
 hosted models could be measured: each phase was compared with
 `evals/baseline.json`, scored on the earlier local stack (Chroma and Qwen models
 under MLX), and a change to the pipeline is compared with it the same way.

@@ -30,9 +30,15 @@ from rag_pipeline.pipeline import RAGPipeline
 _ROOT = Path(__file__).resolve().parents[1]
 
 
-def _q(id: str = "q1", sources: tuple[str, ...] = ("a.md",)) -> ev.Question:
+def _q(
+    id: str = "q1", sources: tuple[str, ...] = ("a.md",), category: str = "easy"
+) -> ev.Question:
     return ev.Question(
-        id=id, question=f"Question {id}?", answer="An answer.", sources=sources
+        id=id,
+        question=f"Question {id}?",
+        answer="An answer.",
+        sources=sources,
+        category=category,
     )
 
 
@@ -114,20 +120,35 @@ def test_the_eval_corpus_indexes_every_expected_source(settings, fake_embeddings
             '[{"id": "a", "question": "q?"}]', "exactly the keys", id="missing-key"
         ),
         pytest.param(
-            '[{"id": "a", "question": " ", "answer": "x", "sources": []}]',
+            '[{"id": "a", "question": " ", "answer": "x", "sources": [],'
+            ' "category": "easy"}]',
             "must be text",
             id="blank-question",
         ),
         pytest.param(
-            '[{"id": "a", "question": "q?", "answer": "x", "sources": "a.md"}]',
+            '[{"id": "a", "question": "q?", "answer": "x", "sources": "a.md",'
+            ' "category": "easy"}]',
             "list of file names",
             id="sources-not-a-list",
         ),
         pytest.param(
-            '[{"id": "a", "question": "q?", "answer": "x", "sources": []},'
-            ' {"id": "a", "question": "r?", "answer": "y", "sources": []}]',
+            '[{"id": "a", "question": "q?", "answer": "x", "sources": [],'
+            ' "category": "easy"},'
+            ' {"id": "a", "question": "r?", "answer": "y", "sources": [],'
+            ' "category": "easy"}]',
             "duplicate question ids",
             id="duplicate-id",
+        ),
+        pytest.param(
+            '[{"id": "a", "question": "q?", "answer": "x", "sources": []}]',
+            "exactly the keys",
+            id="no-category",
+        ),
+        pytest.param(
+            '[{"id": "a", "question": "q?", "answer": "x", "sources": [],'
+            ' "category": "hard"}]',
+            "category must be one of",
+            id="unknown-category",
         ),
     ],
 )
@@ -195,12 +216,12 @@ def test_a_new_question_set_is_uploaded_once_with_references():
         {
             "inputs": {"question": "Question q1?"},
             "outputs": {"answer": "An answer.", "sources": ["a.md"]},
-            "metadata": {"id": "q1"},
+            "metadata": {"id": "q1", "category": "easy"},
         },
         {
             "inputs": {"question": "Question q2?"},
             "outputs": {"answer": "An answer.", "sources": []},
-            "metadata": {"id": "q2"},
+            "metadata": {"id": "q2", "category": "easy"},
         },
     ]
 
@@ -249,6 +270,11 @@ def test_the_target_runs_the_pipeline_and_returns_what_was_read(
     assert set(outputs["sources"]) <= {"a.md", "sub/b.txt"}
     assert outputs["contexts"]
     assert {c["source"] for c in outputs["contexts"]} == set(outputs["sources"])
+    # The vector search's candidates, before the rerank: the fake reranker
+    # keeps the first RETRIEVAL_K of them, in order.
+    assert outputs["candidates"][: len(outputs["contexts"])] == [
+        c["source"] for c in outputs["contexts"]
+    ]
     # Plain dicts: LangSmith serializes the outputs as JSON.
     json.dumps(outputs)
 
@@ -270,6 +296,25 @@ def test_retrieval_hit(outputs, expected, score):
     result = ev.retrieval_hit(outputs, {"answer": "x", "sources": expected})
 
     assert result["key"] == "retrieval_hit"
+    assert result["score"] == score
+
+
+@pytest.mark.parametrize(
+    ("outputs", "expected", "score"),
+    [
+        pytest.param({"sources": ["a.md"]}, ["a.md"], 1.0, id="one-of-one"),
+        pytest.param({"sources": ["a.md", "c.md"]}, ["a.md", "b.md"], 0.5, id="half"),
+        pytest.param({"sources": ["b.md", "a.md"]}, ["a.md", "b.md"], 1.0, id="both"),
+        pytest.param({"sources": ["c.md"]}, ["a.md"], 0.0, id="none"),
+        pytest.param({"sources": ["a.md"]}, [], None, id="unanswerable"),
+        pytest.param({}, ["a.md"], None, id="run-failed"),
+    ],
+)
+def test_retrieval_recall(outputs, expected, score):
+    """Where retrieval_hit passes a two-file question on one file, recall halves."""
+    result = ev.retrieval_recall(outputs, {"answer": "x", "sources": expected})
+
+    assert result["key"] == "retrieval_recall"
     assert result["score"] == score
 
 
@@ -296,6 +341,29 @@ def test_retrieval_rank(outputs, expected, score):
     result = ev.retrieval_rank(outputs, {"answer": "x", "sources": expected})
 
     assert result["key"] == "retrieval_rank"
+    assert result["score"] == (pytest.approx(score) if score is not None else None)
+
+
+@pytest.mark.parametrize(
+    ("candidates", "expected", "score"),
+    [
+        pytest.param(["a.md", "b.md"], ["a.md"], 1.0, id="first"),
+        pytest.param(["b.md", "b.md", "c.md", "a.md"], ["a.md"], 0.25, id="fourth"),
+        pytest.param(["b.md", "c.md"], ["a.md"], 0.0, id="never-fetched"),
+        pytest.param(["a.md"], [], None, id="unanswerable"),
+        pytest.param(None, ["a.md"], None, id="run-failed"),
+    ],
+)
+def test_candidate_rank(candidates, expected, score):
+    """Ranked over the vector search's candidates, never the prompt's chunks,
+    which here always hold the right file."""
+    outputs = (
+        {} if candidates is None else {"candidates": candidates, **_contexts("a.md")}
+    )
+
+    result = ev.candidate_rank(outputs, {"answer": "x", "sources": expected})
+
+    assert result["key"] == "candidate_rank"
     assert result["score"] == (pytest.approx(score) if score is not None else None)
 
 
@@ -433,27 +501,18 @@ def test_the_judge_check_reports_an_unusable_key_as_runtime_error(monkeypatch):
 # --- summary, report and baseline -----------------------------------------------
 
 
+def _scored(**scores: float | None) -> dict[str, float | None]:
+    """Scores for every metric, 1 unless given."""
+    return dict.fromkeys(ev.METRICS, 1) | scores
+
+
 def test_summarize_averages_only_what_was_scored():
-    rows = [
-        (
-            {"retrieval_hit": 1, "retrieval_rank": 0.5, "correct": 1, "grounded": 1},
-            False,
-        ),
-        (
-            {"retrieval_hit": 0, "retrieval_rank": 0.0, "correct": 0, "grounded": 1},
-            False,
-        ),
+    rows: list[ev.Row] = [
+        ("easy", _scored(retrieval_hit=1, retrieval_rank=0.5), False),
+        ("easy", _scored(retrieval_hit=0, retrieval_rank=0.0, correct=0), False),
         # unanswerable
-        (
-            {
-                "retrieval_hit": None,
-                "retrieval_rank": None,
-                "correct": 1,
-                "grounded": 1,
-            },
-            False,
-        ),
-        ({}, True),  # the run raised
+        ("easy", _scored(retrieval_hit=None, retrieval_rank=None), False),
+        ("easy", {}, True),  # the run raised
     ]
 
     summary = ev.summarize(rows)
@@ -465,9 +524,29 @@ def test_summarize_averages_only_what_was_scored():
     assert (summary.examples, summary.errors) == (4, 1)
 
 
+def test_summarize_breaks_the_means_down_by_category_in_a_fixed_order():
+    """A hard category's failures are seen in its own line, not diluted by the
+    easy questions' passes in the overall mean."""
+    rows: list[ev.Row] = [
+        ("multi", _scored(retrieval_recall=0.5), False),
+        *[("easy", _scored(), False) for _ in range(9)],
+        ("multi", _scored(retrieval_recall=0.0), False),
+    ]
+
+    summary = ev.summarize(rows)
+
+    assert list(summary.by_category) == ["easy", "multi"]
+    assert summary.by_category["multi"].metrics["retrieval_recall"] == ev.Metric(
+        mean=0.25, n=2
+    )
+    assert summary.by_category["easy"].examples == 9
+    assert summary.metrics["retrieval_recall"].mean == pytest.approx(9.5 / 11)
+
+
 def test_rows_read_langsmith_results():
     row = {
         "run": SimpleNamespace(error=None),
+        "example": SimpleNamespace(metadata={"id": "q1", "category": "table"}),
         "evaluation_results": {
             "results": [
                 EvaluationResult(key="retrieval_hit", score=None),
@@ -476,24 +555,14 @@ def test_rows_read_langsmith_results():
         },
     }
 
-    assert list(ev._rows([row])) == [({"retrieval_hit": None, "correct": 1}, False)]
+    assert list(ev._rows([row])) == [
+        ("table", {"retrieval_hit": None, "correct": 1}, False)
+    ]
 
 
 def test_incomplete_names_each_metric_short_of_every_question():
     questions = [_q("q1"), _q("q2", ())]
-    summary = ev.summarize(
-        [
-            (
-                {
-                    "retrieval_hit": 1,
-                    "retrieval_rank": 1.0,
-                    "correct": 1,
-                    "grounded": 1,
-                },
-                False,
-            )
-        ]
-    )
+    summary = ev.summarize([("easy", _scored(), False)])
 
     assert ev.incomplete(summary, questions) == [
         "correct: 1 of 2 scored",
@@ -501,17 +570,18 @@ def test_incomplete_names_each_metric_short_of_every_question():
     ]
 
 
-def _summary(correct: float, rank: float = 1.0) -> ev.Summary:
-    return ev.Summary(
-        metrics={
-            "retrieval_hit": ev.Metric(1.0, 1),
-            "retrieval_rank": ev.Metric(rank, 1),
-            "correct": ev.Metric(correct, 2),
-            "grounded": ev.Metric(1.0, 2),
-        },
-        examples=2,
-        errors=0,
-    )
+def _summary(
+    correct: float, rank: float = 1.0, *, categories: tuple[str, ...] = ()
+) -> ev.Summary:
+    metrics = {metric: ev.Metric(1.0, 2) for metric in ev.METRICS} | {
+        "retrieval_rank": ev.Metric(rank, 2),
+        "correct": ev.Metric(correct, 2),
+    }
+    by_category = {
+        category: ev.Summary(metrics=metrics, examples=2, errors=0)
+        for category in categories
+    }
+    return ev.Summary(metrics=metrics, examples=2, errors=0, by_category=by_category)
 
 
 def test_the_report_compares_with_a_baseline_on_the_same_questions_and_judge(settings):
@@ -527,7 +597,7 @@ def test_the_rank_is_reported_as_a_number_and_its_change_in_points(settings):
 
     lines = ev.format_report(_summary(1.0, rank=0.75), "ds", baseline)
 
-    (rank_line,) = [line for line in lines if "retrieval_rank" in line]
+    (rank_line,) = [line for line in lines if line.startswith("  retrieval_rank")]
     assert "  0.75" in rank_line
     assert "change  -0.25" in rank_line
 
@@ -538,8 +608,61 @@ def test_a_metric_the_baseline_predates_is_reported_without_a_change(settings):
 
     lines = ev.format_report(_summary(1.0, rank=0.5), "ds", baseline)
 
-    (rank_line,) = [line for line in lines if "retrieval_rank" in line]
+    (rank_line,) = [line for line in lines if line.startswith("  retrieval_rank")]
     assert "baseline" not in rank_line
+
+
+def test_each_category_is_a_line_with_its_change_beneath(settings):
+    baseline = ev.baseline_record(
+        _summary(0.5, categories=("easy", "table")), "ds", "exp", "https://x", settings
+    )
+
+    lines = ev.format_report(
+        _summary(1.0, categories=("easy", "table")), "ds", baseline
+    )
+
+    header = next(
+        i for i, line in enumerate(lines) if line.split()[:2] == ["category", "n"]
+    )
+    assert lines[header + 1].split()[:2] == ["easy", "2"]
+    assert lines[header + 2].split()[0] == "change"
+    assert "+50.0%" in lines[header + 2]
+    assert lines[header + 3].split()[:2] == ["table", "2"]
+
+
+def test_a_baseline_without_categories_is_compared_overall_only(settings):
+    """The baseline from before categories existed has no breakdown: its
+    categories have nothing to compare with, as a metric it predates does not."""
+    baseline = ev.baseline_record(_summary(0.5), "ds", "exp", "https://x", settings)
+    del baseline["scores_by_category"]
+
+    lines = ev.format_report(_summary(1.0, categories=("easy",)), "ds", baseline)
+
+    assert any(line.split()[:2] == ["easy", "2"] for line in lines)
+    assert not any(line.split()[:1] == ["change"] for line in lines)
+    assert any("correct" in line and "change +50.0%" in line for line in lines)
+
+
+def test_a_metric_a_category_does_not_score_is_a_dash_not_zero():
+    """decoy questions are unanswerable, so no retrieval metric scores them."""
+    unscored = ev.Summary(
+        metrics={
+            metric: ev.Metric(0.0, 0)
+            if metric in ev._RETRIEVAL_METRICS
+            else ev.Metric(1.0, 3)
+            for metric in ev.METRICS
+        },
+        examples=3,
+        errors=0,
+    )
+    summary = replace(_summary(1.0), by_category={"decoy": unscored})
+
+    (line,) = [
+        line
+        for line in ev.format_report(summary, "ds", None)
+        if line.split()[:1] == ["decoy"]
+    ]
+    assert line.split()[2:] == ["-", "-", "-", "-", "100.0%", "100.0%"]
 
 
 @pytest.mark.parametrize(
@@ -548,21 +671,30 @@ def test_a_metric_the_baseline_predates_is_reported_without_a_change(settings):
     ids=["other-questions", "other-judge"],
 )
 def test_the_report_refuses_to_compare_across_questions_or_judges(settings, change):
-    baseline = ev.baseline_record(_summary(0.5), "ds", "exp", "https://x", settings)
+    baseline = ev.baseline_record(
+        _summary(0.5, categories=("easy",)), "ds", "exp", "https://x", settings
+    )
 
-    lines = ev.format_report(_summary(1.0), "ds", {**baseline, **change})
+    lines = ev.format_report(
+        _summary(1.0, categories=("easy",)), "ds", {**baseline, **change}
+    )
 
     assert not any("change" in line for line in lines)
     assert any("no comparison" in line for line in lines)
 
 
-def test_a_baseline_records_the_judge_and_settings_but_no_paths(settings):
-    record = ev.baseline_record(_summary(1.0), "ds", "exp", "https://x", settings)
+def test_a_baseline_records_the_judge_settings_and_categories_but_no_paths(settings):
+    record = ev.baseline_record(
+        _summary(1.0, categories=("easy", "multi")), "ds", "exp", "https://x", settings
+    )
 
     assert record["judge"] == ev.JUDGE_MODEL
     assert record["settings"]["retrieval_k"] == settings.retrieval_k
     assert "data_dir" not in record["settings"]
     assert "persist_dir" not in record["settings"]
+    assert set(record["scores"]) == set(ev.METRICS)
+    assert list(record["scores_by_category"]) == ["easy", "multi"]
+    assert record["scores_by_category"]["multi"]["correct"] == {"mean": 1.0, "n": 2}
     json.dumps(record)
 
 

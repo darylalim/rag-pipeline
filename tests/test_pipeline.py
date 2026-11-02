@@ -286,6 +286,9 @@ def test_retrieve_reranks_and_truncates(settings, fake_embeddings, tmp_path):
 
     assert len(seen) == wide.fetch_k
     assert reranked == list(reversed(seen))[: wide.retrieval_k]
+    # candidates() is that search on its own -- what `rag eval` ranks the
+    # embedder by -- so it must be exactly what the reranker was given.
+    assert pipeline.candidates("apples") == seen
 
 
 def test_retrieve_never_returns_a_foreign_document(

@@ -223,14 +223,23 @@ documents.
 - **Large enough** that vector search, which fetches `FETCH_K` = 20 chunks, has
   to choose. (The 9 chunks of the sample `data/` scored 100% on everything.)
 
-Each question gets four scores:
+Each question gets six scores:
 
 | Score | Measures | Judged by |
 | ----- | -------- | --------- |
 | `retrieval_hit` | Whether a correct source file is among the chunks in the prompt (not scored for the 5 unanswerable questions) | The pipeline's output |
 | `retrieval_rank` | 1 ÷ the rank of the first chunk from a correct file (0 if none), averaged as mean reciprocal rank. Catches a right file slipping down before it drops out | The pipeline's output |
+| `retrieval_recall` | The fraction of the correct files among the chunks in the prompt. Equal to `retrieval_hit` for a one-file question; for a two-file one, sees half the evidence missing | The pipeline's output |
+| `candidate_rank` | `retrieval_rank` over the `FETCH_K` vector-search candidates, before the reranker. A diagnostic: high here but low in the prompt means the reranker dropped the chunk; low here means the embedder never fetched it | The pipeline's output |
 | `correct` | Whether the answer matches the reference, or, for an unanswerable question, says it cannot answer | Claude Opus 5.5 |
 | `grounded` | Whether every claim is supported by the retrieved chunks | Claude Opus 5.5 |
+
+Each question also has a `category` (`CATEGORIES` in `evaluation.py`), and
+every score is reported per category as well as overall, so a hard category's
+failures are not diluted by the easy questions' passes. `easy` is the original
+set; each other category stresses one part of the pipeline (chunking, the
+reranker, the embedder, `RETRIEVAL_K`, or declining to answer). LangSmith's
+compare view can filter an experiment's rows by category.
 
 It needs one more key than the pipeline does:
 
@@ -245,7 +254,8 @@ uv run rag eval --save-baseline    # score, and save as the new baseline
 ```
 
 A run takes about 7 minutes and costs about $1–2, mostly for the judge. It
-prints each score, the change from the baseline, and a link to the experiment.
+prints each score overall and per category, the change from the baseline, and a
+link to the experiment.
 It checks the keys, the judge and LangSmith before loading any model.
 
 - **Comparable only within one question set and one judge.** The dataset name is

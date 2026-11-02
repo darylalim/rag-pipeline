@@ -337,24 +337,35 @@ class RAGPipeline:
         # so a missing LANGSMITH_API_KEY is reported before the first question.
         self._tracing_client: Client | None = tracing_client(settings)
 
+    def candidates(self, question: str) -> list[Document]:
+        """The vector search alone: fetch_k chunks, before the reranker.
+
+        Its own method so `rag eval` can see what the reranker was given, and
+        so tell a chunk the embedder never fetched from one the reranker
+        dropped -- the two point to different fixes. Wrapped so a store
+        failure, such as a query-time dimension mismatch against a collection
+        built with another model, surfaces as the RuntimeError both frontends
+        catch rather than a raw pymongo exception.
+        """
+        with provider_errors_as_runtime():
+            return self._retriever.invoke(question)
+
     def retrieve(self, question: str) -> list[Document]:
         """Return the reranked top chunks for the question.
 
         Vector search casts a wide net (fetch_k); the reranker — scoring each
         candidate against the question jointly — narrows it to retrieval_k. Both
-        calls are wrapped so a store failure, such as a query-time dimension
-        mismatch against a collection built with another model, surfaces as the
-        RuntimeError both frontends catch rather than a raw pymongo exception.
-        The models need no wrapping: their adapters already raise inside the
-        union.
+        calls are wrapped so a store failure surfaces as the RuntimeError both
+        frontends catch. The models need no wrapping: their adapters already
+        raise inside the union.
 
         Traced, the search is LangChain's own retriever run; the rerank is not
         a Runnable, so it gets a run of its own here -- the step whose choices
         decide what the model is shown, with what it was given and what it kept,
         scored.
         """
+        candidates = self.candidates(question)
         with provider_errors_as_runtime():
-            candidates = self._retriever.invoke(question)
             if not tracing_is_enabled():
                 return list(self._reranker.compress_documents(candidates, question))
             with trace(

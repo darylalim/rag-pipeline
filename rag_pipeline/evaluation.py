@@ -6,7 +6,8 @@ the hosted chat model does not decode greedily, so one answer differs from run
 to run -- so every change is scored on the same questions, by the same judge,
 and compared with a saved baseline.
 
-Four scores per question, all but ``retrieval_rank`` 1 (pass) or 0 (fail):
+Six scores per question; the ranks and the recall are fractions, the rest 1
+(pass) or 0 (fail):
 
 - ``retrieval_hit``: an expected source file is among the chunks the answer was
   generated from. Not scored for a question the documents cannot answer.
@@ -14,6 +15,14 @@ Four scores per question, all but ``retrieval_rank`` 1 (pass) or 0 (fail):
   among them, as a reciprocal rank (1 for first, 1/2 for second, 0 if none).
   Scored like ``retrieval_hit``, but not 0 or 1: it sees a right file slipping
   down the prompt before it falls out of it.
+- ``retrieval_recall``: the fraction of the expected files that reached the
+  prompt. The same as ``retrieval_hit`` for a one-file question; for a question
+  that needs two files, it sees the answer missing half its evidence, which
+  ``retrieval_hit`` passes.
+- ``candidate_rank``: ``retrieval_rank`` over the vector search's ``FETCH_K``
+  candidates, before the reranker. A diagnostic rather than a target: a high
+  ``candidate_rank`` beside a low ``retrieval_rank`` means the reranker dropped
+  the chunk, a low one that the embedder never fetched it -- different fixes.
 - ``correct``: the answer matches the reference answer -- or, for a question
   the documents cannot answer, says so instead of answering from general
   knowledge. Judged by Claude.
@@ -29,6 +38,13 @@ enough (four services documented alike, a deprecated guide contradicting the
 current one) that retrieval has real choices to get wrong. The three sample
 documents in ``data/`` made 9 chunks, and every question scored 100%.
 
+Each question has a ``category`` (``CATEGORIES``), and every score is reported
+per category as well as overall: the ``easy`` questions are a regression floor
+that passes almost entirely, and a mean over all of them would dilute the hard
+categories' failures until they barely registered. Each hard category is built
+to stress one part of the pipeline, so a change can be judged by the category
+it was meant to move.
+
 The question set (``evals/questions.json``) is uploaded to LangSmith under a
 name derived from its content, so an edited set is a new dataset: an experiment
 is only ever compared with others scored on the same questions.
@@ -40,7 +56,7 @@ import hashlib
 import json
 import time
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
@@ -79,9 +95,47 @@ _JUDGE_EFFORT = "medium"
 # non-streaming timeout.
 _JUDGE_MAX_TOKENS = 16000
 
-METRICS = ("retrieval_hit", "retrieval_rank", "correct", "grounded")
+METRICS = (
+    "retrieval_hit",
+    "retrieval_rank",
+    "retrieval_recall",
+    "candidate_rank",
+    "correct",
+    "grounded",
+)
 # Shown as a mean reciprocal rank rather than a pass rate.
-_RANK_METRICS = frozenset({"retrieval_rank"})
+_RANK_METRICS = frozenset({"retrieval_rank", "candidate_rank"})
+# Scored only for a question some file answers; the rest for every question.
+_RETRIEVAL_METRICS = frozenset(METRICS) - {"correct", "grounded"}
+# Column headings for the per-category table, in METRICS' order.
+_SHORT = {
+    "retrieval_hit": "hit",
+    "retrieval_rank": "rank",
+    "retrieval_recall": "recall",
+    "candidate_rank": "cand",
+    "correct": "correct",
+    "grounded": "grounded",
+}
+
+# What each kind of question stresses. `easy` is the original set: one
+# directly worded question per fact. The rest are each built so that one
+# component, when it falls short, fails them:
+CATEGORIES = (
+    "easy",
+    # the answer in a later chunk of a long document that no longer names its
+    # subject there: chunking and contextualized embeddings
+    "context",
+    # two documents disagree and only one is current: the reranker
+    "version",
+    # worded with none of the answer's vocabulary: the embedder and FETCH_K
+    "paraphrase",
+    # one row or cell of a table deep in a long document: chunking
+    "table",
+    # the answer needs two files: RETRIEVAL_K
+    "multi",
+    # unanswerable, though a sibling document answers it for a sibling: grounding
+    "decoy",
+)
 _EXPERIMENT_PREFIX = "rag-pipeline"
 
 
@@ -95,6 +149,8 @@ class Question:
     # The files a correct answer draws on, relative to the data directory as a
     # chunk's `source` is. Empty for a question the documents cannot answer.
     sources: tuple[str, ...]
+    # One of CATEGORIES.
+    category: str
 
     @property
     def answerable(self) -> bool:
@@ -115,7 +171,7 @@ def load_questions(path: Path = QUESTIONS_PATH) -> list[Question]:
     if not isinstance(raw, list) or not raw:
         raise ValueError(f"{path} must be a non-empty JSON list of questions.")
 
-    fields = {"id", "question", "answer", "sources"}
+    fields = {"id", "question", "answer", "sources", "category"}
     questions: list[Question] = []
     for i, entry in enumerate(raw):
         if not isinstance(entry, dict) or set(entry) != fields:
@@ -134,7 +190,14 @@ def load_questions(path: Path = QUESTIONS_PATH) -> list[Question]:
             raise ValueError(
                 f"{path}, entry {i}: sources must be a list of file names."
             )
-        questions.append(Question(*text, sources=tuple(sources)))
+        if entry["category"] not in CATEGORIES:
+            raise ValueError(
+                f"{path}, entry {i}: category must be one of {list(CATEGORIES)}, "
+                f"not {entry['category']!r}."
+            )
+        questions.append(
+            Question(*text, sources=tuple(sources), category=entry["category"])
+        )
 
     ids = [q.id for q in questions]
     if len(set(ids)) != len(ids):
@@ -199,7 +262,9 @@ def sync_dataset(client: DatasetStore, questions: list[Question]) -> str:
                     {
                         "inputs": {"question": q.question},
                         "outputs": {"answer": q.answer, "sources": list(q.sources)},
-                        "metadata": {"id": q.id},
+                        # The category too, so LangSmith's compare view can
+                        # filter by it, and the summary can group by it.
+                        "metadata": {"id": q.id, "category": q.category},
                     }
                     for q in questions
                 ],
@@ -219,7 +284,11 @@ def make_target(pipeline: RAGPipeline) -> Callable[[dict], dict]:
     """The function LangSmith runs per question: the pipeline, end to end.
 
     Returns the chunks themselves as well as their sources, because groundedness
-    is judged against exactly what the model read.
+    is judged against exactly what the model read; and the vector search's
+    candidates, in order, for `candidate_rank`. They are searched again rather
+    than taken from the answer, which would widen the `Answer` both frontends
+    use for the eval's sake: a search is deterministic for a fixed index, so it
+    finds what the pipeline's own did, for one more embedding of the question.
     """
     from rag_pipeline.pipeline import source_excerpts, unique_sources
 
@@ -229,6 +298,10 @@ def make_target(pipeline: RAGPipeline) -> Callable[[dict], dict]:
             "answer": answer.text,
             "sources": unique_sources(answer.sources),
             "contexts": [dict(excerpt) for excerpt in source_excerpts(answer.sources)],
+            "candidates": [
+                excerpt["source"]
+                for excerpt in source_excerpts(pipeline.candidates(inputs["question"]))
+            ],
         }
 
     return target
@@ -256,31 +329,66 @@ def retrieval_hit(outputs: dict, reference_outputs: dict) -> dict:
     }
 
 
-def retrieval_rank(outputs: dict, reference_outputs: dict) -> dict:
-    """1/rank of the first chunk from an expected file in the prompt, else 0.
+def retrieval_recall(outputs: dict, reference_outputs: dict) -> dict:
+    """The fraction of the expected files that reached the prompt.
 
-    Ranked over the chunks in the order the model read them -- the reranker's
-    order -- not over distinct files, so two chunks of one wrong file ahead of
-    the right one count as two places. Not scored when `retrieval_hit` is not.
+    Scored like `retrieval_hit`, which it equals for a one-file question.
     """
     expected = reference_outputs.get("sources") or []
     if not expected:
         return {
-            "key": "retrieval_rank",
+            "key": "retrieval_recall",
             "score": None,
             "comment": "No source expected.",
         }
-    if "contexts" not in outputs:
-        return {"key": "retrieval_rank", "score": None, "comment": "No output."}
-    order = [context["source"] for context in outputs["contexts"]]
+    if "sources" not in outputs:
+        return {"key": "retrieval_recall", "score": None, "comment": "No output."}
+    found = [source for source in expected if source in outputs["sources"]]
+    return {
+        "key": "retrieval_recall",
+        "score": len(found) / len(expected),
+        "comment": f"Expected {expected}; retrieved {outputs['sources']}.",
+    }
+
+
+def _reciprocal_rank(
+    key: str, order: list[str] | None, reference_outputs: dict
+) -> dict:
+    """1/rank of the first chunk from an expected file in `order`, else 0.
+
+    Ranked over chunks, not distinct files, so two chunks of one wrong file
+    ahead of the right one count as two places. `order` is None for a run that
+    produced no output.
+    """
+    expected = reference_outputs.get("sources") or []
+    if not expected:
+        return {"key": key, "score": None, "comment": "No source expected."}
+    if order is None:
+        return {"key": key, "score": None, "comment": "No output."}
     rank = next((i for i, source in enumerate(order, 1) if source in expected), None)
     return {
-        "key": "retrieval_rank",
+        "key": key,
         "score": 1 / rank if rank else 0.0,
         "comment": f"First expected chunk at rank {rank} of {len(order)}: {order}."
         if rank
         else f"No chunk from {expected} among {order}.",
     }
+
+
+def retrieval_rank(outputs: dict, reference_outputs: dict) -> dict:
+    """The reciprocal rank of the right file in the prompt, in the order the
+    model read it -- the reranker's. Not scored when `retrieval_hit` is not."""
+    contexts = outputs.get("contexts")
+    order = None if contexts is None else [c["source"] for c in contexts]
+    return _reciprocal_rank("retrieval_rank", order, reference_outputs)
+
+
+def candidate_rank(outputs: dict, reference_outputs: dict) -> dict:
+    """The reciprocal rank of the right file among the vector search's
+    candidates, before the reranker chose among them."""
+    return _reciprocal_rank(
+        "candidate_rank", outputs.get("candidates"), reference_outputs
+    )
 
 
 class Verdict(BaseModel):
@@ -438,16 +546,30 @@ class Summary:
     examples: int
     # Examples whose pipeline run raised: none of their scores exist.
     errors: int
+    # The same, within each category present, in CATEGORIES' order.
+    by_category: dict[str, Summary] = field(default_factory=dict)
 
 
-def summarize(rows: Iterable[tuple[Mapping[str, float | None], bool]]) -> Summary:
-    """Mean of each metric over the examples that have a score for it.
+# One example: its category, its scores by key, and whether its run raised.
+Row = tuple[str, Mapping[str, float | None], bool]
 
-    Each row is one example's scores by key, and whether its run raised.
-    """
+
+def summarize(rows: Iterable[Row]) -> Summary:
+    """Mean of each metric over the examples that have a score for it, overall
+    and within each category."""
+    rows = list(rows)
+    by_category = {
+        category: _means([row for row in rows if row[0] == category])
+        for category in CATEGORIES
+        if any(row[0] == category for row in rows)
+    }
+    return replace(_means(rows), by_category=by_category)
+
+
+def _means(rows: list[Row]) -> Summary:
     scores: dict[str, list[float]] = {metric: [] for metric in METRICS}
     examples = errors = 0
-    for by_key, failed in rows:
+    for _, by_key, failed in rows:
         examples += 1
         errors += failed
         for metric in METRICS:
@@ -466,23 +588,22 @@ def summarize(rows: Iterable[tuple[Mapping[str, float | None], bool]]) -> Summar
     )
 
 
-def _rows(results: Iterable[Any]) -> Iterable[tuple[dict[str, float | None], bool]]:
-    """Each LangSmith result row as (scores by key, whether the run raised)."""
+def _rows(results: Iterable[Any]) -> Iterable[Row]:
+    """Each LangSmith result row as a `Row`, its category read back from the
+    example's metadata, where `sync_dataset` put it."""
     for row in results:
         by_key = {
             result.key: result.score for result in row["evaluation_results"]["results"]
         }
-        yield by_key, row["run"].error is not None
+        yield row["example"].metadata["category"], by_key, row["run"].error is not None
 
 
 def expected_counts(questions: list[Question]) -> dict[str, int]:
     """How many examples each metric scores when nothing fails."""
     answerable = sum(q.answerable for q in questions)
     return {
-        "retrieval_hit": answerable,
-        "retrieval_rank": answerable,
-        "correct": len(questions),
-        "grounded": len(questions),
+        metric: answerable if metric in _RETRIEVAL_METRICS else len(questions)
+        for metric in METRICS
     }
 
 
@@ -514,10 +635,18 @@ def baseline_record(
         "date": datetime.now(UTC).date().isoformat(),
         "judge": JUDGE_MODEL,
         "settings": _comparable_settings(settings),
-        "scores": {
-            metric: {"mean": round(m.mean, 4), "n": m.n}
-            for metric, m in summary.metrics.items()
+        "scores": _scores(summary),
+        "scores_by_category": {
+            category: _scores(within)
+            for category, within in summary.by_category.items()
         },
+    }
+
+
+def _scores(summary: Summary) -> dict[str, dict[str, float | int]]:
+    return {
+        metric: {"mean": round(m.mean, 4), "n": m.n}
+        for metric, m in summary.metrics.items()
     }
 
 
@@ -532,13 +661,14 @@ def format_report(
     )
     lines = []
     for metric, m in summary.metrics.items():
-        line = f"  {metric:<14} {_shown(metric, m.mean)}  ({m.n} scored)"
+        line = f"  {metric:<16} {_shown(metric, m.mean)}  ({m.n} scored)"
         # A metric the baseline predates has nothing to be compared with.
         before = (baseline or {}).get("scores", {}).get(metric) if comparable else None
         if before is not None:
             change = _shown(metric, m.mean - before["mean"], signed=True)
             line += f"   baseline {_shown(metric, before['mean'])}, change {change}"
         lines.append(line)
+    lines.extend(_category_table(summary, baseline if comparable else None))
     if baseline is not None and not comparable:
         lines.append(
             "  The saved baseline used other questions or another judge: no comparison."
@@ -546,6 +676,49 @@ def format_report(
     if summary.errors:
         lines.append(
             f"  {summary.errors} of {summary.examples} questions failed to run."
+        )
+    return lines
+
+
+_COLUMN = 9
+
+
+def _category_table(summary: Summary, baseline: Mapping[str, Any] | None) -> list[str]:
+    """Each category's means, one line each, with a line of changes beneath
+    any category the baseline scored too.
+
+    A metric a category does not score -- the retrieval ones for `decoy`,
+    whose questions no file answers -- is shown as a dash, not as 0.
+    """
+    if not summary.by_category:
+        return []
+    lines = [
+        "",
+        f"  {'category':<12}{'n':>4}"
+        + "".join(f"{_SHORT[metric]:>{_COLUMN}}" for metric in METRICS),
+    ]
+    before_by_category = (baseline or {}).get("scores_by_category", {})
+    for category, within in summary.by_category.items():
+        cells = [
+            _shown(metric, m.mean) if m.n else "-"
+            for metric, m in within.metrics.items()
+        ]
+        lines.append(
+            f"  {category:<12}{within.examples:>4}"
+            + "".join(f"{cell:>{_COLUMN}}" for cell in cells)
+        )
+        # A category, or a metric, the baseline predates has no change.
+        before = before_by_category.get(category)
+        if before is None:
+            continue
+        changes = [
+            _shown(metric, m.mean - before[metric]["mean"], signed=True)
+            if m.n and before.get(metric, {}).get("n")
+            else ""
+            for metric, m in within.metrics.items()
+        ]
+        lines.append(
+            f"  {'  change':<16}" + "".join(f"{cell:>{_COLUMN}}" for cell in changes)
         )
     return lines
 
@@ -662,7 +835,13 @@ def run(settings: Settings, *, save_baseline: bool = False) -> list[str]:
         results = langsmith_evaluate(
             make_target(pipeline),
             data=dataset,
-            evaluators=[retrieval_hit, retrieval_rank, *make_judge_evaluators(judge)],
+            evaluators=[
+                retrieval_hit,
+                retrieval_rank,
+                retrieval_recall,
+                candidate_rank,
+                *make_judge_evaluators(judge),
+            ],
             experiment_prefix=_EXPERIMENT_PREFIX,
             metadata={"judge": JUDGE_MODEL, **_comparable_settings(settings)},
             # One question at a time, so the answers' order matches the
