@@ -794,5 +794,95 @@
       "support/escalation-matrix.md"
     ],
     "category": "table"
+  },
+  {
+    "id": "multi-davit-dependency-timeout",
+    "question": "What is the request timeout of the service Davit looks origin facilities up in?",
+    "answer": "300 milliseconds (Hawser).",
+    "sources": [
+      "services/davit.md",
+      "services/hawser.md"
+    ],
+    "category": "multi"
+  },
+  {
+    "id": "multi-enrich-and-keep",
+    "question": "How quickly are carrier events enriched, and how long are enriched shipment records kept?",
+    "answer": "99% are enriched within 2 minutes of reaching shipments.raw, and enriched records are kept for 2 years.",
+    "sources": [
+      "services/ballast.md",
+      "policies/data-retention.md"
+    ],
+    "category": "multi"
+  },
+  {
+    "id": "multi-rebuild-headroom",
+    "question": "How much headroom does Lantern's nightly index rebuild have before Tidewatch would kill it?",
+    "answer": "About 5 minutes: a rebuild takes about 40 minutes, and Tidewatch kills a job after 45.",
+    "sources": [
+      "services/lantern.md",
+      "services/tidewatch.md"
+    ],
+    "category": "multi"
+  },
+  {
+    "id": "multi-starter-support-hours",
+    "question": "During which hours can a Starter customer get support?",
+    "answer": "By email, in business hours: 09:00 to 18:00 Pacific time, Monday to Friday.",
+    "sources": [
+      "product/plans.md",
+      "support/escalation-matrix.md"
+    ],
+    "category": "multi"
+  },
+  {
+    "id": "multi-new-oncall-start",
+    "question": "When a new engineer first joins the on-call rotation, in which role is it, and on what day and time does their on-call week begin?",
+    "answer": "As secondary on-call; rotations hand off on Tuesdays at 10:00 Pacific time.",
+    "sources": [
+      "onboarding/first-week.md",
+      "oncall/oncall-handbook.md"
+    ],
+    "category": "multi"
+  },
+  {
+    "id": "multi-db-access",
+    "question": "How long does write access to the production freight database last, and how often are that database's credentials rotated?",
+    "answer": "Write access expires after 8 hours; the credentials are rotated every 30 days.",
+    "sources": [
+      "policies/access-control.md",
+      "policies/secrets-management.md"
+    ],
+    "category": "multi"
+  },
+  {
+    "id": "multi-outage-owner",
+    "question": "Which team owns the service whose migration caused the March 2025 search outage, and who is that team's engineering manager?",
+    "answer": "Pipeline, which owns Ballast; its engineering manager is Priya Raman.",
+    "sources": [
+      "postmortems/2025-03-lantern-outage.md",
+      "teams/pipeline.md"
+    ],
+    "category": "multi"
+  },
+  {
+    "id": "multi-gantry-postmortem-required",
+    "question": "Did the September 2025 Gantry rate-limit incident require a written postmortem?",
+    "answer": "No: it was a SEV3, and only SEV1 and SEV2 incidents require one.",
+    "sources": [
+      "postmortems/2025-09-gantry-rate-limit.md",
+      "oncall/incident-severity.md"
+    ],
+    "category": "multi"
+  },
+  {
+    "id": "multi-search-outage-summary",
+    "question": "By when did a public summary of the March 2025 search outage's postmortem have to be published?",
+    "answer": "Within 10 business days, since it was a SEV1.",
+    "sources": [
+      "postmortems/2025-03-lantern-outage.md",
+      "policies/incident-communication.md"
+    ],
+    "category": "multi"
   }
 ]
