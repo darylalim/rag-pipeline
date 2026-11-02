@@ -31,8 +31,19 @@ st.set_page_config(
 
 # Passages side by side in the retrieved-passages panel. Two, because a passage
 # is a paragraph or more of prose: a third column narrows each to a few words a
-# line. Below 640px Streamlit stacks the columns again.
+# line.
 _PASSAGE_COLUMNS = 2
+
+# Each passage card's width. Fixed, because a fixed width is the only one a row
+# wraps on: Streamlit gives a "stretch" card a 128px flex basis and no minimum,
+# so two shrink side by side down to about 135px each, and st.columns stacks
+# only on the window's width, which keeps two ~190px cards beside an open
+# sidebar on a tablet. 352 is about the widest at which two still fit in the
+# assistant's chat bubble beside the open sidebar at 1280px; on a wider screen the pair keeps that width rather than
+# growing, since a passage's readable line length does not grow with the
+# monitor. Streamlit caps it at the panel's width, so on a phone a card is
+# simply full width.
+_PASSAGE_WIDTH_PX = 352
 
 # Initialized here rather than beside the replay loop: the sidebar runs first and
 # already writes this key, so a reader added there would otherwise KeyError on
@@ -360,8 +371,11 @@ def _render_sources(excerpts: list[Excerpt]) -> None:
     evidence that the documents really lack the answer, and telling a refusal
     apart from an answer would take a guess at the model's wording.
 
-    Laid out a row at a time, rather than dealt into columns, so rank reads left
-    to right and then down, and the cards in a row share one height.
+    Laid out a row at a time, each row a wrapping horizontal container, so rank
+    reads left to right and then down, the cards in a row share one height, a
+    row never holds more than `_PASSAGE_COLUMNS`, and a row too narrow for two
+    puts the second card under the first: it wraps on the space the panel
+    actually has, not on the window's width.
     """
     if excerpts:
         with st.expander(
@@ -370,15 +384,13 @@ def _render_sources(excerpts: list[Excerpt]) -> None:
         ):
             for start in range(0, len(excerpts), _PASSAGE_COLUMNS):
                 row = excerpts[start : start + _PASSAGE_COLUMNS]
-                # Not strict: an odd last passage leaves its row's second column
-                # empty, so it keeps the width of the cards above it.
-                columns = st.columns(_PASSAGE_COLUMNS)
-                for rank, (column, excerpt) in enumerate(
-                    zip(columns, row, strict=False), start=start + 1
-                ):
-                    with column.container(border=True, height="stretch"):
-                        st.caption(f"{rank}. `{excerpt['source']}`")
-                        st.text(_reflow(excerpt["text"]))
+                with st.container(horizontal=True):
+                    for rank, excerpt in enumerate(row, start=start + 1):
+                        with st.container(
+                            border=True, width=_PASSAGE_WIDTH_PX, height="stretch"
+                        ):
+                            st.caption(f"{rank}. `{excerpt['source']}`")
+                            st.text(_reflow(excerpt["text"]))
 
 
 # Replay the conversation so far.
