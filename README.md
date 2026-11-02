@@ -208,11 +208,11 @@ reloads its pipeline when the index changes.
 
 ## Evaluation
 
-`rag eval` scores the pipeline on 50 fixed questions, so the effect of a change
+`rag eval` scores the pipeline on 106 fixed questions, so the effect of a change
 (model, setting, prompt) shows up across all of them at once.
 
 The questions are about `evals/corpus/`, the engineering handbook of
-**Tallowmere**, a fictional freight-tracking company (48 documents, 49 chunks).
+**Tallowmere**, a fictional freight-tracking company (66 documents, 108 chunks).
 `rag eval` indexes it into its own `rag_eval` collection and never touches your
 documents.
 
@@ -227,7 +227,7 @@ Each question gets six scores:
 
 | Score | Measures | Judged by |
 | ----- | -------- | --------- |
-| `retrieval_hit` | Whether a correct source file is among the chunks in the prompt (not scored for the 5 unanswerable questions) | The pipeline's output |
+| `retrieval_hit` | Whether a correct source file is among the chunks in the prompt (not scored for the 13 unanswerable questions) | The pipeline's output |
 | `retrieval_rank` | 1 ÷ the rank of the first chunk from a correct file (0 if none), averaged as mean reciprocal rank. Catches a right file slipping down before it drops out | The pipeline's output |
 | `retrieval_recall` | The fraction of the correct files among the chunks in the prompt. Equal to `retrieval_hit` for a one-file question; for a two-file one, sees half the evidence missing | The pipeline's output |
 | `candidate_rank` | `retrieval_rank` over the `FETCH_K` vector-search candidates, before the reranker. A diagnostic: high here but low in the prompt means the reranker dropped the chunk; low here means the embedder never fetched it | The pipeline's output |
@@ -253,7 +253,7 @@ uv run rag eval                    # score, and compare with evals/baseline.json
 uv run rag eval --save-baseline    # score, and save as the new baseline
 ```
 
-A run takes about 7 minutes and costs about $1–2, mostly for the judge. It
+A run takes about 15 minutes and costs about $2–4, mostly for the judge. It
 prints each score overall and per category, the change from the baseline, and a
 link to the experiment.
 It checks the keys, the judge and LangSmith before loading any model.

@@ -884,5 +884,61 @@
       "policies/incident-communication.md"
     ],
     "category": "multi"
+  },
+  {
+    "id": "decoy-mooring-retries",
+    "question": "How many attempts does Mooring make when a call to one of its dependencies fails?",
+    "answer": "The documents do not say how many attempts Mooring makes.",
+    "sources": [],
+    "category": "decoy"
+  },
+  {
+    "id": "decoy-mooring-dead-letters",
+    "question": "How long does Mooring keep work that failed every retry?",
+    "answer": "The documents do not say how long Mooring keeps failed work.",
+    "sources": [],
+    "category": "decoy"
+  },
+  {
+    "id": "decoy-mooring-page",
+    "question": "When does Mooring page its on-call for errors?",
+    "answer": "The documents do not say when Mooring pages its on-call.",
+    "sources": [],
+    "category": "decoy"
+  },
+  {
+    "id": "decoy-mooring-maintenance",
+    "question": "When is Mooring's weekly maintenance window?",
+    "answer": "The documents do not give a maintenance window for Mooring.",
+    "sources": [],
+    "category": "decoy"
+  },
+  {
+    "id": "decoy-harbor-timeout",
+    "question": "What is Harbor's request timeout?",
+    "answer": "The documents do not give Harbor's request timeout.",
+    "sources": [],
+    "category": "decoy"
+  },
+  {
+    "id": "decoy-gantry-retries",
+    "question": "How many times does Gantry retry a failed request?",
+    "answer": "The documents do not say how many times Gantry retries.",
+    "sources": [],
+    "category": "decoy"
+  },
+  {
+    "id": "decoy-ballast-timeout",
+    "question": "What is Ballast's request timeout?",
+    "answer": "The documents do not give Ballast a request timeout.",
+    "sources": [],
+    "category": "decoy"
+  },
+  {
+    "id": "decoy-overage-price",
+    "question": "How much does each additional 1,000 shipments cost on the Growth plan?",
+    "answer": "The documents do not give the price of additional shipments on the Growth plan.",
+    "sources": [],
+    "category": "decoy"
   }
 ]

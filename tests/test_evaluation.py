@@ -61,6 +61,11 @@ def test_the_shipped_question_set_fits_the_eval_corpus():
     # Both kinds, so `correct` is tested on declining as well as answering.
     assert any(q.answerable for q in questions)
     assert any(not q.answerable for q in questions)
+    # Every category, so each one's line in the report means something.
+    assert {q.category for q in questions} == set(ev.CATEGORIES)
+    # A decoy is unanswerable by definition; a source on one would make it
+    # an ordinary question scored as a failed decline.
+    assert not any(q.answerable for q in questions if q.category == "decoy")
 
 
 def test_the_eval_corpus_outnumbers_what_vector_search_fetches():

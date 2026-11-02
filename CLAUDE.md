@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 uv sync                              # install deps (creates .venv)
 uv run rag ingest                    # embed data/ into the Atlas collection (needs MONGODB_URI + VOYAGE_API_KEY)
 uv run rag query "your question"     # ask from the terminal (needs ANTHROPIC_API_KEY too)
-uv run rag eval                      # score the pipeline on evals/questions.json (needs LANGSMITH_API_KEY too; indexes evals/corpus itself; ~$1-2)
+uv run rag eval                      # score the pipeline on evals/questions.json (needs LANGSMITH_API_KEY too; indexes evals/corpus itself; ~15 min, ~$2-4)
 uv run rag eval --save-baseline      # ...and save the scores as evals/baseline.json
 uv run streamlit run streamlit_app.py # chat UI over the same pipeline
 uv run streamlit run streamlit_app.py --server.fileWatcherType auto   # while editing streamlit_app.py (config.toml turns the watcher off)
