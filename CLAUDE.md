@@ -135,17 +135,35 @@ it says whether a miss is the embedder's or the reranker's), `correct` and
 `grounded` (judged by Claude). Every score is reported overall and per
 `category` (`CATEGORIES`; carried in each example's LangSmith metadata), and a
 baseline keeps both; an older baseline without `scores_by_category` is compared
-overall only. It exists so the migration to
-hosted models could be measured: each phase was compared with
-`evals/baseline.json`, scored on the earlier local stack (Chroma and Qwen models
-under MLX), and a change to the pipeline is compared with it the same way.
+overall only. It exists so a change to the pipeline can be measured:
+`evals/baseline.json` holds the cloud stack's scores, and a change is compared
+with it. (The migration to hosted models was measured the same way, against a
+baseline from the local Chroma/MLX stack on the earlier 50 questions.)
+
+The categories: `easy` (the original 50, a regression floor) and six hard
+ones, each built to fail when one part of the pipeline falls short —
+`context` (six Fleet Data specs from one template, whose later chunks never
+name their service), `version` (a current document beside a stale one worded
+like the question), `paraphrase` (no shared vocabulary), `table` (cells in rows
+cut from their header), `multi` (two files, often a chain), `decoy`
+(unanswerable, though a sibling answers it; Mooring is the template with three
+sections dropped). Two tests keep the structural ones hard:
+`test_a_context_question_cites_chunks_that_do_not_name_their_subject` and
+`test_a_table_question_cites_a_table_split_from_its_header`. A new question is
+checked for fairness before it is trusted: the pipeline's own model, given its
+expected files in full, must pass `correct` (a one-off script, not shipped).
+
+Retrieval scores are deterministic for a fixed index and models, and `correct`
+barely moves between runs (two runs of the new set: identical); `grounded`
+moves by about one question. So one run reads a retrieval change, and only a
+close `grounded` result needs a second.
 
 The questions are about `evals/corpus/`, a fictional company's handbook, which
 `run()` ingests through `eval_settings()` — the caller's models and chunking,
 `EVAL_CORPUS` and its own `EVAL_COLLECTION` — so the user's index is never read
 or written. Fictional, so an answer cannot come from the model's own knowledge;
-confusable (services documented alike, a deprecated guide contradicting the
-current one); and kept at least twice `FETCH_K` in chunks
+confusable (services documented alike, deprecated documents beside the
+ones that replaced them); and kept at least twice `FETCH_K` in chunks
 (`test_the_eval_corpus_outnumbers_what_vector_search_fetches`), or every chunk
 reaches the reranker and the embedder goes untested. The sample `data/` made 9
 chunks and scored 100% on everything. Editing the corpus or the questions means

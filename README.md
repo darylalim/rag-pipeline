@@ -217,9 +217,9 @@ The questions are about `evals/corpus/`, the engineering handbook of
 documents.
 
 - **Fictional**, so the model cannot answer from its own knowledge.
-- **Confusable**: four services documented alike with different values, a
-  deprecated deployment guide that contradicts the current one, and a customer
-  SLA next to internal SLOs.
+- **Confusable**: services documented alike with different values (seven of
+  them written to one template), out-of-date documents beside the ones that
+  replaced them, and a customer SLA next to internal SLOs.
 - **Large enough** that vector search, which fetches `FETCH_K` = 20 chunks, has
   to choose. (The 9 chunks of the sample `data/` scored 100% on everything.)
 
@@ -265,6 +265,9 @@ It checks the keys, the judge and LangSmith before loading any model.
   recorded as unscored.
 - **A baseline needs every question scored.** `--save-baseline` refuses a run
   with a failed question or a declined grade.
+- **Retrieval scores are exact.** They do not change between runs on the same
+  index and models, and `correct` barely does; `grounded` can move by about one
+  question. One run is enough to read a retrieval change.
 - **Every experiment row includes the question's full trace**, whatever
   `LANGSMITH_TRACING` is set to. Nothing outside the eval is traced.
 
@@ -292,7 +295,12 @@ LANGSMITH_API_KEY=lsv2_...
 Traces go to the `rag-pipeline` project (`LANGSMITH_PROJECT`), which is created
 on first use. The sidebar shows when tracing is on. For an EU account, also set
 `LANGSMITH_ENDPOINT=https://eu.api.smith.langchain.com`. The free plan's 5,000
-traces a month covers about 50 questions a day.
+traces a month covers about 50 questions a day, but `rag eval` spends about 740
+of them per run (each question, plus each of its six scores as a trace of its
+own), so about six eval runs exhaust it. Past the limit LangSmith refuses new
+traces until the month resets: questions and evals still work, and an eval's
+scores and saved baseline are complete, but its experiment in LangSmith is
+missing rows.
 
 - **A trace contains everything:** the question, every retrieved passage, the
   prompt and the answer.

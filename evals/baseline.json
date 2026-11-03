@@ -1,39 +1,234 @@
 {
-  "dataset": "rag-pipeline-qa-6c17186e8443",
-  "experiment": "rag-pipeline-38ee4ec4",
-  "url": "https://smith.langchain.com/o/98ceb257-f10c-4666-b247-995cd045bb7d/datasets/721a09b7-aede-498d-b1e0-1714413c99df/compare?selectedSessions=a149bc84-0b24-42ce-b786-a7fff176d8ea",
-  "date": "2026-10-01",
+  "dataset": "rag-pipeline-qa-4be0784887f6",
+  "experiment": "rag-pipeline-1072909a",
+  "url": "https://smith.langchain.com/o/98ceb257-f10c-4666-b247-995cd045bb7d/datasets/524454e5-ddca-4855-b28d-e3265f506b18/compare?selectedSessions=a36aa215-1118-4a6f-8b87-1b5ce01eb38b",
+  "date": "2026-11-02",
   "judge": "claude-opus-5-5",
   "settings": {
+    "mongodb_db": "rag_db",
     "collection_name": "rag_eval",
-    "embedding_model": "mlx-community/Qwen3-VL-Embedding-2B-bf16",
-    "embedding_dimensions": 2048,
-    "chat_model": "mlx-community/Qwen3.8-27B-4bit",
+    "vector_index_name": "vector_index",
+    "mongodb_timeout_ms": 10000,
+    "embedding_model": "voyage-4-large",
+    "embedding_dimensions": 1024,
+    "chat_model": "claude-sonnet-5-5",
     "max_tokens": 1024,
     "chunk_size": 1000,
     "chunk_overlap": 200,
     "retrieval_k": 4,
     "fetch_k": 20,
-    "rerank_model": "mlx-community/Qwen3-VL-Reranker-2B-bf16",
-    "phoenix_collector_endpoint": "",
-    "phoenix_project": "rag-pipeline"
+    "rerank_model": "rerank-3",
+    "langsmith_tracing": true,
+    "langsmith_project": "rag-pipeline"
   },
   "scores": {
     "retrieval_hit": {
-      "mean": 1.0,
-      "n": 45
+      "mean": 0.9677,
+      "n": 93
     },
     "retrieval_rank": {
-      "mean": 1.0,
-      "n": 45
+      "mean": 0.8943,
+      "n": 93
+    },
+    "retrieval_recall": {
+      "mean": 0.9624,
+      "n": 93
+    },
+    "candidate_rank": {
+      "mean": 0.8466,
+      "n": 93
     },
     "correct": {
-      "mean": 1.0,
-      "n": 50
+      "mean": 0.9528,
+      "n": 106
     },
     "grounded": {
-      "mean": 1.0,
-      "n": 50
+      "mean": 0.9811,
+      "n": 106
+    }
+  },
+  "scores_by_category": {
+    "easy": {
+      "retrieval_hit": {
+        "mean": 1.0,
+        "n": 45
+      },
+      "retrieval_rank": {
+        "mean": 1.0,
+        "n": 45
+      },
+      "retrieval_recall": {
+        "mean": 1.0,
+        "n": 45
+      },
+      "candidate_rank": {
+        "mean": 0.9254,
+        "n": 45
+      },
+      "correct": {
+        "mean": 1.0,
+        "n": 50
+      },
+      "grounded": {
+        "mean": 1.0,
+        "n": 50
+      }
+    },
+    "context": {
+      "retrieval_hit": {
+        "mean": 0.7,
+        "n": 10
+      },
+      "retrieval_rank": {
+        "mean": 0.4333,
+        "n": 10
+      },
+      "retrieval_recall": {
+        "mean": 0.7,
+        "n": 10
+      },
+      "candidate_rank": {
+        "mean": 0.3344,
+        "n": 10
+      },
+      "correct": {
+        "mean": 0.7,
+        "n": 10
+      },
+      "grounded": {
+        "mean": 1.0,
+        "n": 10
+      }
+    },
+    "version": {
+      "retrieval_hit": {
+        "mean": 1.0,
+        "n": 9
+      },
+      "retrieval_rank": {
+        "mean": 0.6667,
+        "n": 9
+      },
+      "retrieval_recall": {
+        "mean": 1.0,
+        "n": 9
+      },
+      "candidate_rank": {
+        "mean": 0.7778,
+        "n": 9
+      },
+      "correct": {
+        "mean": 1.0,
+        "n": 9
+      },
+      "grounded": {
+        "mean": 1.0,
+        "n": 9
+      }
+    },
+    "paraphrase": {
+      "retrieval_hit": {
+        "mean": 1.0,
+        "n": 10
+      },
+      "retrieval_rank": {
+        "mean": 1.0,
+        "n": 10
+      },
+      "retrieval_recall": {
+        "mean": 1.0,
+        "n": 10
+      },
+      "candidate_rank": {
+        "mean": 0.9,
+        "n": 10
+      },
+      "correct": {
+        "mean": 1.0,
+        "n": 10
+      },
+      "grounded": {
+        "mean": 0.8,
+        "n": 10
+      }
+    },
+    "table": {
+      "retrieval_hit": {
+        "mean": 1.0,
+        "n": 10
+      },
+      "retrieval_rank": {
+        "mean": 1.0,
+        "n": 10
+      },
+      "retrieval_recall": {
+        "mean": 1.0,
+        "n": 10
+      },
+      "candidate_rank": {
+        "mean": 1.0,
+        "n": 10
+      },
+      "correct": {
+        "mean": 1.0,
+        "n": 10
+      },
+      "grounded": {
+        "mean": 1.0,
+        "n": 10
+      }
+    },
+    "multi": {
+      "retrieval_hit": {
+        "mean": 1.0,
+        "n": 9
+      },
+      "retrieval_rank": {
+        "mean": 0.8704,
+        "n": 9
+      },
+      "retrieval_recall": {
+        "mean": 0.9444,
+        "n": 9
+      },
+      "candidate_rank": {
+        "mean": 0.8611,
+        "n": 9
+      },
+      "correct": {
+        "mean": 0.7778,
+        "n": 9
+      },
+      "grounded": {
+        "mean": 1.0,
+        "n": 9
+      }
+    },
+    "decoy": {
+      "retrieval_hit": {
+        "mean": 0.0,
+        "n": 0
+      },
+      "retrieval_rank": {
+        "mean": 0.0,
+        "n": 0
+      },
+      "retrieval_recall": {
+        "mean": 0.0,
+        "n": 0
+      },
+      "candidate_rank": {
+        "mean": 0.0,
+        "n": 0
+      },
+      "correct": {
+        "mean": 1.0,
+        "n": 8
+      },
+      "grounded": {
+        "mean": 1.0,
+        "n": 8
+      }
     }
   }
 }
